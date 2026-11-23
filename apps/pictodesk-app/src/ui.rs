@@ -8,6 +8,8 @@ use font8x8::UnicodeFonts;
 
 pub type Rgb = (u8, u8, u8);
 pub const PLATINUM: Rgb = (204, 204, 204);
+pub const RULER_W: i32 = 18;
+pub const RULER_H: i32 = 18;
 pub const PLATINUM_LIGHT: Rgb = (221, 221, 221);
 pub const WHITE: Rgb = (255, 255, 255);
 pub const BLACK: Rgb = (0, 0, 0);

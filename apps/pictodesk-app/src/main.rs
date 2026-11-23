@@ -155,6 +155,7 @@ enum Action {
     FeatherDialog,
     ToggleHistogram,
     ToggleBrushes,
+    ToggleRulers,
     ZoomIn,
     ZoomOut,
     Zoom100,
@@ -419,6 +420,7 @@ struct App {
     dialog: Option<Dialog>,
     show_histogram: bool,
     show_brushes: bool,
+    show_rulers: bool,
     show_palette: bool,
     file_panel: Option<Vec<PathBuf>>,
     // interaction
@@ -474,6 +476,7 @@ impl App {
             dialog: None,
             show_histogram: false,
             show_brushes: false,
+            show_rulers: true,
             show_palette: false,
             file_panel: None,
             cursor: (0.0, 0.0),
@@ -503,17 +506,22 @@ impl App {
         self.dirty = true;
     }
 
-    fn canvas_rect(win_w: u32, win_h: u32) -> Rect {
+    fn canvas_rect(&self, win_w: u32, win_h: u32) -> Rect {
+        let (rx, ry) = if self.show_rulers {
+            (ui::RULER_W, ui::RULER_H)
+        } else {
+            (0, 0)
+        };
         Rect::new(
-            ui::TOOLBAR_W,
-            ui::MENU_H,
-            (win_w as i32 - ui::TOOLBAR_W).max(10),
-            (win_h as i32 - ui::MENU_H - ui::STATUS_H).max(10),
+            ui::TOOLBAR_W + rx,
+            ui::MENU_H + ry,
+            (win_w as i32 - ui::TOOLBAR_W - rx).max(10),
+            (win_h as i32 - ui::MENU_H - ui::STATUS_H - ry).max(10),
         )
     }
 
     fn fit_view(&mut self, win_w: u32, win_h: u32) {
-        let c = Self::canvas_rect(win_w, win_h);
+        let c = self.canvas_rect(win_w, win_h);
         self.viewport = Viewport::fit(
             self.doc.width as f32,
             self.doc.height as f32,
@@ -524,8 +532,9 @@ impl App {
 
     /// Screen (window) coords -> document coords.
     fn to_doc(&self, sx: f32, sy: f32) -> (f32, f32) {
+        let c = self.canvas_rect(self.win_size.0, self.win_size.1);
         self.viewport
-            .screen_to_doc((sx - ui::TOOLBAR_W as f32, sy - ui::MENU_H as f32))
+            .screen_to_doc((sx - c.x as f32, sy - c.y as f32))
     }
 
     fn active_tiles_all(&self) -> Vec<(i32, i32)> {
@@ -640,6 +649,7 @@ impl App {
                     MenuItem::new("Histogram", Action::ToggleHistogram)
                         .check_if(self.show_histogram),
                     MenuItem::new("Brushes", Action::ToggleBrushes).check_if(self.show_brushes),
+                    MenuItem::new("Rulers", Action::ToggleRulers).check_if(self.show_rulers),
                     MenuItem::new("Zoom In", Action::ZoomIn),
                     MenuItem::new("Zoom Out", Action::ZoomOut),
                     MenuItem::new("Actual Pixels", Action::Zoom100),
@@ -994,8 +1004,12 @@ impl App {
             }
             Action::ToggleHistogram => self.show_histogram = !self.show_histogram,
             Action::ToggleBrushes => self.show_brushes = !self.show_brushes,
+            Action::ToggleRulers => {
+                self.show_rulers = !self.show_rulers;
+                self.fit_view(self.win_size.0, self.win_size.1);
+            }
             Action::ZoomIn | Action::ZoomOut => {
-                let c = Self::canvas_rect(self.win_size.0, self.win_size.1);
+                let c = self.canvas_rect(self.win_size.0, self.win_size.1);
                 let center = (c.w as f32 / 2.0, c.h as f32 / 2.0);
                 let f = if matches!(action, Action::ZoomIn) {
                     1.25
@@ -1005,7 +1019,7 @@ impl App {
                 self.viewport.zoom_at(center, f);
             }
             Action::Zoom100 => {
-                let c = Self::canvas_rect(self.win_size.0, self.win_size.1);
+                let c = self.canvas_rect(self.win_size.0, self.win_size.1);
                 self.viewport.scale = 1.0;
                 self.viewport.offset = (
                     (c.w as f32 - self.doc.width as f32) / 2.0,
@@ -1365,6 +1379,9 @@ impl App {
 
     fn draw(&mut self, f: &mut Frame) {
         self.draw_canvas(f);
+        if self.show_rulers {
+            self.draw_rulers(f);
+        }
         self.draw_toolbox(f);
         if self.show_palette {
             self.draw_palette(f);
@@ -1396,9 +1413,108 @@ impl App {
         }
     }
 
+    /// Photoshop-style rulers along the top and left of the canvas:
+    /// pixel coordinates in document space, tick spacing adapts to
+    /// zoom, and a marker tracks the cursor on each ruler.
+    fn draw_rulers(&self, f: &mut Frame) {
+        let c = self.canvas_rect(f.w, f.h);
+        let top = Rect::new(
+            ui::TOOLBAR_W,
+            ui::MENU_H,
+            f.w as i32 - ui::TOOLBAR_W,
+            ui::RULER_H,
+        );
+        let left = Rect::new(
+            ui::TOOLBAR_W,
+            ui::MENU_H,
+            ui::RULER_W,
+            c.bottom() - ui::MENU_H,
+        );
+        f.fill_rect(top, ui::PLATINUM);
+        f.fill_rect(left, ui::PLATINUM);
+        f.fill_rect(
+            Rect::new(ui::TOOLBAR_W, ui::MENU_H, ui::RULER_W, ui::RULER_H),
+            ui::PLATINUM_LIGHT,
+        );
+        f.fill_rect(
+            Rect::new(
+                ui::TOOLBAR_W,
+                ui::MENU_H + ui::RULER_H - 1,
+                f.w as i32 - ui::TOOLBAR_W,
+                1,
+            ),
+            ui::DARK,
+        );
+        f.fill_rect(
+            Rect::new(
+                ui::TOOLBAR_W + ui::RULER_W - 1,
+                ui::MENU_H,
+                1,
+                c.bottom() - ui::MENU_H,
+            ),
+            ui::DARK,
+        );
+        let scale = self.viewport.scale;
+        let steps = [1i32, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000];
+        let step = steps
+            .iter()
+            .copied()
+            .find(|s| *s as f32 * scale >= 48.0)
+            .unwrap_or(10000);
+        // Horizontal ticks + labels.
+        let d0 = self.viewport.screen_to_doc((0.0, 0.0)).0;
+        let mut p = (d0 / step as f32).floor() as i32 * step;
+        loop {
+            let sx = c.x + (p as f32 * scale + self.viewport.offset.0) as i32;
+            if sx > c.right() {
+                break;
+            }
+            if sx >= c.x {
+                f.fill_rect(Rect::new(sx, ui::MENU_H + ui::RULER_H - 6, 1, 6), ui::DARK);
+                f.text(sx + 3, ui::MENU_H + 3, &p.to_string(), 1, ui::BLACK);
+            }
+            p += step;
+        }
+        // Vertical ticks + labels.
+        let e0 = self.viewport.screen_to_doc((0.0, 0.0)).1;
+        let mut q = (e0 / step as f32).floor() as i32 * step;
+        loop {
+            let sy = c.y + (q as f32 * scale + self.viewport.offset.1) as i32;
+            if sy > c.bottom() {
+                break;
+            }
+            if sy >= c.y {
+                f.fill_rect(
+                    Rect::new(ui::TOOLBAR_W + ui::RULER_W - 6, sy, 6, 1),
+                    ui::DARK,
+                );
+                // Vertical labels read top-down, one digit per row.
+                for (i, ch) in q.to_string().chars().enumerate() {
+                    f.text(
+                        ui::TOOLBAR_W + 5,
+                        sy + 3 + i as i32 * 9,
+                        &ch.to_string(),
+                        1,
+                        ui::BLACK,
+                    );
+                }
+            }
+            q += step;
+        }
+        // Cursor markers.
+        let (mx, my) = (self.cursor.0 as i32, self.cursor.1 as i32);
+        if c.contains(mx, my) {
+            f.fill_rect(Rect::new(mx, ui::MENU_H + ui::RULER_H - 9, 1, 9), ui::BLACK);
+            f.fill_rect(
+                Rect::new(ui::TOOLBAR_W + ui::RULER_W - 9, my, 9, 1),
+                ui::BLACK,
+            );
+        }
+    }
+
     fn draw_canvas(&mut self, f: &mut Frame) {
         self.ensure_render_cache();
-        let c = Self::canvas_rect(f.w, f.h);
+        let c = self.canvas_rect(f.w, f.h);
         f.fill_rect(c, ui::CANVAS_SURROUND);
         let origin = (
             c.x as f32 + self.viewport.offset.0,
@@ -2325,7 +2441,7 @@ impl App {
             return;
         }
         // ---- canvas
-        let canvas = Self::canvas_rect(self.win_size.0, self.win_size.1);
+        let canvas = self.canvas_rect(self.win_size.0, self.win_size.1);
         if !canvas.contains(mx, my) {
             return;
         }
@@ -2339,7 +2455,7 @@ impl App {
         match self.tool {
             Tool::Hand => self.drag = DragMode::Pan,
             Tool::Zoom => {
-                let local = (x - ui::TOOLBAR_W as f32, y - ui::MENU_H as f32);
+                let local = (x - canvas.x as f32, y - canvas.y as f32);
                 self.viewport
                     .zoom_at(local, if self.alt_down { 0.5 } else { 2.0 });
             }
@@ -2920,7 +3036,7 @@ impl App {
     }
 
     pub fn scroll(&mut self, delta: f32) {
-        let canvas = Self::canvas_rect(self.win_size.0, self.win_size.1);
+        let canvas = self.canvas_rect(self.win_size.0, self.win_size.1);
         let (mx, my) = (self.cursor.0 as i32, self.cursor.1 as i32);
         if canvas.contains(mx, my) {
             let local = (

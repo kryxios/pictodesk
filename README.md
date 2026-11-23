@@ -3,7 +3,7 @@
 An open-source desktop photo and image editor — local files, no cloud,
 no account, no subscription. Built feature by feature, in the open.
 
-**Status: v0.1.0 — Phase 1 complete: a real photo editor.** The UI
+**Status: v0.1.1 — Phase 1 complete: a real photo editor.** The UI
 and menus deliberately mirror Photoshop 1.0 (1990): same menu bar
 (File, Edit, Image, Mode, Filter, Select, Window), same toolbox,
 same dialogs — and, for now, the same single level of Undo.
@@ -27,7 +27,7 @@ What exists today:
   Filters (Gaussian Blur, Sharpen, Unsharp Mask, Add Noise);
   Image Size, Canvas Size, Crop, Rotate, Flip; a Histogram palette.
 - A desktop shell (`apps/pictodesk-app`): the Photoshop 1.0 workbench
-  — platinum menu bar and toolbox, floating Brushes/Histogram
+  — platinum menu bar and toolbox, rulers, floating Brushes/Histogram
   palettes, modal dialogs with live preview, one level of Undo.
   Open a file with `pictodesk-app photo.png`, or drag a file onto the
   window. Verify the UI headlessly with
