@@ -222,3 +222,64 @@ fn sixteen_bit_png_survives_import_exactly() {
     let p2 = back.render_pixel(1, 0);
     assert_eq!((p2.r, p2.g), (0xFF00, 0x00FF));
 }
+
+#[test]
+fn sixteen_bit_png_with_icc_profile_is_converted_on_import() {
+    use image::ImageEncoder;
+    use pictodesk_core::icc::IccProfile;
+
+    // A 16-bit PNG carrying an embedded Adobe RGB profile: the import
+    // must land in the sRGB working space, like an 8-bit file's does.
+    let adobe_bytes = moxcms::ColorProfile::new_adobe_rgb().encode().unwrap();
+    let mut buf16 = image::ImageBuffer::<image::Rgba<u16>, Vec<u16>>::new(2, 1);
+    buf16.put_pixel(0, 0, image::Rgba([0x8000, 0x4000, 0x2000, 0xFFFF]));
+    buf16.put_pixel(1, 0, image::Rgba([0x8000, 0x8000, 0x8000, 0xFFFF]));
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut enc = image::codecs::png::PngEncoder::new(&mut bytes);
+    enc.set_icc_profile(adobe_bytes).unwrap();
+    let raw16: Vec<u8> = buf16
+        .as_raw()
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    enc.write_image(&raw16, 2, 1, image::ExtendedColorType::Rgba16)
+        .unwrap();
+
+    let doc = import_image(&bytes).unwrap();
+    let p = doc.render_pixel(0, 0);
+    // Expected values: the same conversion run directly through the
+    // f32 ICC path.
+    let mut out = [0.0f32; 3];
+    IccProfile::adobe_rgb()
+        .convert_rgb_f32(
+            &IccProfile::srgb(),
+            &[
+                0x8000 as f32 / 65535.0,
+                0x4000 as f32 / 65535.0,
+                0x2000 as f32 / 65535.0,
+            ],
+            &mut out,
+        )
+        .unwrap();
+    let exp = |v: f32| (v.clamp(0.0, 1.0) * 65535.0 + 0.5) as i32;
+    assert!(
+        (p.r as i32 - exp(out[0])).abs() <= 2
+            && (p.g as i32 - exp(out[1])).abs() <= 2
+            && (p.b as i32 - exp(out[2])).abs() <= 2,
+        "imported {p:?} vs direct conversion {out:?}"
+    );
+    assert!(
+        (p.r as i32 - 0x8000).abs() > 100
+            || (p.g as i32 - 0x4000).abs() > 100
+            || (p.b as i32 - 0x2000).abs() > 100,
+        "the profile must actually be applied, not ignored: {p:?}"
+    );
+    assert_eq!(p.a, 0xFFFF, "alpha is not color-managed");
+    // Neutral gray stays neutral through the conversion (within the
+    // f32 transform's rounding — a few steps in 65535).
+    let g = doc.render_pixel(1, 0);
+    assert!(
+        (g.r as i32 - g.g as i32).abs() <= 8 && (g.g as i32 - g.b as i32).abs() <= 8,
+        "gray stays neutral: {g:?}"
+    );
+}

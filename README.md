@@ -3,7 +3,7 @@
 An open-source desktop photo and image editor — local files, no cloud,
 no account, no subscription. Built feature by feature, in the open.
 
-**Status: v0.3.3 — Phase 3 complete: layers, with the v0.3.0 reduced forms finished. First public alpha.**
+**Status: v0.3.4 — Phase 3 complete: layers, with the v0.3.0 reduced forms finished. First public alpha.**
 The UI follows the classic early-90s editor design: a File / Edit /
 Image / Mode / Filter / Select / Window menu bar, a compact
 two-column toolbox, modal dialogs with live preview, docked tabbed
@@ -42,7 +42,9 @@ What exists today:
   spot channels export as their own plates in a Separation TIFF;
   selection-to-path uses real Bézier curve fitting, and pen/path
   edits are undoable like everything else; Select > Grow and
-  Similar; 16-bit files now import bit-exact; CMYK documents save
+  Similar; 16-bit files now import bit-exact, and an embedded ICC
+  profile on a 16-bit file is converted into the working space at
+  full 16-bit precision, same as 8-bit files; CMYK documents save
   as true CMYK TIFFs with the clipping path embedded. The
   `.pdk` format is now v3 (v1/v2 files still load).
 - Phase 3: layers — a Layer menu and a Layers panel with live

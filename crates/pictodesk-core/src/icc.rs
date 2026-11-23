@@ -7,8 +7,9 @@
 //! What this provides:
 //! - Load any `.icc`/`.icm` profile from bytes or a file
 //! - Built-in sRGB and Adobe RGB profiles
-//! - Profile-to-profile conversion for RGBA8 buffers (display/export)
-//!   and RGB f32 buffers (the 16-bit pipeline converts via f32)
+//! - Profile-to-profile conversion for RGBA8 buffers (display/export),
+//!   RGB f32 buffers, and RGBA u16 buffers (the 16-bit pipeline
+//!   converts via f32, at full 16-bit precision)
 
 use std::path::Path;
 
@@ -102,6 +103,44 @@ impl IccProfile {
         Ok(())
     }
 
+    /// Convert RGBA u16 pixels (0..=65535 per channel) from this
+    /// profile to `dst`, in place. Alpha passes through untouched
+    /// (ICC transforms are color-only). Runs through the f32
+    /// transform in chunks, with the transform built once, so a huge
+    /// image never needs a second full-size buffer.
+    pub fn convert_rgba_u16(&self, dst: &IccProfile, pixels: &mut [u16]) -> Result<(), IccError> {
+        assert_eq!(pixels.len() % 4, 0);
+        let transform = self
+            .inner
+            .create_transform_f32(
+                Layout::Rgb,
+                &dst.inner,
+                Layout::Rgb,
+                TransformOptions::default(),
+            )
+            .map_err(|e| IccError(format!("{e:?}")))?;
+        const CHUNK: usize = 8192 * 4; // 8192 pixels per chunk
+        for chunk in pixels.chunks_mut(CHUNK) {
+            let n = chunk.len() / 4;
+            let mut src = vec![0.0f32; n * 3];
+            for (i, px) in chunk.as_chunks::<4>().0.iter().enumerate() {
+                src[i * 3] = px[0] as f32 / 65535.0;
+                src[i * 3 + 1] = px[1] as f32 / 65535.0;
+                src[i * 3 + 2] = px[2] as f32 / 65535.0;
+            }
+            let mut out = vec![0.0f32; n * 3];
+            transform
+                .transform(&src, &mut out)
+                .map_err(|e| IccError(format!("{e:?}")))?;
+            for (i, px) in chunk.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                for (c, v) in out[i * 3..i * 3 + 3].iter().enumerate() {
+                    px[c] = (v.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Convert RGB f32 triplets (0.0..=1.0) from this profile to `dst`.
     pub fn convert_rgb_f32(
         &self,
@@ -149,6 +188,25 @@ mod tests {
                 out[i]
             );
         }
+    }
+
+    #[test]
+    fn rgba_u16_conversion_keeps_gray_neutral_and_alpha_untouched() {
+        // One Adobe RGB color pixel + one neutral gray, odd alphas.
+        let mut px: Vec<u16> = vec![32768, 16384, 8192, 40000, 32768, 32768, 32768, 65535];
+        IccProfile::adobe_rgb()
+            .convert_rgba_u16(&IccProfile::srgb(), &mut px)
+            .unwrap();
+        assert_eq!(px[3], 40000, "alpha passes through untouched");
+        assert_eq!(px[7], 65535, "alpha passes through untouched");
+        assert!(
+            (px[4] as i32 - px[5] as i32).abs() <= 2 && (px[5] as i32 - px[6] as i32).abs() <= 2,
+            "neutral gray stays neutral: {px:?}"
+        );
+        assert!(
+            px[0] != 32768 || px[1] != 16384 || px[2] != 8192,
+            "a real profile conversion must move the color pixel: {px:?}"
+        );
     }
 
     #[test]

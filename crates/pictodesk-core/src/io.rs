@@ -85,10 +85,10 @@ pub fn import_image(bytes: &[u8]) -> Result<Document, IoError> {
         image::load_from_memory(bytes).map_err(|e| IoError::Decode(e.to_string()))?;
     let (w, h) = (img.width(), img.height());
     // 16-bit sources keep their full precision end to end (Phase 2:
-    // 16-bit/channel editing exposed). The ICC conversion path works
-    // at 8-bit, so it applies to 8-bit sources; a 16-bit file's
-    // profile conversion is a later refinement.
-    let pixels16: Option<Vec<Pixel16>> = img
+    // 16-bit/channel editing exposed), including color management:
+    // an embedded profile is converted into the sRGB working space
+    // through the f32 ICC path, at full 16-bit precision.
+    let mut pixels16: Option<Vec<Pixel16>> = img
         .as_rgba16()
         .map(|buf| {
             buf.as_raw()
@@ -108,6 +108,24 @@ pub fn import_image(bytes: &[u8]) -> Result<Document, IoError> {
                     .collect()
             })
         });
+    if let Some(pixels) = &mut pixels16 {
+        if let Some(profile_bytes) = &icc {
+            if let Ok(src_profile) = IccProfile::from_bytes(profile_bytes) {
+                let mut flat: Vec<u16> = pixels.iter().flat_map(|p| [p.r, p.g, p.b, p.a]).collect();
+                if src_profile
+                    .convert_rgba_u16(&IccProfile::srgb(), &mut flat)
+                    .is_ok()
+                {
+                    *pixels = flat
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|c| Pixel16::new(c[0], c[1], c[2], c[3]))
+                        .collect();
+                }
+            }
+        }
+    }
     let mut doc = Document::new(w, h);
     if let Some(pixels) = &pixels16 {
         for ty in 0..(h as i32 + 255) / 256 {

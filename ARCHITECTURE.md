@@ -45,20 +45,24 @@ engine as built, not future plans.
   capture the result. Memory cost scales with tiles touched, not
   canvas size.
 - **`format`** — the `.pdk` file format. v2 = header + DEFLATE
-  (flate2/miniz_oxide) over the complete v1 payload; the loader
-  dispatches on version and reads v1 files forever. Saves for
-  recovery are atomic (write temp, rename), so a crash mid-save
-  leaves the previous file intact.
+  (flate2/miniz_oxide) over the complete v1 payload; v3 adds an
+  extension block (color mode, alpha/spot channels, paths, layer
+  links, CMYK alpha planes, the provenance history log), every part
+  of it optional so older v3 files still load. The loader dispatches
+  on version and reads v1/v2 files forever. Saves for recovery are
+  atomic (write temp, rename), so a crash mid-save leaves the
+  previous file intact.
 
 ## Shell (`pictodesk-app`)
 
 - **`viewport`** — pure document↔screen math: fit, zoom-at-cursor
   (the document point under the cursor stays under the cursor),
   pan, clamping. Unit-tested separately from any window code.
-- **`shader.wgsl`** — one fullscreen triangle; the fragment shader
-  maps screen pixels through the viewport, samples the document
-  texture, draws a checkerboard behind transparency and a dark
-  surround outside the document.
+- **inline WGSL shader** (in `main.rs`) — one fullscreen triangle
+  that presents the CPU-drawn workbench framebuffer as a GPU
+  texture; the document area inside it is the engine's flattened
+  render over a checkerboard, with a dark surround outside the
+  document.
 - **`--shot <file.ppm>`** — verification mode: renders one frame
   offscreen through the same pipeline and writes it out, so the GPU
   path is testable on machines without a display.
