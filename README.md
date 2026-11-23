@@ -3,7 +3,7 @@
 An open-source desktop photo and image editor — local files, no cloud,
 no account, no subscription. Built feature by feature, in the open.
 
-**Status: v0.3.8 — Phase 3 complete: layers, with the v0.3.0 reduced forms finished. First public alpha.**
+**Status: v0.4.0 — Phase 4 complete: non-destructive editing — adjustment layers, layer masks, actions, navigator, guides. First public alpha.**
 The UI follows the classic early-90s editor design: a File / Edit /
 Image / Mode / Filter / Select / Window menu bar, a compact
 two-column toolbox, modal dialogs with live preview, docked tabbed
@@ -67,6 +67,20 @@ What exists today:
   every edit's label, with timestamps — viewable any time via
   File > History Log. (The undo stack itself stays session-only,
   same as the classics.)
+- Phase 4: non-destructive editing — adjustment layers (Levels,
+  Curves, Brightness/Contrast, Hue/Saturation, Color Balance,
+  Photo Filter) that stay editable forever and apply live to
+  everything beneath them; layer masks on any layer (paint to
+  hide/reveal, feather, disable without deleting); merging a
+  masked or adjustment layer bakes the pair's render, so the
+  picture itself never changes; an Actions palette that records
+  a sequence of edits and replays it on another image, plus
+  batch processing that runs an action over a whole folder of
+  images (originals untouched — results land as
+  `<name>-edited.png`); a Navigator palette; guides dragged out
+  of the rulers, a grid, and snapping; and right-click context
+  menus. Masks, adjustment settings, and guides all save in the
+  `.pdk` file.
 - A desktop shell (`apps/pictodesk-app`): the classic 1990-era workbench
   — platinum menu bar and toolbox, rulers, docked tabbed palettes
   (Channels/Paths, Brushes, Histogram, Color), modal dialogs with

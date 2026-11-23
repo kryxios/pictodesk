@@ -100,6 +100,10 @@ pub struct Document {
     pub clipping_path: Option<usize>,
     /// Provenance event log, stored in the `.pdk` file.
     pub history_log: Vec<HistoryEvent>,
+    /// Vertical guide positions in document pixels (Phase 4).
+    pub guides_x: Vec<i32>,
+    /// Horizontal guide positions in document pixels (Phase 4).
+    pub guides_y: Vec<i32>,
 }
 
 impl Document {
@@ -119,6 +123,8 @@ impl Document {
             work_path: None,
             clipping_path: None,
             history_log: Vec::new(),
+            guides_x: Vec::new(),
+            guides_y: Vec::new(),
         }
     }
 
@@ -184,6 +190,63 @@ impl Document {
     pub fn merge_down(&mut self, idx: usize) -> bool {
         if idx == 0 || idx >= self.layers.len() {
             return false;
+        }
+        // Phase 4 bake path: when either layer carries a mask, or
+        // the top is an adjustment layer (which has no pixels of its
+        // own), the pair is rendered together and the result becomes
+        // one plain layer — the only way to keep the composite
+        // identical after the merge.
+        let needs_bake = self.layers[idx].adjustment.is_some()
+            || self.layers[idx].mask.is_some()
+            || self.layers[idx - 1].mask.is_some();
+        if needs_bake {
+            let mut pair = Document::new(self.width, self.height);
+            pair.mode = self.mode;
+            pair.working_space = self.working_space;
+            let mut below = self.layers[idx - 1].clone();
+            // The merged layer inherits the bottom layer's blend
+            // mode and opacity (the classic merge rule), so the pair
+            // is baked with the bottom layer at Normal / 100% and
+            // those properties are re-applied to the result.
+            let (bmode, bop) = (below.blend_mode, below.opacity);
+            below.blend_mode = crate::blend::BlendMode::Normal;
+            below.opacity = 1.0;
+            pair.layers = vec![below, self.layers[idx].clone()];
+            let mut merged = Layer::new(self.layers[idx - 1].name.clone());
+            merged.blend_mode = bmode;
+            merged.opacity = bop;
+            match self.mode {
+                ColorMode::Cmyk => {
+                    for y in 0..self.height as i32 {
+                        for x in 0..self.width as i32 {
+                            let (ink, a) = pair.composite_inks(x, y);
+                            if a > 0.0 {
+                                let e = |v: f32| (v.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
+                                merged.set_pixel(
+                                    x,
+                                    y,
+                                    Pixel16::from_f32s(ink[0], ink[1], ink[2], ink[3]),
+                                );
+                                merged.set_alpha(x, y, e(a));
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    for y in 0..self.height as i32 {
+                        for x in 0..self.width as i32 {
+                            let p = pair.render_pixel(x, y);
+                            if p.a > 0 {
+                                merged.set_pixel(x, y, p);
+                            }
+                        }
+                    }
+                }
+            }
+            self.layers.remove(idx);
+            self.layers[idx - 1] = merged;
+            self.active_layer = idx - 1;
+            return true;
         }
         let top = self.layers.remove(idx);
         if top.visible {
@@ -363,6 +426,16 @@ impl Document {
         l.set_alpha(x, y, v.4);
     }
 
+    /// The layer's mask strength at (x, y) as 0.0..=1.0 — 1.0 when
+    /// there is no mask or the mask is disabled.
+    fn mask_factor(layer: &Layer, x: i32, y: i32) -> f32 {
+        if layer.mask.is_some() && layer.mask_enabled {
+            layer.mask_value(x, y) as f32 / 255.0
+        } else {
+            1.0
+        }
+    }
+
     /// Flattened pixel at (x, y): all visible layers composited.
     /// CMYK documents composite in ink space and convert to RGB.
     pub fn render_pixel(&self, x: i32, y: i32) -> Pixel16 {
@@ -376,7 +449,22 @@ impl Document {
             if !layer.visible {
                 continue;
             }
-            let p = layer.get_pixel(x, y).to_f32s();
+            if let Some(adj) = &layer.adjustment {
+                // Adjustment layer: transform the composite of
+                // everything below, strength = opacity x mask.
+                if acc.3 > 0.0 {
+                    let t = layer.opacity * Self::mask_factor(layer, x, y);
+                    if t > 0.0 {
+                        let (r, g, b) = adj.apply(acc.0, acc.1, acc.2);
+                        acc.0 += (r - acc.0) * t;
+                        acc.1 += (g - acc.1) * t;
+                        acc.2 += (b - acc.2) * t;
+                    }
+                }
+                continue;
+            }
+            let mut p = layer.get_pixel(x, y).to_f32s();
+            p.3 *= Self::mask_factor(layer, x, y);
             acc = composite_over(acc, p, layer.blend_mode, layer.opacity);
         }
         Pixel16::from_f32s(acc.0, acc.1, acc.2, acc.3)
@@ -390,8 +478,23 @@ impl Document {
             if !layer.visible {
                 continue;
             }
+            if let Some(adj) = &layer.adjustment {
+                if acc.1 > 0.0 {
+                    let t = layer.opacity * Self::mask_factor(layer, x, y);
+                    if t > 0.0 {
+                        let (r, g, b) = cmyk_to_rgb(acc.0[0], acc.0[1], acc.0[2], acc.0[3]);
+                        let (r, g, b) = adj.apply(r, g, b);
+                        let (ic, im, iy, ik) = crate::color::rgb_to_cmyk(r, g, b);
+                        let ink = [ic, im, iy, ik];
+                        for (acc_v, ink_v) in acc.0.iter_mut().zip(ink.iter()) {
+                            *acc_v += (ink_v - *acc_v) * t;
+                        }
+                    }
+                }
+                continue;
+            }
             let p = layer.get_pixel(x, y).to_f32s();
-            let a = layer.get_alpha(x, y) as f32 / 65535.0;
+            let a = layer.get_alpha(x, y) as f32 / 65535.0 * Self::mask_factor(layer, x, y);
             acc = composite_over_inks(
                 acc,
                 ([p.0, p.1, p.2, p.3], a),
@@ -400,6 +503,70 @@ impl Document {
             );
         }
         acc
+    }
+
+    /// Add an adjustment layer above the active layer and make it
+    /// active; returns its index. It starts with a reveal-all mask,
+    /// like the classic editor's adjustment layers.
+    pub fn add_adjustment_layer(
+        &mut self,
+        name: impl Into<String>,
+        adj: crate::adjust::Adjustment,
+    ) -> usize {
+        let mut layer = Layer::new(name);
+        layer.adjustment = Some(adj);
+        layer.add_mask(255);
+        let at = (self.active_layer + 1).min(self.layers.len());
+        self.layers.insert(at, layer);
+        self.active_layer = at;
+        at
+    }
+
+    /// Soften a layer's mask edges with a box blur of the given
+    /// radius (document pixels) — the "feather the mask" operation.
+    pub fn feather_mask(&mut self, layer_idx: usize, radius: u32) {
+        let (w, h) = (self.width as i32, self.height as i32);
+        let layer = &mut self.layers[layer_idx];
+        if layer.mask.is_none() || radius == 0 {
+            return;
+        }
+        let mut plane: Vec<u8> = Vec::with_capacity((w * h) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                plane.push(layer.mask_value(x, y));
+            }
+        }
+        let r = radius as i32;
+        let mut out = vec![0u8; plane.len()];
+        for y in 0..h {
+            for x in 0..w {
+                let (mut sum, mut n) = (0u32, 0u32);
+                for dy in -r..=r {
+                    for dx in -r..=r {
+                        let (sx, sy) = (x + dx, y + dy);
+                        if sx >= 0 && sy >= 0 && sx < w && sy < h {
+                            sum += plane[(sy * w + sx) as usize] as u32;
+                            n += 1;
+                        }
+                    }
+                }
+                out[(y * w + x) as usize] = (sum / n.max(1)) as u8;
+            }
+        }
+        // Rewrite sparsely: tiles that are uniformly the fill value
+        // are dropped back to the default.
+        let fill = layer.mask_fill;
+        if let Some(mask) = &mut layer.mask {
+            mask.clear();
+        }
+        for y in 0..h {
+            for x in 0..w {
+                let v = out[(y * w + x) as usize];
+                if v != fill {
+                    layer.set_mask_value(x, y, v);
+                }
+            }
+        }
     }
 
     /// The flattened CMYK pixel as it would print: layers composited

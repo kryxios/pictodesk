@@ -110,6 +110,44 @@ re-apply, commit on OK), a file-open panel, drag-and-drop, and the
 1.0-authentic single level of Undo (`History::set_limit(Some(1))` —
 the engine itself is unlimited; later phases raise the cap).
 
+## Phase 4 additions (v0.4.0)
+
+- `adjust.rs` — the `Adjustment` enum is the single source of
+  truth for adjustment math: the destructive Image > Adjust
+  commands and adjustment layers both call `Adjustment::apply`.
+  Six kinds: Levels, Curves, Brightness/Contrast, Hue/Saturation,
+  Color Balance, Photo Filter (tint toward a filter color at the
+  pixel's own luminance, blended by density).
+- Layers grow two optional fields: a sparse tile-plane mask
+  (`mask`, with `mask_fill` as the absent-tile value and a
+  `mask_enabled` switch) and an `adjustment`. Compositing
+  multiplies a layer's alpha by its mask factor; an adjustment
+  layer transforms the accumulated composite beneath it,
+  weighted by opacity × mask factor. CMYK documents route the
+  composite through RGB for the adjustment and back into ink
+  space. Masks survive transforms, flips, and image resizes.
+- `merge_down` gains a bake path: when either layer carries a
+  mask, or the top layer is an adjustment layer, the pair is
+  rendered in isolation and the result inherits the bottom
+  layer's blend mode and opacity — the composite is bit-identical
+  after the merge (test-covered). The old fast path dropped
+  masks silently; it now only runs for plain layer pairs.
+- `.pdk`: masks, adjustment parameters, and guides ride as one
+  more optional trailing section of the v3 envelope; files
+  written before Phase 4 load unchanged.
+- Guides live on the Document (`guides_x` / `guides_y`). The
+  shell adds drag-from-the-ruler guide creation, Move-tool guide
+  dragging (drag off-canvas to delete), a toggleable grid, and
+  snapping of Move-tool drags to guides and grid. The Navigator
+  palette shows a thumbnail with the visible-area rectangle and
+  click/drag panning. Right-click context menus cover the canvas
+  and the Layers panel rows.
+- Actions: the shell records steps (adjustments, filters,
+  geometry, layer operations) into named actions, replays them
+  as one undoable step, and batch-processes a folder — each
+  image imported, stepped, and written back as
+  `<name>-edited.png` beside the untouched original.
+
 ## Phase 3 additions (v0.3.0)
 
 - Layers become the working surface: the document's layer stack

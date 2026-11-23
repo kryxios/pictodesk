@@ -268,6 +268,98 @@ fn serialize_ext(w: &mut Writer, doc: &Document) {
         w.u16(name.len() as u16);
         w.bytes(name);
     }
+    // Phase 4 section (v0.4.0 addition, also optional trailing):
+    // per layer a mask block then an adjustment block, then the
+    // document guides.
+    for layer in &doc.layers {
+        match &layer.mask {
+            Some(mask) => {
+                w.u8(1);
+                w.u8(layer.mask_enabled as u8);
+                w.u8(layer.mask_fill);
+                w.u32(mask.len() as u32);
+                let mut coords: Vec<_> = mask.keys().copied().collect();
+                coords.sort();
+                for coord in coords {
+                    w.i32(coord.0);
+                    w.i32(coord.1);
+                    w.bytes(&mask[&coord]);
+                }
+            }
+            None => w.u8(0),
+        }
+        use crate::adjust::Adjustment;
+        match &layer.adjustment {
+            None => w.u8(0),
+            Some(Adjustment::Levels {
+                in_black,
+                in_white,
+                gamma,
+                out_black,
+                out_white,
+            }) => {
+                w.u8(1);
+                w.u8(*in_black);
+                w.u8(*in_white);
+                w.f32(*gamma);
+                w.u8(*out_black);
+                w.u8(*out_white);
+            }
+            Some(Adjustment::Curves { points }) => {
+                w.u8(2);
+                w.u8(points.len() as u8);
+                for (px, py) in points {
+                    w.u8(*px);
+                    w.u8(*py);
+                }
+            }
+            Some(Adjustment::BrightnessContrast {
+                brightness,
+                contrast,
+            }) => {
+                w.u8(3);
+                w.i32(*brightness);
+                w.i32(*contrast);
+            }
+            Some(Adjustment::HueSaturation {
+                hue,
+                saturation,
+                lightness,
+            }) => {
+                w.u8(4);
+                w.i32(*hue);
+                w.i32(*saturation);
+                w.i32(*lightness);
+            }
+            Some(Adjustment::ColorBalance {
+                shadows,
+                midtones,
+                highlights,
+            }) => {
+                w.u8(5);
+                for t in [shadows, midtones, highlights] {
+                    w.i32(t.0);
+                    w.i32(t.1);
+                    w.i32(t.2);
+                }
+            }
+            Some(Adjustment::PhotoFilter { color, density }) => {
+                w.u8(6);
+                w.u8(color.0);
+                w.u8(color.1);
+                w.u8(color.2);
+                w.u8(*density);
+            }
+        }
+    }
+    w.u32(doc.guides_x.len() as u32);
+    for g in &doc.guides_x {
+        w.i32(*g);
+    }
+    w.u32(doc.guides_y.len() as u32);
+    for g in &doc.guides_y {
+        w.i32(*g);
+    }
 }
 
 /// The current (v3) serialization: header + DEFLATE-compressed
@@ -442,6 +534,75 @@ fn parse_ext(payload: &[u8], doc: &mut Document) -> Result<(), FormatError> {
                 .map_err(|_| FormatError::Corrupt("history action not UTF-8"))?;
             doc.history_log
                 .push(crate::document::HistoryEvent { when, action });
+        }
+    }
+    // Optional trailing section: Phase 4 masks, adjustment layers,
+    // and guides (v0.4.0). Files written before it end exactly here.
+    if r.pos < payload.len() {
+        use crate::adjust::Adjustment;
+        for layer in &mut doc.layers {
+            if r.u8()? != 0 {
+                layer.mask_enabled = r.u8()? != 0;
+                layer.mask_fill = r.u8()?;
+                let count = r.u32()?;
+                let mut mask = std::collections::HashMap::new();
+                for _ in 0..count {
+                    let coord = (r.i32()?, r.i32()?);
+                    let data = r.take(crate::tile::TILE_PIXELS)?.to_vec();
+                    mask.insert(coord, data);
+                }
+                layer.mask = Some(mask);
+            }
+            layer.adjustment = match r.u8()? {
+                0 => None,
+                1 => Some(Adjustment::Levels {
+                    in_black: r.u8()?,
+                    in_white: r.u8()?,
+                    gamma: r.f32()?,
+                    out_black: r.u8()?,
+                    out_white: r.u8()?,
+                }),
+                2 => {
+                    let n = r.u8()?;
+                    let mut points = Vec::new();
+                    for _ in 0..n {
+                        points.push((r.u8()?, r.u8()?));
+                    }
+                    Some(Adjustment::Curves { points })
+                }
+                3 => Some(Adjustment::BrightnessContrast {
+                    brightness: r.i32()?,
+                    contrast: r.i32()?,
+                }),
+                4 => Some(Adjustment::HueSaturation {
+                    hue: r.i32()?,
+                    saturation: r.i32()?,
+                    lightness: r.i32()?,
+                }),
+                5 => {
+                    let read3 = |r: &mut Reader| -> Result<(i32, i32, i32), FormatError> {
+                        Ok((r.i32()?, r.i32()?, r.i32()?))
+                    };
+                    Some(Adjustment::ColorBalance {
+                        shadows: read3(&mut r)?,
+                        midtones: read3(&mut r)?,
+                        highlights: read3(&mut r)?,
+                    })
+                }
+                6 => Some(Adjustment::PhotoFilter {
+                    color: (r.u8()?, r.u8()?, r.u8()?),
+                    density: r.u8()?,
+                }),
+                _ => return Err(FormatError::Corrupt("unknown adjustment kind")),
+            };
+        }
+        let nx = r.u32()?;
+        for _ in 0..nx {
+            doc.guides_x.push(r.i32()?);
+        }
+        let ny = r.u32()?;
+        for _ in 0..ny {
+            doc.guides_y.push(r.i32()?);
         }
     }
     Ok(())

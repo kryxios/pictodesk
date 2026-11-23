@@ -162,6 +162,8 @@ enum PanelKind {
     Brushes,
     Histogram,
     Color,
+    Navigator,
+    Actions,
 }
 
 // ---------------------------------------------------------------- actions
@@ -221,6 +223,26 @@ enum Action {
     MergeDown,
     MergeVisible,
     FlattenImage,
+    NewAdjustment(&'static str),
+    EditAdjustment,
+    AddMaskReveal,
+    AddMaskHide,
+    AddMaskSelection,
+    DeleteMask,
+    ToggleMaskEnabled,
+    FeatherMask,
+    ToggleNavigator,
+    ToggleActionsPanel,
+    ToggleGuides,
+    ToggleGrid,
+    ToggleSnap,
+    ClearGuides,
+    MacroRecord,
+    MacroStop,
+    MacroPlay,
+    MacroNew,
+    MacroDelete,
+    MacroBatch,
     TogglePaths,
     ToggleColor,
     ToggleRulers,
@@ -305,6 +327,9 @@ enum DialogKind {
     NewLayer,
     LayerOptions,
     HistoryLog,
+    PhotoFilter,
+    FeatherMask,
+    Batch,
 }
 
 impl DialogKind {
@@ -332,6 +357,9 @@ impl DialogKind {
             DialogKind::NewLayer => "New Layer",
             DialogKind::LayerOptions => "Layer Options",
             DialogKind::HistoryLog => "History Log",
+            DialogKind::PhotoFilter => "Photo Filter",
+            DialogKind::FeatherMask => "Feather Mask",
+            DialogKind::Batch => "Batch Process",
         }
     }
     /// Pixel dialogs preview live through a tile-snapshot command.
@@ -348,6 +376,7 @@ impl DialogKind {
                 | DialogKind::GaussianBlur
                 | DialogKind::Unsharp
                 | DialogKind::AddNoise
+                | DialogKind::PhotoFilter
         )
     }
 }
@@ -371,6 +400,14 @@ struct Dialog {
     /// Live-preview snapshot (pixel dialogs only).
     preview: Option<TileEditCommand>,
     slider_drag: Option<usize>,
+    /// Photo Filter color (preset swatches set this).
+    photo_color: (u8, u8, u8),
+    /// When set, this dialog edits an adjustment layer's parameters
+    /// live instead of previewing a destructive edit (Phase 4).
+    adj_layer: Option<usize>,
+    /// Document state before an adjustment-layer dialog opened, so
+    /// Cancel can restore it and OK can record one undo step.
+    adj_snapshot: Option<Document>,
 }
 
 impl Dialog {
@@ -399,6 +436,9 @@ impl Dialog {
             DialogKind::Fill => vec![100.0],
             DialogKind::SaveAs => vec![],
             DialogKind::HistoryLog => vec![],
+            DialogKind::PhotoFilter => vec![25.0],
+            DialogKind::FeatherMask => vec![5.0],
+            DialogKind::Batch => vec![],
         };
         Dialog {
             kind,
@@ -412,6 +452,9 @@ impl Dialog {
             text_focus: false,
             preview: None,
             slider_drag: None,
+            photo_color: (255, 178, 84),
+            adj_layer: None,
+            adj_snapshot: None,
         }
     }
 
@@ -452,10 +495,13 @@ impl Dialog {
             }
             DialogKind::Feather => vec![("Radius", 0.0, 250.0)],
             DialogKind::Fill => vec![("Opacity", 0.0, 100.0)],
+            DialogKind::PhotoFilter => vec![("Density", 0.0, 100.0)],
+            DialogKind::FeatherMask => vec![("Radius", 0.0, 250.0)],
             DialogKind::Curves
             | DialogKind::SaveAs
             | DialogKind::SavePath
             | DialogKind::HistoryLog
+            | DialogKind::Batch
             | DialogKind::NewLayer => vec![],
             DialogKind::LayerOptions => vec![("Opacity", 0.0, 100.0)],
             DialogKind::GrowSel | DialogKind::SimilarSel => vec![("Tolerance", 0.0, 255.0)],
@@ -488,6 +534,8 @@ enum DragMode {
     MenuNav,
     PenNew,
     PenDrag,
+    NavDrag,
+    GuideDrag,
 }
 
 struct StrokeState {
@@ -505,20 +553,165 @@ enum ChannelView {
     Composite,
     Channel(usize), // index into the mode's channel list (R,G,B / C,M,Y,K / Gray)
     Alpha(usize),
+    /// A layer mask, shown as grayscale (Phase 4).
+    Mask(usize),
 }
 
-/// Where painting lands: the image itself, or one alpha channel.
+/// Where painting lands: the image itself, one alpha channel, or a
+/// layer mask (Phase 4).
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum PaintTarget {
     Image,
     Alpha(usize),
+    Mask(usize),
 }
+
+/// Photo Filter preset colors (Phase 4): name + 8-bit RGB.
+const PHOTO_FILTER_PRESETS: [(&str, (u8, u8, u8)); 6] = [
+    ("Warming", (255, 178, 84)),
+    ("Cooling", (96, 165, 255)),
+    ("Red", (255, 60, 40)),
+    ("Green", (60, 200, 90)),
+    ("Blue", (60, 90, 255)),
+    ("Sepia", (172, 122, 58)),
+];
 
 /// A path identity: the unsaved work path or a saved path by index.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum PathRef {
     Work,
     Saved(usize),
+}
+
+/// One replayable step of a recorded Action (Phase 4). Steps carry
+/// their full parameters so replay needs no dialogs.
+#[derive(Clone, Debug)]
+enum RecordedStep {
+    Adjustment(pictodesk_core::adjust::Adjustment),
+    AdjustmentLayer(pictodesk_core::adjust::Adjustment),
+    Posterize(u8),
+    Threshold(u8),
+    Invert,
+    Desaturate,
+    GaussianBlur(f32),
+    Unsharp(f32, f32, u8),
+    AddNoise(f32),
+    ImageSize(u32, u32),
+    CanvasSize(u32, u32, (i32, i32)),
+    Rotate180,
+    Rotate90Cw,
+    Rotate90Ccw,
+    FlipH,
+    FlipV,
+    Flatten,
+    CropToSelection,
+}
+
+impl RecordedStep {
+    fn label(&self) -> String {
+        match self {
+            RecordedStep::Adjustment(a) => a.name().to_string(),
+            RecordedStep::AdjustmentLayer(a) => format!("{} Layer", a.name()),
+            RecordedStep::Posterize(_) => "Posterize".into(),
+            RecordedStep::Threshold(_) => "Threshold".into(),
+            RecordedStep::Invert => "Invert".into(),
+            RecordedStep::Desaturate => "Desaturate".into(),
+            RecordedStep::GaussianBlur(_) => "Gaussian Blur".into(),
+            RecordedStep::Unsharp(..) => "Unsharp Mask".into(),
+            RecordedStep::AddNoise(_) => "Add Noise".into(),
+            RecordedStep::ImageSize(..) => "Image Size".into(),
+            RecordedStep::CanvasSize(..) => "Canvas Size".into(),
+            RecordedStep::Rotate180 => "Rotate 180".into(),
+            RecordedStep::Rotate90Cw => "Rotate 90 CW".into(),
+            RecordedStep::Rotate90Ccw => "Rotate 90 CCW".into(),
+            RecordedStep::FlipH => "Flip Horizontal".into(),
+            RecordedStep::FlipV => "Flip Vertical".into(),
+            RecordedStep::Flatten => "Flatten Image".into(),
+            RecordedStep::CropToSelection => "Crop".into(),
+        }
+    }
+}
+
+/// A named, replayable sequence of steps (Phase 4 Actions).
+#[derive(Clone, Debug)]
+struct RecordedAction {
+    name: String,
+    steps: Vec<RecordedStep>,
+}
+
+/// A right-click context menu (Phase 4): items are (label, action,
+/// enabled), drawn at (x, y) like a menu-bar dropdown.
+struct ContextMenu {
+    x: i32,
+    y: i32,
+    items: Vec<(String, Action, bool)>,
+}
+
+/// Apply one recorded step to a document (shared by action replay
+/// and batch processing). Adjustments land on the active layer.
+fn apply_step(doc: &mut Document, step: &RecordedStep, sel: Option<&Selection>) {
+    use pictodesk_core::adjust::Adjustment;
+    let layer = doc.active_layer;
+    match step {
+        RecordedStep::Adjustment(adj) => match adj {
+            Adjustment::Levels {
+                in_black,
+                in_white,
+                gamma,
+                out_black,
+                out_white,
+            } => adjust::levels(
+                doc, layer, sel, *in_black, *in_white, *gamma, *out_black, *out_white,
+            ),
+            Adjustment::Curves { points } => adjust::curves(doc, layer, sel, points),
+            Adjustment::BrightnessContrast {
+                brightness,
+                contrast,
+            } => adjust::brightness_contrast(doc, layer, sel, *brightness, *contrast),
+            Adjustment::HueSaturation {
+                hue,
+                saturation,
+                lightness,
+            } => adjust::hue_saturation(doc, layer, sel, *hue, *saturation, *lightness),
+            Adjustment::ColorBalance {
+                shadows,
+                midtones,
+                highlights,
+            } => adjust::color_balance(doc, layer, sel, *shadows, *midtones, *highlights),
+            Adjustment::PhotoFilter { color, density } => {
+                adjust::photo_filter(doc, layer, sel, *color, *density)
+            }
+        },
+        RecordedStep::AdjustmentLayer(adj) => {
+            doc.add_adjustment_layer(adj.name(), adj.clone());
+        }
+        RecordedStep::Posterize(n) => adjust::posterize(doc, layer, sel, *n),
+        RecordedStep::Threshold(n) => adjust::threshold(doc, layer, sel, *n),
+        RecordedStep::Invert => adjust::invert(doc, layer, sel),
+        RecordedStep::Desaturate => adjust::desaturate(doc, layer, sel),
+        RecordedStep::GaussianBlur(r) => filter::gaussian_blur(doc, layer, sel, *r),
+        RecordedStep::Unsharp(a, r, t) => filter::unsharp_mask(doc, layer, sel, *a, *r, *t),
+        RecordedStep::AddNoise(a) => filter::add_noise(doc, layer, sel, *a, 12345),
+        RecordedStep::ImageSize(w, h) => transform::resize_image(doc, *w, *h),
+        RecordedStep::CanvasSize(w, h, anchor) => transform::canvas_size(doc, *w, *h, *anchor),
+        RecordedStep::Rotate180 => transform::rotate_180(doc),
+        RecordedStep::Rotate90Cw => transform::rotate_90_cw(doc),
+        RecordedStep::Rotate90Ccw => transform::rotate_90_ccw(doc),
+        RecordedStep::FlipH => transform::flip_horizontal(doc),
+        RecordedStep::FlipV => transform::flip_vertical(doc),
+        RecordedStep::Flatten => doc.flatten(),
+        RecordedStep::CropToSelection => {
+            if let Some((x, y, w, h)) = sel.and_then(|s| s.bounds()) {
+                transform::crop(doc, x, y, w, h);
+            }
+        }
+    }
+}
+
+fn apply_steps(doc: &mut Document, steps: &[RecordedStep], sel: Option<&Selection>) {
+    for step in steps {
+        apply_step(doc, step, sel);
+    }
 }
 
 struct App {
@@ -561,6 +754,19 @@ struct App {
     /// one undo step when the gesture ends (path edits are undoable).
     path_before: Option<Document>,
     alpha_last: (f32, f32),
+    // Phase 4: navigator, guides/grid/snap, actions, context menu.
+    show_navigator: bool,
+    show_actions: bool,
+    show_guides: bool,
+    show_grid: bool,
+    snap_enabled: bool,
+    actions: Vec<RecordedAction>,
+    active_action: usize,
+    recording: bool,
+    context_menu: Option<ContextMenu>,
+    /// Guide being dragged out of a ruler, or an existing guide
+    /// being moved: (vertical?, doc position, existing index).
+    guide_drag: Option<(bool, i32, Option<usize>)>,
     file_panel: Option<Vec<PathBuf>>,
     // interaction
     cursor: (f32, f32),
@@ -638,6 +844,16 @@ impl App {
             alpha_cmd: None,
             path_before: None,
             alpha_last: (0.0, 0.0),
+            show_navigator: true,
+            show_actions: false,
+            show_guides: true,
+            show_grid: false,
+            snap_enabled: true,
+            actions: Vec::new(),
+            active_action: 0,
+            recording: false,
+            context_menu: None,
+            guide_drag: None,
             file_panel: None,
             cursor: (0.0, 0.0),
             mouse_down: false,
@@ -689,7 +905,12 @@ impl App {
     }
 
     fn dock_open(&self) -> bool {
-        self.show_cp || self.show_brushes || self.show_histogram || self.show_palette
+        self.show_cp
+            || self.show_brushes
+            || self.show_histogram
+            || self.show_palette
+            || self.show_navigator
+            || self.show_actions
     }
 
     fn channel_row_count(&self) -> usize {
@@ -736,6 +957,12 @@ impl App {
         }
         if self.show_palette {
             place(PanelKind::Color, 168, &mut out, &mut y);
+        }
+        if self.show_navigator {
+            place(PanelKind::Navigator, 128, &mut out, &mut y);
+        }
+        if self.show_actions {
+            place(PanelKind::Actions, 158, &mut out, &mut y);
         }
         out
     }
@@ -844,6 +1071,7 @@ impl App {
                         MenuItem::new("Desaturate", Action::AdjustDialog("desat")),
                         MenuItem::new("Posterize...", Action::AdjustDialog("posterize")),
                         MenuItem::new("Threshold...", Action::AdjustDialog("threshold")),
+                        MenuItem::new("Photo Filter...", Action::AdjustDialog("photo")),
                     ]),
                 ],
             },
@@ -859,12 +1087,39 @@ impl App {
                             MenuItem::new(m.name(), Action::BlendMode(i)).check_if(*m == cur)
                         })
                         .collect();
+                    let has_mask = self.doc.layers[a].mask.is_some();
+                    let is_adj = self.doc.layers[a].adjustment.is_some();
                     vec![
                         MenuItem::new("New Layer...", Action::NewLayer).key("Shift+N"),
+                        MenuItem::new("New Adjustment Layer", Action::None).sub(vec![
+                            MenuItem::new("Levels...", Action::NewAdjustment("levels")),
+                            MenuItem::new("Curves...", Action::NewAdjustment("curves")),
+                            MenuItem::new(
+                                "Brightness/Contrast...",
+                                Action::NewAdjustment("brightness"),
+                            ),
+                            MenuItem::new("Hue/Saturation...", Action::NewAdjustment("hue")),
+                            MenuItem::new("Color Balance...", Action::NewAdjustment("balance")),
+                            MenuItem::new("Photo Filter...", Action::NewAdjustment("photo")),
+                        ]),
+                        MenuItem::new("Edit Adjustment Layer...", Action::EditAdjustment)
+                            .off_if(!is_adj),
                         MenuItem::new("Duplicate Layer", Action::DuplicateLayer),
                         MenuItem::new("Delete Layer", Action::DeleteLayer)
                             .off_if(self.doc.layers.len() <= 1),
                         MenuItem::new("Layer Options...", Action::LayerOptions),
+                        MenuItem::new("Add Layer Mask", Action::None)
+                            .off_if(has_mask)
+                            .sub(vec![
+                                MenuItem::new("Reveal All", Action::AddMaskReveal),
+                                MenuItem::new("Hide All", Action::AddMaskHide),
+                                MenuItem::new("From Selection", Action::AddMaskSelection)
+                                    .off_if(!has_sel),
+                            ]),
+                        MenuItem::new("Delete Layer Mask", Action::DeleteMask).off_if(!has_mask),
+                        MenuItem::new("Disable/Enable Mask", Action::ToggleMaskEnabled)
+                            .off_if(!has_mask),
+                        MenuItem::new("Feather Mask...", Action::FeatherMask).off_if(!has_mask),
                         MenuItem::new("Blend Mode", Action::None).sub(blend_items),
                         MenuItem::new("Bring Forward", Action::BringForward).key("]"),
                         MenuItem::new("Send Backward", Action::SendBackward).key("["),
@@ -937,7 +1192,16 @@ impl App {
                     MenuItem::new("Paths", Action::TogglePaths)
                         .check_if(self.show_cp && self.cp_tab == 2),
                     MenuItem::new("Color", Action::ToggleColor).check_if(self.show_palette),
+                    MenuItem::new("Navigator", Action::ToggleNavigator)
+                        .check_if(self.show_navigator),
+                    MenuItem::new("Actions", Action::ToggleActionsPanel)
+                        .check_if(self.show_actions),
                     MenuItem::new("Rulers", Action::ToggleRulers).check_if(self.show_rulers),
+                    MenuItem::new("Guides", Action::ToggleGuides).check_if(self.show_guides),
+                    MenuItem::new("Grid", Action::ToggleGrid).check_if(self.show_grid),
+                    MenuItem::new("Snap", Action::ToggleSnap).check_if(self.snap_enabled),
+                    MenuItem::new("Clear Guides", Action::ClearGuides)
+                        .off_if(self.doc.guides_x.is_empty() && self.doc.guides_y.is_empty()),
                     MenuItem::new("Zoom In", Action::ZoomIn).key("+"),
                     MenuItem::new("Zoom Out", Action::ZoomOut).key("-"),
                     MenuItem::new("Actual Pixels", Action::Zoom100).key("1"),
@@ -995,6 +1259,255 @@ impl App {
         self.last_label = Some(label.to_string());
         self.status = label.to_string();
         self.touch();
+    }
+
+    /// If an Actions recording is running, append a step to it.
+    fn record_step(&mut self, step: RecordedStep) {
+        if self.recording {
+            if let Some(a) = self.actions.get_mut(self.active_action) {
+                a.steps.push(step);
+            }
+        }
+    }
+
+    /// Build the Adjustment a dialog's current values describe.
+    fn adjustment_from_dialog(d: &Dialog) -> pictodesk_core::adjust::Adjustment {
+        use pictodesk_core::adjust::Adjustment;
+        let v = &d.vals;
+        match d.kind {
+            DialogKind::Levels => Adjustment::Levels {
+                in_black: v[0] as u8,
+                in_white: v[1] as u8,
+                gamma: v[2],
+                out_black: v[3] as u8,
+                out_white: v[4] as u8,
+            },
+            DialogKind::Curves => Adjustment::Curves {
+                points: d.curve_points.clone(),
+            },
+            DialogKind::BrightnessContrast => Adjustment::BrightnessContrast {
+                brightness: v[0] as i32,
+                contrast: v[1] as i32,
+            },
+            DialogKind::HueSaturation => Adjustment::HueSaturation {
+                hue: v[0] as i32,
+                saturation: v[1] as i32,
+                lightness: v[2] as i32,
+            },
+            DialogKind::ColorBalance => {
+                let g = |r: usize, i: usize| v[r * 3 + i] as i32;
+                Adjustment::ColorBalance {
+                    shadows: (g(0, 0), g(0, 1), g(0, 2)),
+                    midtones: (g(1, 0), g(1, 1), g(1, 2)),
+                    highlights: (g(2, 0), g(2, 1), g(2, 2)),
+                }
+            }
+            _ => Adjustment::PhotoFilter {
+                color: d.photo_color,
+                density: v[0] as u8,
+            },
+        }
+    }
+
+    /// Open an adjustment dialog that creates a new adjustment
+    /// layer (existing = None) or edits an existing one live.
+    fn open_adjustment_dialog(&mut self, kind: &str, existing: Option<usize>) {
+        use pictodesk_core::adjust::Adjustment;
+        let dk = match kind {
+            "levels" => DialogKind::Levels,
+            "curves" => DialogKind::Curves,
+            "brightness" => DialogKind::BrightnessContrast,
+            "hue" => DialogKind::HueSaturation,
+            "balance" => DialogKind::ColorBalance,
+            _ => DialogKind::PhotoFilter,
+        };
+        let snapshot = self.doc.clone();
+        let layer_idx = match existing {
+            Some(i) => i,
+            None => {
+                let adj = match kind {
+                    "levels" => Adjustment::Levels {
+                        in_black: 0,
+                        in_white: 255,
+                        gamma: 1.0,
+                        out_black: 0,
+                        out_white: 255,
+                    },
+                    "curves" => Adjustment::Curves {
+                        points: vec![(0, 0), (255, 255)],
+                    },
+                    "brightness" => Adjustment::BrightnessContrast {
+                        brightness: 0,
+                        contrast: 0,
+                    },
+                    "hue" => Adjustment::HueSaturation {
+                        hue: 0,
+                        saturation: 0,
+                        lightness: 0,
+                    },
+                    "balance" => Adjustment::ColorBalance {
+                        shadows: (0, 0, 0),
+                        midtones: (0, 0, 0),
+                        highlights: (0, 0, 0),
+                    },
+                    _ => Adjustment::PhotoFilter {
+                        color: (255, 178, 84),
+                        density: 25,
+                    },
+                };
+                let name = adj.name().to_string();
+                let i = self.doc.add_adjustment_layer(name, adj);
+                self.doc_version += 1;
+                i
+            }
+        };
+        self.doc.active_layer = layer_idx;
+        let mut d = Dialog::new(dk, &self.doc);
+        // Seed the dialog from the layer's current parameters.
+        if let Some(adj) = &self.doc.layers[layer_idx].adjustment {
+            match adj {
+                Adjustment::Levels {
+                    in_black,
+                    in_white,
+                    gamma,
+                    out_black,
+                    out_white,
+                } => {
+                    d.vals = vec![
+                        *in_black as f32,
+                        *in_white as f32,
+                        *gamma,
+                        *out_black as f32,
+                        *out_white as f32,
+                    ];
+                }
+                Adjustment::Curves { points } => {
+                    d.curve_points = points.clone();
+                }
+                Adjustment::BrightnessContrast {
+                    brightness,
+                    contrast,
+                } => {
+                    d.vals = vec![*brightness as f32, *contrast as f32];
+                }
+                Adjustment::HueSaturation {
+                    hue,
+                    saturation,
+                    lightness,
+                } => {
+                    d.vals = vec![*hue as f32, *saturation as f32, *lightness as f32];
+                }
+                Adjustment::ColorBalance {
+                    shadows,
+                    midtones,
+                    highlights,
+                } => {
+                    d.vals = vec![
+                        shadows.0 as f32,
+                        shadows.1 as f32,
+                        shadows.2 as f32,
+                        midtones.0 as f32,
+                        midtones.1 as f32,
+                        midtones.2 as f32,
+                        highlights.0 as f32,
+                        highlights.1 as f32,
+                        highlights.2 as f32,
+                    ];
+                }
+                Adjustment::PhotoFilter { color, density } => {
+                    d.vals = vec![*density as f32];
+                    d.photo_color = *color;
+                }
+            }
+        }
+        d.adj_layer = Some(layer_idx);
+        d.adj_snapshot = Some(snapshot);
+        let title = d.kind.title();
+        self.dialog = Some(d);
+        self.status = format!("Adjustment layer: {title}");
+    }
+
+    /// Batch-process a folder with the selected action: every
+    /// image file in the folder is opened, the action's steps are
+    /// applied, and the result is written next to the original as
+    /// `<name>-edited.png`. Originals are never overwritten.
+    fn run_batch(&mut self, folder_text: &str) {
+        let Some(action) = self.actions.get(self.active_action).cloned() else {
+            self.status = "No action selected for batch".into();
+            return;
+        };
+        if action.steps.is_empty() {
+            self.status = "That action has no steps yet".into();
+            return;
+        }
+        let dir = std::path::PathBuf::from(folder_text.trim());
+        if !dir.is_dir() {
+            self.status = format!("Batch: '{}' is not a folder", dir.display());
+            return;
+        }
+        let mut done = 0usize;
+        let mut failed = 0usize;
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            let mut paths: Vec<std::path::PathBuf> = entries.flatten().map(|e| e.path()).collect();
+            paths.sort();
+            for path in paths {
+                let ext = path
+                    .extension()
+                    .map(|e| e.to_string_lossy().to_lowercase())
+                    .unwrap_or_default();
+                if !matches!(
+                    ext.as_str(),
+                    "png" | "jpg" | "jpeg" | "tif" | "tiff" | "bmp" | "gif" | "webp"
+                ) {
+                    continue;
+                }
+                let Ok(bytes) = std::fs::read(&path) else {
+                    failed += 1;
+                    continue;
+                };
+                let Ok(mut doc) = io::import_image(&bytes) else {
+                    failed += 1;
+                    continue;
+                };
+                apply_steps(&mut doc, &action.steps, None);
+                let stem = path.file_stem().unwrap_or_default().to_string_lossy();
+                let out = dir.join(format!("{stem}-edited.png"));
+                match io::export_image(&doc, ExportFormat::Png, 90) {
+                    Ok(png) => {
+                        if std::fs::write(&out, png).is_ok() {
+                            done += 1;
+                        } else {
+                            failed += 1;
+                        }
+                    }
+                    Err(_) => failed += 1,
+                }
+            }
+        }
+        self.status = format!(
+            "Batch '{}' : {done} file(s) processed, {failed} failed",
+            action.name
+        );
+    }
+
+    /// Replay an action's steps onto the current document as one
+    /// undoable step.
+    fn play_action(&mut self, idx: usize) {
+        let Some(action) = self.actions.get(idx).cloned() else {
+            self.status = "No action to play".into();
+            return;
+        };
+        if action.steps.is_empty() {
+            self.status = "That action has no steps yet".into();
+            return;
+        }
+        let sel = self.sel.clone();
+        let steps = action.steps.clone();
+        let label = format!("Play: {}", action.name);
+        self.structural(&label, |doc| {
+            apply_steps(doc, &steps, sel.as_ref());
+        });
+        self.status = format!("Played '{}'", action.name);
     }
 
     fn begin_free_transform(&mut self) {
@@ -1531,23 +2044,33 @@ impl App {
             Action::CropToSelection => {
                 if let Some((x, y, w, h)) = self.sel.as_ref().and_then(|s| s.bounds()) {
                     self.structural("Crop", |d| transform::crop(d, x, y, w, h));
+                    self.record_step(RecordedStep::CropToSelection);
                     self.sel = None;
                     self.fit_view(self.win_size.0, self.win_size.1);
                 }
             }
-            Action::Rotate180 => self.structural("Rotate 180", transform::rotate_180),
+            Action::Rotate180 => {
+                self.structural("Rotate 180", transform::rotate_180);
+                self.record_step(RecordedStep::Rotate180);
+            }
             Action::Rotate90Cw => {
                 self.structural("Rotate 90 CW", transform::rotate_90_cw);
+                self.record_step(RecordedStep::Rotate90Cw);
                 self.fit_view(self.win_size.0, self.win_size.1);
             }
             Action::Rotate90Ccw => {
                 self.structural("Rotate 90 CCW", transform::rotate_90_ccw);
+                self.record_step(RecordedStep::Rotate90Ccw);
                 self.fit_view(self.win_size.0, self.win_size.1);
             }
             Action::FlipHorizontal => {
-                self.structural("Flip Horizontal", transform::flip_horizontal)
+                self.structural("Flip Horizontal", transform::flip_horizontal);
+                self.record_step(RecordedStep::FlipH);
             }
-            Action::FlipVertical => self.structural("Flip Vertical", transform::flip_vertical),
+            Action::FlipVertical => {
+                self.structural("Flip Vertical", transform::flip_vertical);
+                self.record_step(RecordedStep::FlipV);
+            }
             Action::AdjustDialog(which) => match which {
                 "invert" => {
                     let tiles = self.sel_tiles();
@@ -1564,6 +2087,7 @@ impl App {
                     );
                     self.last_label = Some("Invert".into());
                     self.status = "Invert".into();
+                    self.record_step(RecordedStep::Invert);
                     self.touch();
                 }
                 "desat" => {
@@ -1581,8 +2105,10 @@ impl App {
                     );
                     self.last_label = Some("Desaturate".into());
                     self.status = "Desaturate".into();
+                    self.record_step(RecordedStep::Desaturate);
                     self.touch();
                 }
+                "photo" => self.open_dialog(DialogKind::PhotoFilter),
                 "bc" => self.open_dialog(DialogKind::BrightnessContrast),
                 "hs" => self.open_dialog(DialogKind::HueSaturation),
                 "cb" => self.open_dialog(DialogKind::ColorBalance),
@@ -1709,7 +2235,153 @@ impl App {
                 self.structural("Flatten Image", |d| {
                     d.flatten();
                 });
+                self.record_step(RecordedStep::Flatten);
                 self.status = "Image flattened".into();
+            }
+            Action::NewAdjustment(kind) => {
+                self.open_adjustment_dialog(kind, None);
+            }
+            Action::EditAdjustment => {
+                let a = self.doc.active_layer;
+                if self.doc.layers[a].adjustment.is_some() {
+                    let kind = match &self.doc.layers[a].adjustment {
+                        Some(pictodesk_core::adjust::Adjustment::Levels { .. }) => "levels",
+                        Some(pictodesk_core::adjust::Adjustment::Curves { .. }) => "curves",
+                        Some(pictodesk_core::adjust::Adjustment::BrightnessContrast { .. }) => {
+                            "brightness"
+                        }
+                        Some(pictodesk_core::adjust::Adjustment::HueSaturation { .. }) => "hue",
+                        Some(pictodesk_core::adjust::Adjustment::ColorBalance { .. }) => "balance",
+                        Some(pictodesk_core::adjust::Adjustment::PhotoFilter { .. }) => "photo",
+                        None => "levels",
+                    };
+                    self.open_adjustment_dialog(kind, Some(a));
+                } else {
+                    self.status = "The active layer is not an adjustment layer".into();
+                }
+            }
+            Action::AddMaskReveal | Action::AddMaskHide | Action::AddMaskSelection => {
+                let a = self.doc.active_layer;
+                if self.doc.layers[a].adjustment.is_some() && self.doc.layers[a].mask.is_some() {
+                    self.status = "That layer already has a mask".into();
+                    return;
+                }
+                let fill = if action == Action::AddMaskHide {
+                    0
+                } else {
+                    255
+                };
+                let from_sel = action == Action::AddMaskSelection;
+                let sel = self.sel.clone();
+                let label = if from_sel {
+                    "Add Mask from Selection"
+                } else if fill == 0 {
+                    "Add Mask (Hide All)"
+                } else {
+                    "Add Mask (Reveal All)"
+                };
+                self.structural(label, |d| {
+                    d.layers[a].add_mask(fill);
+                    if from_sel {
+                        if let Some(s) = &sel {
+                            for y in 0..d.height as i32 {
+                                for x in 0..d.width as i32 {
+                                    d.layers[a].set_mask_value(x, y, s.value(x, y));
+                                }
+                            }
+                        }
+                    }
+                });
+                self.paint_target = PaintTarget::Mask(a);
+                self.channel_view = ChannelView::Mask(a);
+                self.status = "Mask added — paint on it with the brush".into();
+            }
+            Action::DeleteMask => {
+                let a = self.doc.active_layer;
+                self.structural("Delete Mask", |d| {
+                    d.layers[a].mask = None;
+                });
+                if self.paint_target == PaintTarget::Mask(a) {
+                    self.paint_target = PaintTarget::Image;
+                    self.channel_view = ChannelView::Composite;
+                }
+                self.status = "Mask deleted".into();
+            }
+            Action::ToggleMaskEnabled => {
+                let a = self.doc.active_layer;
+                self.structural("Toggle Mask", |d| {
+                    d.layers[a].mask_enabled = !d.layers[a].mask_enabled;
+                });
+            }
+            Action::FeatherMask => {
+                self.open_dialog(DialogKind::FeatherMask);
+            }
+            Action::ToggleNavigator => {
+                self.show_navigator = !self.show_navigator;
+                self.fit_view(self.win_size.0, self.win_size.1);
+            }
+            Action::ToggleActionsPanel => {
+                self.show_actions = !self.show_actions;
+                self.fit_view(self.win_size.0, self.win_size.1);
+            }
+            Action::ToggleGuides => {
+                self.show_guides = !self.show_guides;
+            }
+            Action::ToggleGrid => {
+                self.show_grid = !self.show_grid;
+            }
+            Action::ToggleSnap => {
+                self.snap_enabled = !self.snap_enabled;
+            }
+            Action::ClearGuides => {
+                self.structural("Clear Guides", |d| {
+                    d.guides_x.clear();
+                    d.guides_y.clear();
+                });
+                self.status = "Guides cleared".into();
+            }
+            Action::MacroNew => {
+                let n = self.actions.len() + 1;
+                self.actions.push(RecordedAction {
+                    name: format!("Action {n}"),
+                    steps: Vec::new(),
+                });
+                self.active_action = self.actions.len() - 1;
+                self.status = "New action — press Record, then work".into();
+            }
+            Action::MacroRecord => {
+                if self.actions.is_empty() {
+                    self.do_action(Action::MacroNew);
+                }
+                self.recording = true;
+                self.status =
+                    "Recording… every adjustment, filter and transform is captured".into();
+            }
+            Action::MacroStop => {
+                self.recording = false;
+                self.status = "Recording stopped".into();
+            }
+            Action::MacroPlay => {
+                self.play_action(self.active_action);
+            }
+            Action::MacroDelete => {
+                if !self.actions.is_empty() {
+                    self.actions.remove(self.active_action);
+                    if self.active_action >= self.actions.len() && self.active_action > 0 {
+                        self.active_action -= 1;
+                    }
+                    self.recording = false;
+                }
+            }
+            Action::MacroBatch => {
+                if self.actions.is_empty() {
+                    self.status = "Record an action first, then batch it".into();
+                } else {
+                    let mut d = Dialog::new(DialogKind::Batch, &self.doc);
+                    d.text = String::new();
+                    d.text_focus = true;
+                    self.dialog = Some(d);
+                }
             }
             Action::ToggleLayers => {
                 if self.show_cp && self.cp_tab == 0 {
@@ -1882,6 +2554,14 @@ impl App {
     /// Re-run the dialog's effect from the snapshot (live preview).
     fn dialog_refresh_preview(&mut self) {
         let Some(d) = &mut self.dialog else { return };
+        if let Some(li) = d.adj_layer {
+            // Adjustment-layer dialog: write the parameters straight
+            // into the layer; the compositor does the rest live.
+            let adj = Self::adjustment_from_dialog(d);
+            self.doc.layers[li].adjustment = Some(adj);
+            self.doc_version += 1;
+            return;
+        }
         if !d.kind.is_pixel_dialog() {
             return;
         }
@@ -1935,6 +2615,10 @@ impl App {
                 filter::unsharp_mask(&mut self.doc, layer, s, v[0], v[1], v[2] as u8)
             }
             DialogKind::AddNoise => filter::add_noise(&mut self.doc, layer, s, v[0], 12345),
+            DialogKind::PhotoFilter => {
+                let c = self.dialog.as_ref().unwrap().photo_color;
+                adjust::photo_filter(&mut self.doc, layer, s, c, v[0] as u8)
+            }
             _ => {}
         }
         self.doc_version += 1;
@@ -1945,6 +2629,48 @@ impl App {
             return;
         };
         let layer = self.doc.active_layer;
+        // Adjustment-layer dialogs commit as one document step built
+        // from the snapshot taken when the dialog opened.
+        if let (Some(snap), Some(_li)) = (d.adj_snapshot.take(), d.adj_layer) {
+            let created = snap.layers.len() != self.doc.layers.len();
+            let label = if created {
+                "New Adjustment Layer"
+            } else {
+                "Edit Adjustment"
+            };
+            let mut cmd = DocumentCommand::begin(label, &snap);
+            cmd.finish(&self.doc);
+            self.push_cmd(Box::new(cmd));
+            self.last_label = Some(label.into());
+            self.status = label.into();
+            if created {
+                if let Some(adj) = self.doc.layers[self.doc.active_layer].adjustment.clone() {
+                    self.record_step(RecordedStep::AdjustmentLayer(adj));
+                }
+            }
+            self.touch();
+            return;
+        }
+        // The step this dialog represents, if an Action is recording
+        // (computed before the match moves d.kind).
+        let record_candidate = match d.kind {
+            DialogKind::BrightnessContrast
+            | DialogKind::HueSaturation
+            | DialogKind::ColorBalance
+            | DialogKind::Levels
+            | DialogKind::Curves
+            | DialogKind::PhotoFilter => {
+                Some(RecordedStep::Adjustment(Self::adjustment_from_dialog(&d)))
+            }
+            DialogKind::GaussianBlur => Some(RecordedStep::GaussianBlur(d.vals[0])),
+            DialogKind::Unsharp => {
+                Some(RecordedStep::Unsharp(d.vals[0], d.vals[1], d.vals[2] as u8))
+            }
+            DialogKind::AddNoise => Some(RecordedStep::AddNoise(d.vals[0])),
+            DialogKind::Posterize => Some(RecordedStep::Posterize(d.vals[0] as u8)),
+            DialogKind::Threshold => Some(RecordedStep::Threshold(d.vals[0] as u8)),
+            _ => None,
+        };
         match d.kind {
             k if k.is_pixel_dialog() => {
                 if let Some(mut cmd) = d.preview.take() {
@@ -1956,6 +2682,9 @@ impl App {
                     self.last_label = Some(title.clone());
                     self.status = title;
                 }
+                if let Some(step) = record_candidate.clone() {
+                    self.record_step(step);
+                }
                 self.touch();
             }
             DialogKind::ImageSize => {
@@ -1964,6 +2693,7 @@ impl App {
                     d.vals[1].round().max(1.0) as u32,
                 );
                 self.structural("Image Size", |doc| transform::resize_image(doc, w, h));
+                self.record_step(RecordedStep::ImageSize(w, h));
                 self.sel = None;
                 self.fit_view(self.win_size.0, self.win_size.1);
             }
@@ -1976,8 +2706,24 @@ impl App {
                 self.structural("Canvas Size", |doc| {
                     transform::canvas_size(doc, w, h, anchor)
                 });
+                self.record_step(RecordedStep::CanvasSize(w, h, anchor));
                 self.sel = None;
                 self.fit_view(self.win_size.0, self.win_size.1);
+            }
+            DialogKind::FeatherMask => {
+                let a = self.doc.active_layer;
+                let radius = d.vals[0].round() as u32;
+                if self.doc.layers[a].mask.is_some() {
+                    self.structural("Feather Mask", |doc| {
+                        doc.feather_mask(a, radius);
+                    });
+                    self.status = format!("Mask feathered by {radius} px");
+                } else {
+                    self.status = "The active layer has no mask to feather".into();
+                }
+            }
+            DialogKind::Batch => {
+                self.run_batch(&d.text);
             }
             DialogKind::Feather => {
                 if let Some(s) = &mut self.sel {
@@ -1986,7 +2732,32 @@ impl App {
                 }
             }
             DialogKind::Fill => {
-                if let PaintTarget::Alpha(a) = self.paint_target {
+                if let PaintTarget::Mask(li) = self.paint_target {
+                    let sel = self
+                        .sel
+                        .clone()
+                        .unwrap_or_else(|| Selection::all(self.doc.width, self.doc.height));
+                    let src = if d.fill_bg { self.bg } else { self.fg };
+                    let (r, g, b, _) = src.to_rgba8();
+                    let v = ((r as u32 * 77 + g as u32 * 150 + b as u32 * 29) / 256) as u8;
+                    let op = d.vals[0] / 100.0;
+                    self.structural("Fill", |doc| {
+                        for yy in 0..doc.height as i32 {
+                            for xx in 0..doc.width as i32 {
+                                let m = sel.value(xx, yy) as f32 / 255.0 * op;
+                                if m > 0.0 {
+                                    let cur = doc.layers[li].mask_value(xx, yy) as f32;
+                                    doc.layers[li].set_mask_value(
+                                        xx,
+                                        yy,
+                                        (cur + (v as f32 - cur) * m).round() as u8,
+                                    );
+                                }
+                            }
+                        }
+                    });
+                    self.last_label = Some("Fill".into());
+                } else if let PaintTarget::Alpha(a) = self.paint_target {
                     let sel = self
                         .sel
                         .clone()
@@ -2117,6 +2888,14 @@ impl App {
 
     fn dialog_cancel(&mut self) {
         if let Some(mut d) = self.dialog.take() {
+            if let Some(snap) = d.adj_snapshot.take() {
+                // Adjustment dialog cancelled: restore the document
+                // exactly as it was before the dialog opened.
+                self.doc = snap;
+                self.doc_version += 1;
+                self.touch();
+                return;
+            }
             if let Some(cmd) = &mut d.preview {
                 cmd.revert(&mut self.doc);
                 self.doc_version += 1;
@@ -2190,6 +2969,12 @@ impl App {
         if d.kind == DialogKind::ColorBalance {
             h += 22; // range buttons
         }
+        if d.kind == DialogKind::PhotoFilter {
+            h += 22; // preset swatches
+        }
+        if d.kind == DialogKind::Batch {
+            h += 52; // info lines
+        }
         if d.kind == DialogKind::CanvasSize {
             h += 52; // anchor grid
         }
@@ -2205,6 +2990,7 @@ impl App {
                 | DialogKind::NewDoc
                 | DialogKind::NewLayer
                 | DialogKind::LayerOptions
+                | DialogKind::Batch
         ) {
             h += 24; // text field
         }
@@ -2217,12 +3003,16 @@ impl App {
         if d.kind == DialogKind::ColorBalance || d.kind == DialogKind::Fill {
             y += 22;
         }
+        if d.kind == DialogKind::PhotoFilter {
+            y += 22;
+        }
         if matches!(
             d.kind,
             DialogKind::SaveAs
                 | DialogKind::NewDoc
                 | DialogKind::NewLayer
                 | DialogKind::LayerOptions
+                | DialogKind::Batch
         ) {
             y += 24;
         }
@@ -2235,7 +3025,11 @@ impl App {
         }
         let ok = Rect::new(rect.x + w - 176, rect.y + h - 32, 80, 24);
         let cancel = Rect::new(rect.x + w - 88, rect.y + h - 32, 80, 24);
-        let range_buttons = if d.kind == DialogKind::ColorBalance || d.kind == DialogKind::Fill {
+        let range_buttons = if d.kind == DialogKind::PhotoFilter {
+            (0..6)
+                .map(|i| Rect::new(rect.x + 12 + i * 62, rect.y + 30, 56, 18))
+                .collect()
+        } else if d.kind == DialogKind::ColorBalance || d.kind == DialogKind::Fill {
             let n = if d.kind == DialogKind::ColorBalance {
                 3
             } else {
@@ -2266,6 +3060,7 @@ impl App {
                 | DialogKind::NewDoc
                 | DialogKind::NewLayer
                 | DialogKind::LayerOptions
+                | DialogKind::Batch
         ) {
             Some(Rect::new(rect.x + 12, rect.y + 28, w - 24, 18))
         } else {
@@ -2313,6 +3108,12 @@ impl App {
         if self.show_cp {
             self.draw_channels_paths(f);
         }
+        if self.show_navigator {
+            self.draw_navigator(f);
+        }
+        if self.show_actions {
+            self.draw_actions_panel(f);
+        }
         self.draw_menu_bar(f);
         self.draw_status(f);
         if self.file_panel.is_some() {
@@ -2320,6 +3121,9 @@ impl App {
         }
         if self.dialog.is_some() {
             self.draw_dialog(f);
+        }
+        if self.context_menu.is_some() {
+            self.draw_context_menu(f);
         }
     }
 
@@ -2463,6 +3267,13 @@ impl App {
                     None => (v, v, v),
                 }
             }
+            ChannelView::Mask(li) => {
+                let Some(l) = self.doc.layers.get(li) else {
+                    return (r, g, b);
+                };
+                let v = l.mask_value(dx, dy);
+                (v, v, v)
+            }
         }
     }
 
@@ -2530,6 +3341,57 @@ impl App {
             Rect::new(doc_rect.right(), doc_rect.y + 3, 3, doc_rect.h),
             (70, 70, 70),
         );
+
+        // Guides and grid (Phase 4), drawn over the document.
+        if self.show_grid {
+            let mut step = 64i32;
+            while (step as f32 * scale) < 10.0 {
+                step *= 2;
+            }
+            let gc = (176, 176, 176);
+            let start_x = ((-self.viewport.offset.0) / scale).floor() as i32;
+            let mut wx = start_x - start_x.rem_euclid(step);
+            while (wx as f32) < (self.doc.width as f32) {
+                let sx = doc_rect.x + (wx as f32 * scale) as i32;
+                if sx >= c.x && sx < c.right() {
+                    f.fill_rect(Rect::new(sx, y0.max(c.y), 1, y1 - y0.max(c.y)), gc);
+                }
+                wx += step;
+            }
+            let start_y = ((-self.viewport.offset.1) / scale).floor() as i32;
+            let mut wy = start_y - start_y.rem_euclid(step);
+            while (wy as f32) < (self.doc.height as f32) {
+                let sy = doc_rect.y + (wy as f32 * scale) as i32;
+                if sy >= c.y && sy < c.bottom() {
+                    f.fill_rect(Rect::new(x0.max(c.x), sy, x1 - x0.max(c.x), 1), gc);
+                }
+                wy += step;
+            }
+        }
+        if self.show_guides {
+            let gc = (64, 156, 255);
+            for g in &self.doc.guides_x {
+                let sx = doc_rect.x + (*g as f32 * scale) as i32;
+                if sx >= c.x && sx < c.right() {
+                    f.fill_rect(Rect::new(sx, c.y, 1, c.h), gc);
+                }
+            }
+            for g in &self.doc.guides_y {
+                let sy = doc_rect.y + (*g as f32 * scale) as i32;
+                if sy >= c.y && sy < c.bottom() {
+                    f.fill_rect(Rect::new(c.x, sy, c.w, 1), gc);
+                }
+            }
+            if let Some((vertical, pos, _)) = self.guide_drag {
+                if vertical {
+                    let sx = doc_rect.x + (pos as f32 * scale) as i32;
+                    f.fill_rect(Rect::new(sx, c.y, 1, c.h), (255, 64, 64));
+                } else {
+                    let sy = doc_rect.y + (pos as f32 * scale) as i32;
+                    f.fill_rect(Rect::new(c.x, sy, c.w, 1), (255, 64, 64));
+                }
+            }
+        }
 
         // selection marching ants on the selection bounds
         if let Some(sel) = &self.sel {
@@ -2965,6 +3827,319 @@ impl App {
         }
     }
 
+    /// The Navigator panel (Phase 4): a thumbnail of the whole
+    /// document with a red rectangle marking the visible area;
+    /// clicking or dragging in it pans the main view.
+    fn draw_navigator(&mut self, f: &mut Frame) {
+        let Some(r) = self.group_rect(PanelKind::Navigator) else {
+            return;
+        };
+        f.panel(r);
+        f.text(r.x + 6, r.y + 5, "Navigator", 1, ui::BLACK);
+        let pct = (self.viewport.scale * 100.0).round() as i32;
+        f.text(r.x + 130, r.y + 5, &format!("{pct}%"), 1, ui::DARK);
+        let th = Self::nav_thumb_rect(r);
+        self.ensure_render_cache();
+        let (dw, dh) = (self.doc.width as i32, self.doc.height as i32);
+        for yy in 0..th.h {
+            for xx in 0..th.w {
+                let dx = (xx * dw / th.w).min(dw - 1);
+                let dy = (yy * dh / th.h).min(dh - 1);
+                let i = ((dy * dw + dx) * 4) as usize;
+                let (pr, pg, pb, pa) = (
+                    self.cached_render[i],
+                    self.cached_render[i + 1],
+                    self.cached_render[i + 2],
+                    self.cached_render[i + 3],
+                );
+                let col = if pa == 255 {
+                    (pr, pg, pb)
+                } else {
+                    let cell = (((xx / 4) + (yy / 4)) % 2 == 0) as u32;
+                    let bg = if cell == 0 { 255 } else { 170 };
+                    let a = pa as u32;
+                    (
+                        ((pr as u32 * a + bg * (255 - a)) / 255) as u8,
+                        ((pg as u32 * a + bg * (255 - a)) / 255) as u8,
+                        ((pb as u32 * a + bg * (255 - a)) / 255) as u8,
+                    )
+                };
+                f.set(th.x + xx, th.y + yy, col);
+            }
+        }
+        f.outline_rect(th, ui::SHADOW);
+        // Visible-area rectangle.
+        let c = self.canvas_rect(f.w, f.h);
+        let tl = self.viewport.screen_to_doc((0.0, 0.0));
+        let br = self.viewport.screen_to_doc((c.w as f32, c.h as f32));
+        let vx = th.x + (tl.0 / dw as f32 * th.w as f32) as i32;
+        let vy = th.y + (tl.1 / dh as f32 * th.h as f32) as i32;
+        let vw = ((br.0 - tl.0) / dw as f32 * th.w as f32) as i32;
+        let vh = ((br.1 - tl.1) / dh as f32 * th.h as f32) as i32;
+        // Clamp to the thumbnail: when the whole document is
+        // visible, the view rectangle is the thumbnail itself.
+        let x0 = vx.max(th.x);
+        let y0 = vy.max(th.y);
+        let x1 = (vx + vw).min(th.right());
+        let y1 = (vy + vh).min(th.bottom());
+        if x1 > x0 && y1 > y0 {
+            f.outline_rect(Rect::new(x0, y0, x1 - x0, y1 - y0), (255, 0, 0));
+        }
+    }
+
+    fn nav_thumb_rect(r: Rect) -> Rect {
+        Rect::new(r.x + 6, r.y + 18, r.w - 12, 88)
+    }
+
+    /// Pan so the document point under a Navigator thumbnail point
+    /// sits at the center of the canvas.
+    fn navigator_to(&mut self, mx: i32, my: i32) {
+        let Some(r) = self.group_rect(PanelKind::Navigator) else {
+            return;
+        };
+        let th = Self::nav_thumb_rect(r);
+        let fx = ((mx - th.x) as f32 / th.w as f32).clamp(0.0, 1.0);
+        let fy = ((my - th.y) as f32 / th.h as f32).clamp(0.0, 1.0);
+        let (dx, dy) = (fx * self.doc.width as f32, fy * self.doc.height as f32);
+        let c = self.canvas_rect(self.win_size.0, self.win_size.1);
+        self.viewport.offset = (
+            c.w as f32 / 2.0 - dx * self.viewport.scale,
+            c.h as f32 / 2.0 - dy * self.viewport.scale,
+        );
+    }
+
+    /// The Actions panel (Phase 4): action list with step counts,
+    /// and the New / Record / Play / Delete / Batch buttons. While
+    /// recording, a red REC marker shows.
+    fn draw_actions_panel(&mut self, f: &mut Frame) {
+        let Some(r) = self.group_rect(PanelKind::Actions) else {
+            return;
+        };
+        f.panel(r);
+        f.text(r.x + 6, r.y + 5, "Actions", 1, ui::BLACK);
+        if self.recording {
+            f.fill_rect(Rect::new(r.x + 70, r.y + 5, 7, 7), (255, 0, 0));
+            f.text(r.x + 81, r.y + 5, "REC", 1, (200, 0, 0));
+        }
+        if self.actions.is_empty() {
+            f.text(r.x + 8, r.y + 24, "No actions yet.", 1, ui::DARK);
+            f.text(r.x + 8, r.y + 38, "New, then Record, then", 1, ui::DARK);
+            f.text(r.x + 8, r.y + 50, "work: steps are captured.", 1, ui::DARK);
+        }
+        for i in 0..self.actions.len().min(5) {
+            let rr = Rect::new(r.x + 2, r.y + 20 + i as i32 * 15, r.w - 4, 15);
+            let selected = i == self.active_action;
+            if selected {
+                f.fill_rect(rr, ui::BLACK);
+            }
+            let c = if selected { ui::WHITE } else { ui::BLACK };
+            let a = &self.actions[i];
+            f.text(
+                rr.x + 6,
+                rr.y + 3,
+                &format!("{} ({})", a.name, a.steps.len()),
+                1,
+                c,
+            );
+        }
+        // The selected action's steps, listed under the rows.
+        if let Some(a) = self.actions.get(self.active_action) {
+            for (j, s) in a.steps.iter().take(3).enumerate() {
+                f.text(
+                    r.x + 14,
+                    r.y + 99 + j as i32 * 11,
+                    &format!("- {}", s.label()),
+                    1,
+                    ui::DARK,
+                );
+            }
+            if a.steps.len() > 3 {
+                f.text(
+                    r.x + 14,
+                    r.y + 99 + 33,
+                    &format!("  +{} more", a.steps.len() - 3),
+                    1,
+                    ui::DARK,
+                );
+            }
+        }
+        let labels = ["New", "Rec", "Play", "Del", "Batch"];
+        let bw = (r.w - 8) / 5;
+        for (i, label) in labels.iter().enumerate() {
+            let br = Rect::new(r.x + 4 + i as i32 * bw, r.bottom() - 19, bw - 2, 16);
+            let text = if i == 1 && self.recording {
+                "Stop"
+            } else {
+                label
+            };
+            Self::draw_small_button(f, br, text, true);
+        }
+    }
+
+    fn actions_panel_click(&mut self, r: Rect, mx: i32, my: i32) -> bool {
+        for i in 0..self.actions.len().min(5) {
+            let rr = Rect::new(r.x + 2, r.y + 20 + i as i32 * 15, r.w - 4, 15);
+            if rr.contains(mx, my) {
+                self.active_action = i;
+                return true;
+            }
+        }
+        let bw = (r.w - 8) / 5;
+        for i in 0..5i32 {
+            let br = Rect::new(r.x + 4 + i * bw, r.bottom() - 19, bw - 2, 16);
+            if br.contains(mx, my) {
+                match i {
+                    0 => self.do_action(Action::MacroNew),
+                    1 => {
+                        if self.recording {
+                            self.do_action(Action::MacroStop)
+                        } else {
+                            self.do_action(Action::MacroRecord)
+                        }
+                    }
+                    2 => self.do_action(Action::MacroPlay),
+                    3 => self.do_action(Action::MacroDelete),
+                    _ => self.do_action(Action::MacroBatch),
+                }
+                return true;
+            }
+        }
+        true
+    }
+
+    /// Right-click (Phase 4): open a context menu suited to where
+    /// the click landed — layer operations over the Layers panel,
+    /// editing operations over the canvas.
+    pub fn right_click(&mut self, x: f32, y: f32) {
+        let (mx, my) = (x as i32, y as i32);
+        if self.dialog.is_some() || self.file_panel.is_some() {
+            return;
+        }
+        if self.context_menu.is_some() {
+            self.context_menu = None;
+            return;
+        }
+        // Over a layer row?
+        if let Some(r) = self.group_rect(PanelKind::Cp) {
+            if self.cp_tab == 0 && r.contains(mx, my) {
+                let n = self.doc.layers.len();
+                for row in 0..(n - self.layers_scroll).min(8) {
+                    let li = n - 1 - (self.layers_scroll + row);
+                    let rr = Self::layer_row_rect(r, row);
+                    if rr.contains(mx, my) {
+                        self.doc.active_layer = li;
+                        let l = &self.doc.layers[li];
+                        let mut items = vec![
+                            ("Layer Options...".to_string(), Action::LayerOptions, true),
+                            ("Duplicate Layer".to_string(), Action::DuplicateLayer, true),
+                            (
+                                "Delete Layer".to_string(),
+                                Action::DeleteLayer,
+                                self.doc.layers.len() > 1,
+                            ),
+                            ("-".to_string(), Action::None, false),
+                        ];
+                        if l.adjustment.is_some() {
+                            items.push((
+                                "Edit Adjustment...".to_string(),
+                                Action::EditAdjustment,
+                                true,
+                            ));
+                        }
+                        if l.mask.is_none() {
+                            items.push((
+                                "Add Mask (Reveal All)".to_string(),
+                                Action::AddMaskReveal,
+                                true,
+                            ));
+                            items.push((
+                                "Add Mask (Hide All)".to_string(),
+                                Action::AddMaskHide,
+                                true,
+                            ));
+                        } else {
+                            items.push(("Delete Mask".to_string(), Action::DeleteMask, true));
+                            items.push((
+                                "Disable/Enable Mask".to_string(),
+                                Action::ToggleMaskEnabled,
+                                true,
+                            ));
+                        }
+                        items.push(("-".to_string(), Action::None, false));
+                        items.push(("Merge Down".to_string(), Action::MergeDown, li > 0));
+                        self.context_menu = Some(ContextMenu {
+                            x: mx,
+                            y: my,
+                            items,
+                        });
+                        return;
+                    }
+                }
+            }
+        }
+        // Over the canvas?
+        let c = self.canvas_rect(self.win_size.0, self.win_size.1);
+        if c.contains(mx, my) {
+            let has_sel = self.sel.as_ref().map(|s| !s.is_empty()).unwrap_or(false);
+            let items = vec![
+                ("Undo/Redo".to_string(), Action::UndoToggle, true),
+                ("-".to_string(), Action::None, false),
+                ("Cut".to_string(), Action::Cut, has_sel),
+                ("Copy".to_string(), Action::Copy, has_sel),
+                ("Paste".to_string(), Action::Paste, true),
+                ("Clear".to_string(), Action::Clear, has_sel),
+                ("-".to_string(), Action::None, false),
+                ("Select All".to_string(), Action::SelectAll, true),
+                ("Deselect".to_string(), Action::SelectNone, has_sel),
+                ("Inverse".to_string(), Action::SelectInverse, has_sel),
+                ("-".to_string(), Action::None, false),
+                (
+                    "Free Transform".to_string(),
+                    Action::FreeTransform,
+                    self.doc.layers[self.doc.active_layer].adjustment.is_none(),
+                ),
+                (
+                    "Add Layer Mask (Reveal)".to_string(),
+                    Action::AddMaskReveal,
+                    self.doc.layers[self.doc.active_layer].mask.is_none(),
+                ),
+            ];
+            self.context_menu = Some(ContextMenu {
+                x: mx,
+                y: my,
+                items,
+            });
+        }
+    }
+
+    /// The right-click context menu, drawn like a menu dropdown.
+    fn draw_context_menu(&mut self, f: &mut Frame) {
+        let Some(cm) = &self.context_menu else { return };
+        let w = cm
+            .items
+            .iter()
+            .map(|(l, _, _)| Frame::text_width(l, 1) + 28)
+            .max()
+            .unwrap_or(120);
+        let r = Rect::new(cm.x, cm.y, w, cm.items.len() as i32 * 17 + 6);
+        f.panel(r);
+        let (mx, my) = (self.cursor.0 as i32, self.cursor.1 as i32);
+        for (i, (label, _, enabled)) in cm.items.iter().enumerate() {
+            let ir = Rect::new(r.x + 2, r.y + 3 + i as i32 * 17, r.w - 4, 17);
+            if label == "-" {
+                f.fill_rect(Rect::new(ir.x + 2, ir.y + 8, ir.w - 4, 1), ui::SHADOW);
+                continue;
+            }
+            if ir.contains(mx, my) && *enabled {
+                f.fill_rect(ir, ui::BLACK);
+                f.text(ir.x + 8, ir.y + 4, label, 1, ui::WHITE);
+            } else {
+                let c = if *enabled { ui::BLACK } else { ui::SHADOW };
+                f.text(ir.x + 8, ir.y + 4, label, 1, c);
+            }
+        }
+    }
+
     fn cp_tab_rect(r: Rect, i: usize) -> Rect {
         match i {
             0 => Rect::new(r.x + 3, r.y + 3, 52, 15),
@@ -3009,9 +4184,17 @@ impl App {
         for row in 0..(n - self.layers_scroll).min(8) {
             let li = n - 1 - (self.layers_scroll + row);
             let rr = Self::layer_row_rect(r, row);
-            let (visible, linked, name) = {
+            let (visible, linked, name, has_mask, mask_enabled, is_adj, is_mask_target) = {
                 let l = &self.doc.layers[li];
-                (l.visible, l.linked, l.name.clone())
+                (
+                    l.visible,
+                    l.linked,
+                    l.name.clone(),
+                    l.mask.is_some(),
+                    l.mask_enabled,
+                    l.adjustment.is_some(),
+                    self.paint_target == PaintTarget::Mask(li),
+                )
             };
             let active = li == a;
             if active {
@@ -3030,9 +4213,41 @@ impl App {
                 f.fill_rect(Rect::new(ex - 1, ey - 1, 3, 3), c);
             }
             let th = Rect::new(rr.x + 21, rr.y + 2, 36, 24);
-            self.draw_layer_thumb(f, th, li);
-            f.outline_rect(th, c);
-            f.text(rr.x + 61, rr.y + 10, &name, 1, c);
+            if is_adj {
+                // Adjustment layer: the classic half-and-half disc.
+                f.fill_rect(th, ui::WHITE);
+                let (cx, cy) = (th.x + 18, th.y + 12);
+                for yy in -9..=9i32 {
+                    for xx in -9..=9i32 {
+                        if xx * xx + yy * yy <= 81 {
+                            f.set(cx + xx, cy + yy, if xx < 0 { ui::BLACK } else { ui::WHITE });
+                        }
+                    }
+                }
+                f.outline_rect(th, c);
+            } else {
+                self.draw_layer_thumb(f, th, li);
+                f.outline_rect(th, c);
+            }
+            let mut name_x = rr.x + 61;
+            if has_mask {
+                let mh = Rect::new(rr.x + 59, rr.y + 2, 28, 24);
+                self.draw_mask_thumb(f, mh, li);
+                if is_mask_target {
+                    // The targeted thumbnail gets a double outline.
+                    f.outline_rect(Rect::new(mh.x - 1, mh.y - 1, mh.w + 2, mh.h + 2), c);
+                }
+                f.outline_rect(mh, c);
+                if !mask_enabled {
+                    // Disabled mask: red X, the classic marker.
+                    for t in 0..24i32 {
+                        f.set(mh.x + 2 + t, mh.y + 2 + t * 20 / 24, (255, 0, 0));
+                        f.set(mh.x + 2 + t, mh.y + 21 - t * 20 / 24, (255, 0, 0));
+                    }
+                }
+                name_x = rr.x + 91;
+            }
+            f.text(name_x, rr.y + 10, &name, 1, c);
             let lb = Rect::new(rr.right() - 18, rr.y + 8, 12, 12);
             if linked {
                 // Two interlocking chain links.
@@ -3085,6 +4300,22 @@ impl App {
         }
     }
 
+    /// A mask thumbnail: the mask plane as a small grayscale image.
+    fn draw_mask_thumb(&self, f: &mut Frame, th: Rect, li: usize) {
+        let (dw, dh) = (
+            (self.doc.width as i32).max(1),
+            (self.doc.height as i32).max(1),
+        );
+        for by in 0..12i32 {
+            for bx in 0..14i32 {
+                let dx = ((bx * 2 + 1) * dw / 28).min(dw - 1);
+                let dy = ((by * 2 + 1) * dh / 24).min(dh - 1);
+                let v = self.doc.layers[li].mask_value(dx, dy);
+                f.fill_rect(Rect::new(th.x + bx * 2, th.y + by * 2, 2, 2), (v, v, v));
+            }
+        }
+    }
+
     fn layers_panel_click(&mut self, r: Rect, mx: i32, my: i32) -> bool {
         // Header: blend mode cycles; opacity opens Layer Options.
         if Rect::new(r.x + 2, r.y + 20, r.w - 4, 13).contains(mx, my) {
@@ -3121,6 +4352,34 @@ impl App {
                     d.layers[li].linked = !d.layers[li].linked;
                 });
                 return true;
+            }
+            // Mask thumbnail: click targets the mask for painting;
+            // Alt+click toggles it enabled/disabled.
+            if self.doc.layers[li].mask.is_some() {
+                let mh = Rect::new(rr.x + 59, rr.y + 2, 28, 24);
+                if mh.contains(mx, my) {
+                    self.doc.active_layer = li;
+                    if self.alt_down {
+                        self.structural("Toggle Mask", |d| {
+                            d.layers[li].mask_enabled = !d.layers[li].mask_enabled;
+                        });
+                    } else {
+                        self.paint_target = PaintTarget::Mask(li);
+                        self.channel_view = ChannelView::Mask(li);
+                        self.status = "Painting on the mask (white reveals, black hides)".into();
+                    }
+                    self.touch();
+                    return true;
+                }
+            }
+            // Adjustment thumbnail: click opens the editor.
+            if self.doc.layers[li].adjustment.is_some() {
+                let th = Rect::new(rr.x + 21, rr.y + 2, 36, 24);
+                if th.contains(mx, my) {
+                    self.doc.active_layer = li;
+                    self.do_action(Action::EditAdjustment);
+                    return true;
+                }
             }
             self.doc.active_layer = li;
             self.channel_view = ChannelView::Composite;
@@ -3307,6 +4566,24 @@ impl App {
                             self.touch();
                         }
                     }
+                    PaintTarget::Mask(li) => {
+                        let v = self.fg_luminance();
+                        self.structural("Fill Path", |d| {
+                            if let Some((bx, by, bw, bh)) = sel.bounds() {
+                                for yy in by..by + bh as i32 {
+                                    for xx in bx..bx + bw as i32 {
+                                        let m = sel.value(xx, yy);
+                                        if m > 0 {
+                                            let cur = d.layers[li].mask_value(xx, yy) as u32;
+                                            let nv =
+                                                (cur + (v as u32 - cur) * m as u32 / 255) as u8;
+                                            d.layers[li].set_mask_value(xx, yy, nv);
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    }
                 }
             }
             1 => {
@@ -3335,6 +4612,25 @@ impl App {
                                         1.0,
                                     );
                                 }
+                            }
+                        });
+                    }
+                    PaintTarget::Mask(li) => {
+                        let tip = self.tip;
+                        let v = self.fg_luminance();
+                        let (w, h) = (self.doc.width, self.doc.height);
+                        self.structural("Stroke Path", |d| {
+                            for pt in &pts {
+                                brush::stamp_mask(
+                                    &mut d.layers[li],
+                                    w,
+                                    h,
+                                    pt.0,
+                                    pt.1,
+                                    &tip,
+                                    v,
+                                    1.0,
+                                );
                             }
                         });
                     }
@@ -3455,6 +4751,23 @@ impl App {
                     }
                     return true;
                 }
+            }
+        }
+        // Navigator thumbnail: click/drag pans the main view.
+        if let Some(r) = self.group_rect(PanelKind::Navigator) {
+            if r.contains(mx, my) {
+                let th = Self::nav_thumb_rect(r);
+                if th.contains(mx, my) {
+                    self.navigator_to(mx, my);
+                    self.drag = DragMode::NavDrag;
+                }
+                return true;
+            }
+        }
+        // Actions panel
+        if let Some(r) = self.group_rect(PanelKind::Actions) {
+            if r.contains(mx, my) {
+                return self.actions_panel_click(r, mx, my);
             }
         }
         // Brushes cells
@@ -3772,6 +5085,45 @@ impl App {
         if d.kind == DialogKind::Fill {
             f.button(layout.fill_buttons[0], "Foreground", !d.fill_bg, true);
             f.button(layout.fill_buttons[1], "Background", d.fill_bg, true);
+        }
+        if d.kind == DialogKind::PhotoFilter {
+            for (i, br) in layout.range_buttons.iter().enumerate() {
+                let c = PHOTO_FILTER_PRESETS[i].1;
+                f.fill_rect(*br, c);
+                f.outline_rect(*br, ui::SHADOW);
+                if d.photo_color == c {
+                    f.outline_rect(Rect::new(br.x - 1, br.y - 1, br.w + 2, br.h + 2), ui::BLACK);
+                }
+            }
+        }
+        if d.kind == DialogKind::Batch {
+            let name = self
+                .actions
+                .get(self.active_action)
+                .map(|a| a.name.clone())
+                .unwrap_or_else(|| "(none)".into());
+            f.text(r.x + 12, r.y + 56, &format!("Action: {name}"), 1, ui::BLACK);
+            f.text(
+                r.x + 12,
+                r.y + 70,
+                "Type the folder path above, then OK.",
+                1,
+                ui::DARK,
+            );
+            f.text(
+                r.x + 12,
+                r.y + 82,
+                "Results are written as <name>-edited.png",
+                1,
+                ui::DARK,
+            );
+            f.text(
+                r.x + 12,
+                r.y + 94,
+                "beside each original (never overwritten).",
+                1,
+                ui::DARK,
+            );
         }
         // text field
         if let Some(tf) = layout.text_field {
@@ -4117,11 +5469,19 @@ impl App {
             }
             for (i, b) in layout.range_buttons.iter().enumerate() {
                 if b.contains(mx, my) {
-                    let d = self.dialog.as_mut().unwrap();
-                    if d.kind == DialogKind::ColorBalance {
-                        d.cb_range = i;
-                    } else if d.kind == DialogKind::Fill {
-                        d.fill_bg = i == 1;
+                    let is_photo = {
+                        let d = self.dialog.as_mut().unwrap();
+                        if d.kind == DialogKind::ColorBalance {
+                            d.cb_range = i;
+                        } else if d.kind == DialogKind::Fill {
+                            d.fill_bg = i == 1;
+                        } else if d.kind == DialogKind::PhotoFilter {
+                            d.photo_color = PHOTO_FILTER_PRESETS[i].1;
+                        }
+                        d.kind == DialogKind::PhotoFilter
+                    };
+                    if is_photo {
+                        self.dialog_refresh_preview();
                     }
                     return;
                 }
@@ -4182,6 +5542,74 @@ impl App {
                 }
             }
             return;
+        }
+        // ---- context menu (open): click an item or dismiss
+        if let Some(cm) = self.context_menu.take() {
+            let w = cm
+                .items
+                .iter()
+                .map(|(l, _, _)| Frame::text_width(l, 1) + 28)
+                .max()
+                .unwrap_or(120);
+            let r = Rect::new(cm.x, cm.y, w, cm.items.len() as i32 * 17 + 6);
+            if r.contains(mx, my) {
+                for (i, (label, action, enabled)) in cm.items.iter().enumerate() {
+                    let ir = Rect::new(r.x + 2, r.y + 3 + i as i32 * 17, r.w - 4, 17);
+                    if ir.contains(mx, my) && *enabled && label != "-" {
+                        let action = action.clone();
+                        self.do_action(action);
+                        return;
+                    }
+                }
+            }
+            return;
+        }
+        // ---- guides: drag out of a ruler, or drag an existing one
+        if self.show_guides && self.dialog.is_none() {
+            let c = self.canvas_rect(self.win_size.0, self.win_size.1);
+            let dp = self.to_doc(x, y);
+            if self.show_rulers {
+                let top = Rect::new(
+                    ui::TOOLBAR_W,
+                    ui::MENU_H,
+                    c.right() - ui::TOOLBAR_W,
+                    ui::RULER_H,
+                );
+                let left = Rect::new(
+                    ui::TOOLBAR_W,
+                    ui::MENU_H,
+                    ui::RULER_W,
+                    c.bottom() - ui::MENU_H,
+                );
+                if top.contains(mx, my) && mx >= c.x {
+                    self.guide_drag = Some((false, dp.1 as i32, None));
+                    self.drag = DragMode::GuideDrag;
+                    return;
+                }
+                if left.contains(mx, my) && my >= c.y {
+                    self.guide_drag = Some((true, dp.0 as i32, None));
+                    self.drag = DragMode::GuideDrag;
+                    return;
+                }
+            }
+            if self.tool == Tool::Move && c.contains(mx, my) {
+                for (i, g) in self.doc.guides_x.iter().enumerate() {
+                    let sx = c.x + self.viewport.doc_to_screen((*g as f32, 0.0)).0 as i32;
+                    if (mx - sx).abs() <= 3 {
+                        self.guide_drag = Some((true, *g, Some(i)));
+                        self.drag = DragMode::GuideDrag;
+                        return;
+                    }
+                }
+                for (i, g) in self.doc.guides_y.iter().enumerate() {
+                    let sy = c.y + self.viewport.doc_to_screen((0.0, *g as f32)).1 as i32;
+                    if (my - sy).abs() <= 3 {
+                        self.guide_drag = Some((false, *g, Some(i)));
+                        self.drag = DragMode::GuideDrag;
+                        return;
+                    }
+                }
+            }
         }
         // ---- dock panels
         if self.panel_mouse(mx, my) {
@@ -4297,6 +5725,28 @@ impl App {
                 self.pen_down(x, y, dp);
             }
             Tool::Bucket => {
+                if let PaintTarget::Mask(li) = self.paint_target {
+                    let mut cmd = DocumentCommand::begin("Paint Bucket", &self.doc);
+                    let (w, h) = (self.doc.width, self.doc.height);
+                    let v = self.fg_luminance();
+                    if li < self.doc.layers.len() {
+                        brush::flood_mask(
+                            &mut self.doc.layers[li],
+                            w,
+                            h,
+                            dp.0 as i32,
+                            dp.1 as i32,
+                            v,
+                            32,
+                        );
+                    }
+                    cmd.finish(&self.doc);
+                    self.push_cmd(Box::new(cmd));
+                    self.last_label = Some("Paint Bucket".into());
+                    self.status = "Paint Bucket (mask)".into();
+                    self.touch();
+                    return;
+                }
                 if let PaintTarget::Alpha(a) = self.paint_target {
                     let mut cmd = DocumentCommand::begin("Paint Bucket", &self.doc);
                     let (w, h) = (self.doc.width, self.doc.height);
@@ -4361,6 +5811,17 @@ impl App {
             | Tool::Blur
             | Tool::Sharpen
             | Tool::Smudge => {
+                if let PaintTarget::Mask(_) = self.paint_target {
+                    if matches!(self.tool, Tool::Brush | Tool::Pencil | Tool::Eraser) {
+                        self.alpha_cmd = Some(DocumentCommand::begin("Paint on mask", &self.doc));
+                        self.alpha_last = dp;
+                        self.mask_stamp(dp);
+                        self.drag = DragMode::Paint;
+                    } else {
+                        self.status = "That tool paints on the image, not on a mask".into();
+                    }
+                    return;
+                }
                 if let PaintTarget::Alpha(_) = self.paint_target {
                     if matches!(self.tool, Tool::Brush | Tool::Pencil | Tool::Eraser) {
                         self.alpha_cmd =
@@ -4489,6 +5950,40 @@ impl App {
         if let Some(ch) = self.doc.alphas.get_mut(a) {
             brush::stamp_channel(
                 &mut ch.data,
+                w,
+                h,
+                center.0,
+                center.1,
+                &tip,
+                value,
+                self.opacity,
+            );
+        }
+        self.touch();
+    }
+
+    /// One brush/pencil/eraser stamp into the targeted layer mask.
+    /// Painting with white reveals, black hides; the eraser paints
+    /// with the background color, as on a mask in the classic editor.
+    fn mask_stamp(&mut self, center: (f32, f32)) {
+        let PaintTarget::Mask(li) = self.paint_target else {
+            return;
+        };
+        let value = if self.tool == Tool::Eraser {
+            let (r, g, b, _) = self.bg.to_rgba8();
+            ((r as u32 * 77 + g as u32 * 150 + b as u32 * 29) / 256) as u8
+        } else {
+            self.fg_luminance()
+        };
+        let tip = if self.tool == Tool::Pencil {
+            BrushTip::new(self.tip.size, 1.0)
+        } else {
+            self.tip
+        };
+        let (w, h) = (self.doc.width, self.doc.height);
+        if li < self.doc.layers.len() && self.doc.layers[li].mask.is_some() {
+            brush::stamp_mask(
+                &mut self.doc.layers[li],
                 w,
                 h,
                 center.0,
@@ -4774,6 +6269,17 @@ impl App {
         let (mx, my) = (x as i32, y as i32);
         let prev = self.cursor;
         self.cursor = (x, y);
+        if self.drag == DragMode::NavDrag {
+            self.navigator_to(mx, my);
+            return;
+        }
+        if self.drag == DragMode::GuideDrag {
+            let dp = self.to_doc(x, y);
+            if let Some(g) = &mut self.guide_drag {
+                g.1 = if g.0 { dp.0 as i32 } else { dp.1 as i32 };
+            }
+            return;
+        }
         if self.ft.is_some() {
             let dp = self.to_doc(x, y);
             self.ft_mouse_move(dp);
@@ -4914,8 +6420,53 @@ impl App {
             }
             DragMode::MoveLayer => {
                 let layer = self.doc.active_layer;
-                let dx = (dp.0 - self.drag_start_doc.0).round() as i32;
-                let dy = (dp.1 - self.drag_start_doc.1).round() as i32;
+                let mut dx = (dp.0 - self.drag_start_doc.0).round() as i32;
+                let mut dy = (dp.1 - self.drag_start_doc.1).round() as i32;
+                if self.snap_enabled {
+                    // Snap the grab point to guides (and to the grid
+                    // while it's shown) within a few screen pixels.
+                    let thresh = 6.0 / self.viewport.scale.max(0.01);
+                    let grab = (
+                        self.drag_start_doc.0 + dx as f32,
+                        self.drag_start_doc.1 + dy as f32,
+                    );
+                    let mut best: Option<(f32, f32)> = None;
+                    let mut consider = |cand: f32, is_x: bool| {
+                        let g = if is_x { grab.0 } else { grab.1 };
+                        let d = (cand - g).abs();
+                        if d <= thresh && best.map(|(bd, _)| d < bd).unwrap_or(true) {
+                            best = Some((d, cand));
+                        }
+                    };
+                    for g in &self.doc.guides_x {
+                        consider(*g as f32, true);
+                    }
+                    if self.show_grid {
+                        let step = 64.0f32;
+                        consider((grab.0 / step).round() * step, true);
+                    }
+                    if let Some((_, cand)) = best {
+                        dx = (cand - self.drag_start_doc.0).round() as i32;
+                    }
+                    let mut besty: Option<(f32, f32)> = None;
+                    for g in &self.doc.guides_y {
+                        let d = (*g as f32 - grab.1).abs();
+                        if d <= thresh && besty.map(|(bd, _)| d < bd).unwrap_or(true) {
+                            besty = Some((d, *g as f32));
+                        }
+                    }
+                    if self.show_grid {
+                        let step = 64.0f32;
+                        let cand = (grab.1 / step).round() * step;
+                        let d = (cand - grab.1).abs();
+                        if d <= thresh && besty.map(|(bd, _)| d < bd).unwrap_or(true) {
+                            besty = Some((d, cand));
+                        }
+                    }
+                    if let Some((_, cand)) = besty {
+                        dy = (cand - self.drag_start_doc.1).round() as i32;
+                    }
+                }
                 self.doc.layers[layer].offset =
                     (self.move_orig_offset.0 + dx, self.move_orig_offset.1 + dy);
                 for (li, orig) in &self.move_linked {
@@ -4929,7 +6480,11 @@ impl App {
                     let spacing = (self.tip.size * 0.25).max(1.0);
                     for c in brush::stroke_centers(&[last, dp], spacing) {
                         if c != last {
-                            self.alpha_stamp(c);
+                            if matches!(self.paint_target, PaintTarget::Mask(_)) {
+                                self.mask_stamp(c);
+                            } else {
+                                self.alpha_stamp(c);
+                            }
                         }
                     }
                     self.alpha_last = dp;
@@ -4979,6 +6534,55 @@ impl App {
         self.mouse_down = false;
         if let Some(ft) = &mut self.ft {
             ft.drag = FtDrag::None;
+        }
+        if self.drag == DragMode::GuideDrag {
+            self.drag = DragMode::None;
+            if let Some((vertical, pos, existing)) = self.guide_drag.take() {
+                // Dropping over the canvas keeps the guide; dropping
+                // outside removes it (for an existing guide, deletes).
+                let c = self.canvas_rect(self.win_size.0, self.win_size.1);
+                let inside = c.contains(_x as i32, _y as i32);
+                match (existing, inside) {
+                    (None, true) => {
+                        self.structural("Add Guide", |d| {
+                            if vertical {
+                                d.guides_x.push(pos);
+                            } else {
+                                d.guides_y.push(pos);
+                            }
+                        });
+                        self.status = "Guide added — drag it with the Move tool".into();
+                    }
+                    (Some(i), true) => {
+                        self.structural("Move Guide", |d| {
+                            if vertical {
+                                if i < d.guides_x.len() {
+                                    d.guides_x[i] = pos;
+                                }
+                            } else if i < d.guides_y.len() {
+                                d.guides_y[i] = pos;
+                            }
+                        });
+                    }
+                    (Some(i), false) => {
+                        self.structural("Delete Guide", |d| {
+                            if vertical {
+                                if i < d.guides_x.len() {
+                                    d.guides_x.remove(i);
+                                }
+                            } else if i < d.guides_y.len() {
+                                d.guides_y.remove(i);
+                            }
+                        });
+                    }
+                    (None, false) => {}
+                }
+            }
+            return;
+        }
+        if self.drag == DragMode::NavDrag {
+            self.drag = DragMode::None;
+            return;
         }
         if let Some(d) = &mut self.dialog {
             d.slider_drag = None;
@@ -5576,6 +7180,9 @@ fn run_shot(args: &[String]) -> i32 {
     let mut size = (1280u32, 800u32);
     let mut demo2 = false;
     let mut demo3 = false;
+    let mut demo4 = false;
+    let mut ctx = false;
+    let mut batchtest = false;
     let mut tab: Option<String> = None;
     let mut cmyk = false;
     let mut ft = false;
@@ -5598,6 +7205,9 @@ fn run_shot(args: &[String]) -> i32 {
             }
             "--demo2" => demo2 = true,
             "--demo3" => demo3 = true,
+            "--demo4" => demo4 = true,
+            "--ctx" => ctx = true,
+            "--batchtest" => batchtest = true,
             "--cmyk" => cmyk = true,
             "--ft" => ft = true,
             "--manylayers" => many_layers = true,
@@ -5730,6 +7340,135 @@ fn run_shot(args: &[String]) -> i32 {
         app.cp_tab = 0;
         app.fit_view(size.0, size.1);
     }
+    if demo4 {
+        // Phase 4 demo state: a photo graded by two adjustment
+        // layers (the Photo Filter's mask hides it on the left), a
+        // masked color layer, guides, the Navigator and Actions
+        // panels open, and one recorded action.
+        let mut doc = Document::new(640, 400);
+        doc.layers[0].name = "Photo".into();
+        for y in 0..400i32 {
+            for x in 0..640i32 {
+                let r = (x * 255 / 639) as u8;
+                let g = (y * 255 / 399) as u8;
+                let b = ((x + y) * 255 / 1038) as u8;
+                doc.layers[0].set_pixel(x, y, Pixel16::from_rgba8(r, g, b, 255));
+            }
+        }
+        doc.layers[0].fill_rect(60, 60, 180, 120, Pixel16::from_rgba8(200, 60, 40, 255));
+        doc.layers[0].fill_rect(400, 220, 180, 120, Pixel16::from_rgba8(40, 90, 190, 255));
+        let tint = doc.add_layer("Teal Wash");
+        doc.layers[tint].fill_rect(0, 0, 640, 400, Pixel16::from_rgba8(20, 120, 120, 255));
+        doc.layers[tint].opacity = 0.45;
+        doc.layers[tint].add_mask(255);
+        for y in 0..400i32 {
+            for x in 320..640i32 {
+                doc.layers[tint].set_mask_value(x, y, 0);
+            }
+        }
+        doc.add_adjustment_layer(
+            "Levels",
+            pictodesk_core::adjust::Adjustment::Levels {
+                in_black: 25,
+                in_white: 230,
+                gamma: 1.15,
+                out_black: 0,
+                out_white: 255,
+            },
+        );
+        let pf = doc.add_adjustment_layer(
+            "Photo Filter",
+            pictodesk_core::adjust::Adjustment::PhotoFilter {
+                color: (255, 178, 84),
+                density: 45,
+            },
+        );
+        for y in 0..400i32 {
+            for x in 0..240i32 {
+                doc.layers[pf].set_mask_value(x, y, 0);
+            }
+        }
+        doc.guides_x = vec![320];
+        doc.guides_y = vec![200];
+        doc.active_layer = pf;
+        app.doc = doc;
+        app.doc_version += 1;
+        app.tool = Tool::Move;
+        app.show_cp = true;
+        app.cp_tab = 0;
+        app.show_actions = true;
+        app.show_grid = true;
+        app.actions = vec![RecordedAction {
+            name: "Web Resize + Warm".into(),
+            steps: vec![
+                RecordedStep::ImageSize(800, 600),
+                RecordedStep::AdjustmentLayer(pictodesk_core::adjust::Adjustment::PhotoFilter {
+                    color: (255, 178, 84),
+                    density: 30,
+                }),
+                RecordedStep::Adjustment(pictodesk_core::adjust::Adjustment::HueSaturation {
+                    hue: 0,
+                    saturation: 15,
+                    lightness: 0,
+                }),
+            ],
+        }];
+        app.active_action = 0;
+        app.paint_target = PaintTarget::Mask(pf);
+        app.fit_view(size.0, size.1);
+    }
+    if ctx {
+        // Right-click on the canvas at a fixed spot.
+        app.right_click(300.0, 300.0);
+        app.cursor = (300.0, 300.0);
+    }
+    if batchtest {
+        // End-to-end Actions check: record two steps on the demo
+        // document, play them onto a fresh document and compare
+        // renders; then batch a folder of generated PNGs.
+        app.actions = vec![RecordedAction {
+            name: "Test Action".into(),
+            steps: Vec::new(),
+        }];
+        app.active_action = 0;
+        app.recording = true;
+        app.do_action(Action::FlipHorizontal);
+        app.do_action(Action::AdjustDialog("invert"));
+        app.recording = false;
+        let steps = app.actions[0].steps.len();
+        let mut other = App::new(demo_document(), None);
+        other.actions = app.actions.clone();
+        other.active_action = 0;
+        let before = other.doc.render_checksum();
+        other.play_action(0);
+        let played = other.doc.render_checksum();
+        let mut expected = demo_document();
+        apply_steps(&mut expected, &app.actions[0].steps.clone(), None);
+        let dir = std::env::temp_dir().join("pictodesk-batchtest");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in ["a", "b"] {
+            let png = io::export_image(&demo_document(), ExportFormat::Png, 90).unwrap();
+            std::fs::write(dir.join(format!("{n}.png")), png).unwrap();
+        }
+        app.run_batch(dir.to_str().unwrap());
+        let out_a = dir.join("a-edited.png").exists();
+        let out_b = dir.join("b-edited.png").exists();
+        let ok = steps == 2
+            && played != before
+            && played == expected.render_checksum()
+            && out_a
+            && out_b;
+        eprintln!(
+            "BATCHTEST steps={steps} played_ok={} batch_ok={} {}",
+            played == expected.render_checksum(),
+            out_a && out_b,
+            if ok { "PASS" } else { "FAIL" }
+        );
+        if !ok {
+            return 1;
+        }
+    }
     if let Some(m) = menu {
         app.open_menu = Some(m);
         app.hover_item = Some((m, 0));
@@ -5744,6 +7483,7 @@ fn run_shot(args: &[String]) -> i32 {
     if let Some(name) = dialog_name {
         let kind = match name.as_str() {
             "bc" => DialogKind::BrightnessContrast,
+            "photo" => DialogKind::PhotoFilter,
             "levels" => DialogKind::Levels,
             "curves" => DialogKind::Curves,
             "cb" => DialogKind::ColorBalance,
@@ -6137,6 +7877,15 @@ impl ApplicationHandler for Runner {
                     ElementState::Pressed => self.app.mouse_down(x, y),
                     ElementState::Released => self.app.mouse_up(x, y),
                 }
+                window.request_redraw();
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Right,
+                ..
+            } => {
+                let (x, y) = self.app.cursor;
+                self.app.right_click(x, y);
                 window.request_redraw();
             }
             WindowEvent::MouseWheel { delta, .. } => {

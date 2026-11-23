@@ -22,6 +22,35 @@ fn rebuild_layer(
     out.visible = layer.visible;
     out.blend_mode = layer.blend_mode;
     out.linked = layer.linked;
+    out.adjustment = layer.adjustment.clone();
+    if layer.mask.is_some() {
+        out.add_mask(layer.mask_fill);
+        out.mask_enabled = layer.mask_enabled;
+        // Remap the mask plane through the same mapping; only
+        // non-fill values need writing (the rest stay default).
+        let mcoords: Vec<_> = layer.mask.iter().flat_map(|m| m.keys().copied()).collect();
+        for coord in mcoords {
+            for ly in 0..256i32 {
+                for lx in 0..256i32 {
+                    let (dx, dy) = (
+                        coord.0 * 256 + lx + layer.offset.0,
+                        coord.1 * 256 + ly + layer.offset.1,
+                    );
+                    let v = layer.mask_value(dx, dy);
+                    if v == layer.mask_fill {
+                        continue;
+                    }
+                    let (nx, ny) = map(dx, dy);
+                    if let Some((cw, ch)) = clip {
+                        if nx < 0 || ny < 0 || nx >= cw as i32 || ny >= ch as i32 {
+                            continue;
+                        }
+                    }
+                    out.set_mask_value(nx, ny, v);
+                }
+            }
+        }
+    }
     let has_alpha = !layer.cmyk_alpha.is_empty();
     let mut coords: Vec<_> = layer.tiles.keys().copied().collect();
     if has_alpha {
@@ -239,6 +268,12 @@ pub fn transform_layer(
     out.visible = src.visible;
     out.blend_mode = src.blend_mode;
     out.linked = src.linked;
+    out.adjustment = src.adjustment.clone();
+    let has_mask = src.mask.is_some();
+    if has_mask {
+        out.add_mask(src.mask_fill);
+        out.mask_enabled = src.mask_enabled;
+    }
     for dy in dy0..dy1 {
         for dx in dx0..dx1 {
             // Inverse map dest pixel center -> source coords.
@@ -291,6 +326,10 @@ pub fn transform_layer(
                     out.set_pixel(dx, dy, Pixel16::from_f32s(v.0, v.1, v.2, v.3));
                 }
             }
+            if has_mask {
+                let mv = src.mask_value(sx.round() as i32, sy.round() as i32);
+                out.set_mask_value(dx, dy, mv);
+            }
         }
     }
     doc.layers[layer] = out;
@@ -313,6 +352,19 @@ pub fn resize_image(doc: &mut Document, new_w: u32, new_h: u32) {
         out.opacity = src.opacity;
         out.visible = src.visible;
         out.blend_mode = src.blend_mode;
+        out.adjustment = src.adjustment.clone();
+        if src.mask.is_some() {
+            out.add_mask(src.mask_fill);
+            out.mask_enabled = src.mask_enabled;
+            for yy in 0..new_h as i32 {
+                for xx in 0..new_w as i32 {
+                    let fx = ((xx as f32 + 0.5) * sx - 0.5).round() as i32;
+                    let fy = ((yy as f32 + 0.5) * sy - 0.5).round() as i32;
+                    let mv = src.mask_value(fx.clamp(0, ow as i32 - 1), fy.clamp(0, oh as i32 - 1));
+                    out.set_mask_value(xx, yy, mv);
+                }
+            }
+        }
         if cmyk {
             // Bilinear over the five CMYK values (inks + alpha).
             for yy in 0..new_h as i32 {

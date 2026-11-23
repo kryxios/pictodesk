@@ -742,6 +742,75 @@ pub fn stamp_channel(
     }
 }
 
+/// One brush stamp into a layer mask (Phase 4): the same falloff
+/// math as `stamp_channel`, but the mask is a sparse tile plane on
+/// the layer rather than a flat buffer.
+#[allow(clippy::too_many_arguments)]
+pub fn stamp_mask(
+    layer: &mut crate::layer::Layer,
+    width: u32,
+    height: u32,
+    cx: f32,
+    cy: f32,
+    tip: &BrushTip,
+    value: u8,
+    opacity: f32,
+) {
+    let (x0, y0, x1, y1) = tip.bbox(cx, cy);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
+                continue;
+            }
+            let d = ((x as f32 + 0.5 - cx).powi(2) + (y as f32 + 0.5 - cy).powi(2)).sqrt();
+            let cov = tip.falloff(d) * opacity;
+            if cov <= 0.0 {
+                continue;
+            }
+            let cur = layer.mask_value(x, y) as f32;
+            layer.set_mask_value(x, y, (cur + (value as f32 - cur) * cov).round() as u8);
+        }
+    }
+}
+
+/// Flood a layer mask from (x, y): contiguous pixels within
+/// `tolerance` of the start value are set to `value`. The Paint
+/// Bucket on a mask target.
+pub fn flood_mask(
+    layer: &mut crate::layer::Layer,
+    width: u32,
+    height: u32,
+    x: i32,
+    y: i32,
+    value: u8,
+    tolerance: u8,
+) {
+    if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 || layer.mask.is_none() {
+        return;
+    }
+    let (w, h) = (width as i32, height as i32);
+    let start = layer.mask_value(x, y) as i32;
+    let tol = tolerance as i32;
+    let mut seen = vec![false; (w * h) as usize];
+    let mut stack = vec![(x, y)];
+    while let Some((cx, cy)) = stack.pop() {
+        let i = (cy * w + cx) as usize;
+        if seen[i] {
+            continue;
+        }
+        seen[i] = true;
+        if (layer.mask_value(cx, cy) as i32 - start).abs() > tol {
+            continue;
+        }
+        layer.set_mask_value(cx, cy, value);
+        for (nx, ny) in [(cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)] {
+            if nx >= 0 && ny >= 0 && nx < w && ny < h {
+                stack.push((nx, ny));
+            }
+        }
+    }
+}
+
 /// Flood a channel buffer from (x, y): contiguous pixels within
 /// `tolerance` of the start value are set to `value`. The Paint
 /// Bucket on a channel target.

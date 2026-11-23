@@ -28,6 +28,19 @@ pub struct Layer {
     pub cmyk_alpha: HashMap<TileCoord, Vec<u16>>,
     /// Linked layers move together with the Move tool.
     pub linked: bool,
+    /// Layer mask (Phase 4): a sparse grid of u8 tiles in document
+    /// space (offset-adjusted, like `cmyk_alpha`). An absent tile
+    /// means 255 everywhere — fully revealed. `None` = no mask.
+    pub mask: Option<HashMap<TileCoord, Vec<u8>>>,
+    /// A disabled mask is kept but ignored by the compositor.
+    pub mask_enabled: bool,
+    /// Value of mask areas with no tile yet (255 for a reveal-all
+    /// mask, 0 for hide-all). Meaningful only when `mask` is set.
+    pub mask_fill: u8,
+    /// Adjustment-layer payload (Phase 4). When present, the layer
+    /// holds no pixels of its own: the compositor runs the
+    /// adjustment over everything below it instead.
+    pub adjustment: Option<crate::adjust::Adjustment>,
 }
 
 impl Layer {
@@ -41,7 +54,42 @@ impl Layer {
             offset: (0, 0),
             cmyk_alpha: HashMap::new(),
             linked: false,
+            mask: None,
+            mask_enabled: true,
+            mask_fill: 255,
+            adjustment: None,
         }
+    }
+
+    /// Mask value at a document point (255 = fully revealed; also
+    /// the answer everywhere when the layer has no mask).
+    pub fn mask_value(&self, x: i32, y: i32) -> u8 {
+        let Some(mask) = &self.mask else { return 255 };
+        let (coord, ox, oy) = split_coord(x - self.offset.0, y - self.offset.1);
+        match mask.get(&coord) {
+            Some(t) => t[(oy as usize) * 256 + ox as usize],
+            None => self.mask_fill,
+        }
+    }
+
+    pub fn set_mask_value(&mut self, x: i32, y: i32, v: u8) {
+        let fill = self.mask_fill;
+        let (coord, ox, oy) = split_coord(x - self.offset.0, y - self.offset.1);
+        let Some(mask) = &mut self.mask else { return };
+        if v == fill && !mask.contains_key(&coord) {
+            return; // the fill value is the default; don't allocate
+        }
+        let tile = mask.entry(coord).or_insert_with(|| vec![fill; TILE_PIXELS]);
+        tile[(oy as usize) * 256 + ox as usize] = v;
+    }
+
+    /// Give the layer a mask filled with `fill` (255 = reveal all,
+    /// 0 = hide all). Per-pixel values (e.g. from a selection) are
+    /// painted in afterwards with `set_mask_value`.
+    pub fn add_mask(&mut self, fill: u8) {
+        self.mask = Some(HashMap::new());
+        self.mask_enabled = true;
+        self.mask_fill = fill;
     }
 
     /// Alpha of a CMYK-mode pixel (65535 = opaque; the default where
