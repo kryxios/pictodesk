@@ -5309,13 +5309,34 @@ impl Gpu {
         instance: &wgpu::Instance,
         surface: Option<&wgpu::Surface<'_>>,
     ) -> Option<Self> {
-        let adapter = instance
+        // Prefer a real GPU adapter. Forcing the software fallback
+        // adapter leaves some machines (notably macOS) with a surface
+        // that can never present — the window opens white and stays
+        // white. Only fall back to software if no GPU adapter exists.
+        let adapter = match instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::default(),
                 compatible_surface: surface,
-                force_fallback_adapter: true,
+                force_fallback_adapter: false,
             })
-            .await?;
+            .await
+        {
+            Some(a) => Some(a),
+            None => {
+                instance
+                    .request_adapter(&wgpu::RequestAdapterOptions {
+                        power_preference: wgpu::PowerPreference::default(),
+                        compatible_surface: surface,
+                        force_fallback_adapter: true,
+                    })
+                    .await
+            }
+        }?;
+        let info = adapter.get_info();
+        eprintln!(
+            "PictoDesk graphics: {} ({:?}, {:?})",
+            info.name, info.backend, info.device_type
+        );
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
@@ -5962,23 +5983,29 @@ impl Runner {
                     gpu.draw_to(&view);
                     frame.present();
                 }
-                Err(wgpu::SurfaceError::Lost) | Err(wgpu::SurfaceError::Outdated) => {
+                Err(e) => {
+                    // Any surface error (Lost, Outdated, Timeout,
+                    // OutOfMemory): reconfigure and let the next event
+                    // present a fresh frame, instead of swallowing the
+                    // error and leaving the window blank forever.
+                    eprintln!("PictoDesk surface: {e:?} — reconfiguring");
                     let sz = window.inner_size();
-                    surface.configure(
-                        &gpu.device,
-                        &wgpu::SurfaceConfiguration {
-                            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                            format: gpu.format,
-                            width: sz.width.max(1),
-                            height: sz.height.max(1),
-                            present_mode: wgpu::PresentMode::Fifo,
-                            desired_maximum_frame_latency: 2,
-                            alpha_mode: wgpu::CompositeAlphaMode::Auto,
-                            view_formats: vec![],
-                        },
-                    );
+                    if sz.width > 0 && sz.height > 0 {
+                        surface.configure(
+                            &gpu.device,
+                            &wgpu::SurfaceConfiguration {
+                                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                                format: gpu.format,
+                                width: sz.width,
+                                height: sz.height,
+                                present_mode: wgpu::PresentMode::Fifo,
+                                desired_maximum_frame_latency: 2,
+                                alpha_mode: wgpu::CompositeAlphaMode::Auto,
+                                view_formats: vec![],
+                            },
+                        );
+                    }
                 }
-                Err(_) => {}
             }
         }
         if self.app.quit {
@@ -6003,21 +6030,34 @@ impl ApplicationHandler for Runner {
         let instance = wgpu::Instance::default();
         let surface = instance.create_surface(window.clone()).ok();
         let gpu = pollster::block_on(Gpu::new_for_surface(&instance, surface.as_ref()));
+        if gpu.is_none() {
+            // Never sit on a dead white window: say what happened in
+            // the terminal and quit.
+            eprintln!(
+                "PictoDesk could not initialize graphics on this machine \
+                 (no usable GPU adapter or device). Nothing was drawn. \
+                 Please report this line along with your OS and GPU."
+            );
+            el.exit();
+            return;
+        }
         if let (Some(gpu), Some(surface)) = (&gpu, &surface) {
             let sz = window.inner_size();
-            surface.configure(
-                &gpu.device,
-                &wgpu::SurfaceConfiguration {
-                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-                    format: gpu.format,
-                    width: sz.width,
-                    height: sz.height,
-                    present_mode: wgpu::PresentMode::Fifo,
-                    desired_maximum_frame_latency: 2,
-                    alpha_mode: wgpu::CompositeAlphaMode::Auto,
-                    view_formats: vec![],
-                },
-            );
+            if sz.width > 0 && sz.height > 0 {
+                surface.configure(
+                    &gpu.device,
+                    &wgpu::SurfaceConfiguration {
+                        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                        format: gpu.format,
+                        width: sz.width,
+                        height: sz.height,
+                        present_mode: wgpu::PresentMode::Fifo,
+                        desired_maximum_frame_latency: 2,
+                        alpha_mode: wgpu::CompositeAlphaMode::Auto,
+                        view_formats: vec![],
+                    },
+                );
+            }
         }
         self.app.win_size = {
             let s = window.inner_size();
