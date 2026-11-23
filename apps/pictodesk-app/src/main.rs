@@ -5961,9 +5961,23 @@ struct Runner {
     surface: Option<wgpu::Surface<'static>>,
     frame: Frame,
     last_ants: std::time::Instant,
+    /// Display scale factor (2.0 on Retina). The UI is drawn on the
+    /// CPU at LOGICAL size and the GPU stretches it over the physical
+    /// surface — drawing at physical size made every control half
+    /// size on high-DPI displays and quadrupled the per-frame CPU
+    /// and upload cost.
+    scale: f64,
 }
 
 impl Runner {
+    fn logical_size(&self, phys_w: u32, phys_h: u32) -> (u32, u32) {
+        let s = if self.scale > 0.0 { self.scale } else { 1.0 };
+        (
+            ((phys_w as f64 / s).round() as u32).max(1),
+            ((phys_h as f64 / s).round() as u32).max(1),
+        )
+    }
+
     fn redraw(&mut self) {
         let Some(window) = self.window.clone() else {
             return;
@@ -5972,9 +5986,10 @@ impl Runner {
         if size.width == 0 || size.height == 0 {
             return;
         }
-        self.app.win_size = (size.width, size.height);
-        if self.frame.w != size.width || self.frame.h != size.height {
-            self.frame.resize(size.width, size.height);
+        let logical = self.logical_size(size.width, size.height);
+        self.app.win_size = logical;
+        if self.frame.w != logical.0 || self.frame.h != logical.1 {
+            self.frame.resize(logical.0, logical.1);
         }
         self.app.draw(&mut self.frame);
         if let (Some(gpu), Some(surface)) = (&mut self.gpu, &self.surface) {
@@ -6063,9 +6078,10 @@ impl ApplicationHandler for Runner {
                 );
             }
         }
+        self.scale = window.scale_factor();
         self.app.win_size = {
             let s = window.inner_size();
-            (s.width, s.height)
+            self.logical_size(s.width, s.height)
         };
         self.app.fit_view(self.app.win_size.0, self.app.win_size.1);
         self.window = Some(window);
@@ -6098,11 +6114,17 @@ impl ApplicationHandler for Runner {
                         );
                     }
                 }
-                self.app.win_size = (sz.width, sz.height);
+                self.app.win_size = self.logical_size(sz.width, sz.height);
+                window.request_redraw();
+            }
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                self.scale = scale_factor;
                 window.request_redraw();
             }
             WindowEvent::CursorMoved { position, .. } => {
-                self.app.mouse_move(position.x as f32, position.y as f32);
+                let s = if self.scale > 0.0 { self.scale } else { 1.0 };
+                self.app
+                    .mouse_move((position.x / s) as f32, (position.y / s) as f32);
                 window.request_redraw();
             }
             WindowEvent::MouseInput {
@@ -6228,6 +6250,7 @@ fn run_window(path: Option<PathBuf>) {
         surface: None,
         frame: Frame::new(1280, 800),
         last_ants: std::time::Instant::now(),
+        scale: 1.0,
     };
     let _ = event_loop.run_app(&mut runner);
 }
