@@ -3,7 +3,7 @@
 An open-source desktop photo and image editor — local files, no cloud,
 no account, no subscription. Built feature by feature, in the open.
 
-**Status: v0.3.1 — Phase 3 complete: layers, with the v0.3.0 reduced forms finished. First public alpha.**
+**Status: v0.3.2 — Phase 3 complete: layers, with the v0.3.0 reduced forms finished. First public alpha.**
 The UI follows the classic early-90s editor design: a File / Edit /
 Image / Mode / Filter / Select / Window menu bar, a compact
 two-column toolbox, modal dialogs with live preview, docked tabbed
@@ -60,7 +60,11 @@ What exists today:
   dropped. The Layers panel scrolls (mouse wheel, footer buttons)
   and always keeps the active layer visible. The app autosaves a
   recovery copy of unsaved work every 20 seconds and offers it
-  back after a crash.
+  back after a crash. Like the classic editors, `.pdesk` files
+  carry a provenance history log — created / opened / saved and
+  every edit's label, with timestamps — viewable any time via
+  File > History Log. (The undo stack itself stays session-only,
+  same as the classics.)
 - A desktop shell (`apps/pictodesk-app`): the classic 1990-era workbench
   — platinum menu bar and toolbox, rulers, docked tabbed palettes
   (Channels/Paths, Brushes, Histogram, Color), modal dialogs with

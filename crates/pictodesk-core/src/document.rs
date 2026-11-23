@@ -56,6 +56,36 @@ impl AlphaChannel {
     }
 }
 
+/// One entry in a document's history log — provenance metadata
+/// stored in the file itself (the way classic editors embed an
+/// event log: created / opened / saved / each edit's label). This
+/// is NOT the undo stack; undo states are session-only.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HistoryEvent {
+    /// Seconds since the Unix epoch (UTC).
+    pub when: u64,
+    pub action: String,
+}
+
+/// Format a Unix timestamp as `YYYY-MM-DD HH:MM` in UTC.
+pub fn format_history_time(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let day_secs = secs % 86_400;
+    let (hh, mm) = (day_secs / 3600, (day_secs % 3600) / 60);
+    // Civil-from-days (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}")
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Document {
     pub width: u32,
@@ -68,6 +98,8 @@ pub struct Document {
     pub paths: Vec<crate::path::Path>,
     pub work_path: Option<crate::path::Path>,
     pub clipping_path: Option<usize>,
+    /// Provenance event log, stored in the `.pdesk` file.
+    pub history_log: Vec<HistoryEvent>,
 }
 
 impl Document {
@@ -86,6 +118,25 @@ impl Document {
             paths: Vec::new(),
             work_path: None,
             clipping_path: None,
+            history_log: Vec::new(),
+        }
+    }
+
+    /// Append an event to the history log, timestamped now. The
+    /// log is capped at 500 entries (oldest dropped) so the file
+    /// stays lean.
+    pub fn log_event(&mut self, action: impl Into<String>) {
+        let when = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        self.history_log.push(HistoryEvent {
+            when,
+            action: action.into(),
+        });
+        if self.history_log.len() > 500 {
+            let excess = self.history_log.len() - 500;
+            self.history_log.drain(..excess);
         }
     }
 

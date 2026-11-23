@@ -86,6 +86,9 @@ impl Writer {
     fn u32(&mut self, v: u32) {
         self.buf.extend_from_slice(&v.to_le_bytes());
     }
+    fn u64(&mut self, v: u64) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
     fn i32(&mut self, v: i32) {
         self.buf.extend_from_slice(&v.to_le_bytes());
     }
@@ -115,6 +118,9 @@ impl<'a> Reader<'a> {
     }
     fn u16(&mut self) -> Result<u16, FormatError> {
         Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
+    }
+    fn u64(&mut self) -> Result<u64, FormatError> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
     fn u32(&mut self) -> Result<u32, FormatError> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
@@ -252,6 +258,15 @@ fn serialize_ext(w: &mut Writer, doc: &Document) {
     // Layer link flags (v0.3.0 addition, also optional trailing).
     for layer in &doc.layers {
         w.u8(layer.linked as u8);
+    }
+    // History log (v0.3.2 addition, also optional trailing):
+    // count, then per event (unix secs, name).
+    w.u32(doc.history_log.len() as u32);
+    for ev in &doc.history_log {
+        w.u64(ev.when);
+        let name = ev.action.as_bytes();
+        w.u16(name.len() as u16);
+        w.bytes(name);
     }
 }
 
@@ -414,6 +429,18 @@ fn parse_ext(payload: &[u8], doc: &mut Document) -> Result<(), FormatError> {
     if r.pos < payload.len() {
         for layer in &mut doc.layers {
             layer.linked = r.u8()? != 0;
+        }
+    }
+    // Optional trailing section: history log (v0.3.2). Files
+    // written before it end exactly here.
+    if r.pos < payload.len() {
+        let count = r.u32()?;
+        for _ in 0..count {
+            let when = r.u64()?;
+            let len = r.u16()? as usize;
+            let action = String::from_utf8(r.take(len)?.to_vec())
+                .map_err(|_| FormatError::Corrupt("history action not UTF-8"))?;
+            doc.history_log.push(crate::document::HistoryEvent { when, action });
         }
     }
     Ok(())

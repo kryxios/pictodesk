@@ -123,6 +123,13 @@ the engine itself is unlimited; later phases raise the cap).
   Transform (scale / rotate / skew about the painted-bounds
   center, bilinear, mode-aware sampling; off-canvas content is
   kept because layers are unbounded tile maps).
+- History metadata: `Document::history_log` records provenance
+  events (Created / Opened / Saved, plus the label of every
+  undoable edit, pushed centrally by the shell's `push_cmd`), is
+  stored as an optional trailing section of the `.pdesk`
+  extension block (capped at 500 entries), and is shown by the
+  shell's File > History Log dialog. Undo states themselves are
+  never stored — session-only, as in the classic editors.
 - `psd.rs` — PSD / PSB import: 1/8/16-bit Bitmap / Grayscale /
   Indexed / RGB / CMYK / Multichannel, raw, PackBits and ZIP
   (plain and delta-predicted) channel data, layer records (stored

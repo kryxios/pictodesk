@@ -24,7 +24,7 @@ use pictodesk_core::document::{AlphaChannel, ColorMode};
 use pictodesk_core::filter;
 use pictodesk_core::format;
 use pictodesk_core::histogram::Histogram;
-use pictodesk_core::history::{run_tile_edit, DocumentCommand, MoveLayerCommand, TileEditCommand};
+use pictodesk_core::history::{run_tile_edit, Command, DocumentCommand, MoveLayerCommand, TileEditCommand};
 use pictodesk_core::io::{self, ExportFormat};
 use pictodesk_core::path::{Anchor, Path as BezPath, Subpath};
 use pictodesk_core::selection::Selection;
@@ -170,6 +170,7 @@ enum Action {
     OpenPanel,
     Save,
     SaveAsPanel,
+    HistoryLog,
     ExportPng,
     Revert,
     Quit,
@@ -301,6 +302,7 @@ enum DialogKind {
     SavePath,
     NewLayer,
     LayerOptions,
+    HistoryLog,
 }
 
 impl DialogKind {
@@ -327,6 +329,7 @@ impl DialogKind {
             DialogKind::SavePath => "Save Path",
             DialogKind::NewLayer => "New Layer",
             DialogKind::LayerOptions => "Layer Options",
+            DialogKind::HistoryLog => "History Log",
         }
     }
     /// Pixel dialogs preview live through a tile-snapshot command.
@@ -393,6 +396,7 @@ impl Dialog {
             }
             DialogKind::Fill => vec![100.0],
             DialogKind::SaveAs => vec![],
+            DialogKind::HistoryLog => vec![],
         };
         Dialog {
             kind,
@@ -449,6 +453,7 @@ impl Dialog {
             DialogKind::Curves
             | DialogKind::SaveAs
             | DialogKind::SavePath
+            | DialogKind::HistoryLog
             | DialogKind::NewLayer => vec![],
             DialogKind::LayerOptions => vec![("Opacity", 0.0, 100.0)],
             DialogKind::GrowSel | DialogKind::SimilarSel => vec![("Tolerance", 0.0, 255.0)],
@@ -791,6 +796,7 @@ impl App {
                     MenuItem::new("Open...", Action::OpenPanel).key("O"),
                     MenuItem::new("Save", Action::Save).key("S"),
                     MenuItem::new("Save As...", Action::SaveAsPanel),
+                    MenuItem::new("History Log...", Action::HistoryLog),
                     MenuItem::new("Export PNG...", Action::ExportPng),
                     MenuItem::new("Revert", Action::Revert)
                         .off_if(!self.dirty && self.file_path.is_none()),
@@ -970,14 +976,21 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-use pictodesk_core::history::Command as _;
 
 impl App {
+    /// Push a finished command onto the history stack and record
+    /// the edit in the document's provenance log (stored in the
+    /// `.pdesk` file, like the classic editors' embedded history).
+    fn push_cmd(&mut self, cmd: Box<dyn Command>) {
+        self.doc.log_event(cmd.label());
+        self.hist.push(cmd);
+    }
+
     fn structural(&mut self, label: &str, f: impl FnOnce(&mut Document)) {
         let mut cmd = DocumentCommand::begin(label, &self.doc);
         f(&mut self.doc);
         cmd.finish(&self.doc);
-        self.hist.push(Box::new(cmd));
+        self.push_cmd(Box::new(cmd));
         self.last_label = Some(label.to_string());
         self.status = label.to_string();
         self.touch();
@@ -1055,7 +1068,7 @@ impl App {
             if ft.origin != self.doc {
                 let mut cmd = DocumentCommand::begin("Free Transform", &ft.origin);
                 cmd.finish(&self.doc);
-                self.hist.push(Box::new(cmd));
+                self.push_cmd(Box::new(cmd));
                 self.last_label = Some("Free Transform".into());
             }
             self.status = "Free Transform applied".into();
@@ -1224,7 +1237,7 @@ impl App {
             if before != self.doc {
                 let mut cmd = DocumentCommand::begin(label, &before);
                 cmd.finish(&self.doc);
-                self.hist.push(Box::new(cmd));
+                self.push_cmd(Box::new(cmd));
                 self.last_label = Some(label.to_string());
             }
         }
@@ -1303,6 +1316,7 @@ impl App {
         match result {
             Ok(doc) => {
                 self.doc = doc;
+                self.doc.log_event("Opened");
                 self.hist = History::new();
                 self.hist.set_limit(Some(1));
                 self.last_label = None;
@@ -1332,6 +1346,10 @@ impl App {
     }
 
     fn save_to(&mut self, path: &Path) -> bool {
+        if path.extension().map(|e| e == "pdesk").unwrap_or(false) {
+            // Record the save in the file's own history log.
+            self.doc.log_event("Saved");
+        }
         let result = if path.extension().map(|e| e == "pdesk").unwrap_or(false) {
             std::fs::write(path, format::serialize(&self.doc)).map_err(|e| e.to_string())
         } else if ExportFormat::from_path(path).is_some() {
@@ -1398,6 +1416,9 @@ impl App {
                     .unwrap_or_else(|| "untitled.pdesk".into());
                 d.text_focus = true;
                 self.dialog = Some(d);
+            }
+            Action::HistoryLog => {
+                self.open_dialog(DialogKind::HistoryLog);
             }
             Action::ExportPng => {
                 let name = self
@@ -1909,7 +1930,7 @@ impl App {
                         cmd.capture_after(&self.doc, layer, c);
                     }
                     let title = k.title().to_string();
-                    self.hist.push(Box::new(cmd));
+                    self.push_cmd(Box::new(cmd));
                     self.last_label = Some(title.clone());
                     self.status = title;
                 }
@@ -1996,6 +2017,7 @@ impl App {
                 );
                 let mut doc = Document::new(w, h);
                 doc.layers[0].fill_rect(0, 0, w, h, self.bg);
+                doc.log_event("Created");
                 self.doc = doc;
                 self.channel_view = ChannelView::Composite;
                 self.paint_target = PaintTarget::Image;
@@ -2151,6 +2173,9 @@ impl App {
         }
         if d.kind == DialogKind::Fill {
             h += 22;
+        }
+        if d.kind == DialogKind::HistoryLog {
+            h = 46 + 15 * 13 + 40;
         }
         if matches!(
             d.kind,
@@ -3669,6 +3694,29 @@ impl App {
                 );
             }
         }
+        // history log: the document's provenance events
+        if d.kind == DialogKind::HistoryLog {
+            let boxr = Rect::new(r.x + 12, r.y + 26, r.w - 24, r.h - 26 - 34);
+            f.fill_rect(boxr, ui::WHITE);
+            f.bevel_sunken(boxr);
+            let log = &self.doc.history_log;
+            if log.is_empty() {
+                f.text(boxr.x + 6, boxr.y + 6, "(no history recorded yet)", 1, ui::BLACK);
+            } else {
+                let rows = ((boxr.h - 10) / 13).max(1) as usize;
+                let start = log.len().saturating_sub(rows);
+                for (i, ev) in log[start..].iter().enumerate() {
+                    let when = pictodesk_core::document::format_history_time(ev.when);
+                    f.text(
+                        boxr.x + 6,
+                        boxr.y + 5 + i as i32 * 13,
+                        &format!("{when}  {}", ev.action),
+                        1,
+                        ui::BLACK,
+                    );
+                }
+            }
+        }
         // range / fill toggle buttons
         if d.kind == DialogKind::ColorBalance {
             let names = ["Shadows", "Midtones", "Highlights"];
@@ -4170,7 +4218,7 @@ impl App {
                         brush::flood_channel(&mut ch.data, w, h, dp.0 as i32, dp.1 as i32, v, 32);
                     }
                     cmd.finish(&self.doc);
-                    self.hist.push(Box::new(cmd));
+                    self.push_cmd(Box::new(cmd));
                     self.last_label = Some("Paint Bucket".into());
                     self.status = "Paint Bucket (channel)".into();
                     self.touch();
@@ -4863,7 +4911,7 @@ impl App {
             DragMode::Paint => {
                 if let Some(mut cmd) = self.alpha_cmd.take() {
                     cmd.finish(&self.doc);
-                    self.hist.push(Box::new(cmd));
+                    self.push_cmd(Box::new(cmd));
                     self.last_label = Some("Paint on channel".into());
                     self.status = "Paint on channel".into();
                     self.touch();
@@ -4873,7 +4921,7 @@ impl App {
                         s.cmd.capture_after(&self.doc, layer, *t);
                     }
                     let label = self.tool.name().to_string();
-                    self.hist.push(Box::new(s.cmd));
+                    self.push_cmd(Box::new(s.cmd));
                     self.last_label = Some(label.clone());
                     self.status = label;
                     self.touch();
@@ -5587,6 +5635,24 @@ fn run_shot(args: &[String]) -> i32 {
             "levels" => DialogKind::Levels,
             "curves" => DialogKind::Curves,
             "cb" => DialogKind::ColorBalance,
+            "history" => {
+                use pictodesk_core::document::HistoryEvent;
+                for (when, action) in [
+                    (1_763_827_200, "Created"),
+                    (1_763_830_800, "Levels"),
+                    (1_763_834_400, "Clone Stamp"),
+                    (1_763_838_000, "Saved"),
+                    (1_763_841_600, "Free Transform"),
+                    (1_763_845_200, "Opened"),
+                    (1_763_848_800, "Gaussian Blur"),
+                ] {
+                    app.doc.history_log.push(HistoryEvent {
+                        when,
+                        action: action.into(),
+                    });
+                }
+                DialogKind::HistoryLog
+            }
             _ => DialogKind::HueSaturation,
         };
         app.open_dialog(kind);
