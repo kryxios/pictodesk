@@ -170,6 +170,16 @@ struct MenuItem {
     enabled: bool,
     checked: bool,
     submenu: Option<Vec<MenuItem>>,
+    shortcut: Option<String>,
+}
+
+/// The platform command-modifier label: Cmd on macOS, Ctrl elsewhere.
+fn shortcut_label(k: &str) -> String {
+    if cfg!(target_os = "macos") {
+        format!("Cmd+{k}")
+    } else {
+        format!("Ctrl+{k}")
+    }
 }
 
 impl MenuItem {
@@ -180,6 +190,7 @@ impl MenuItem {
             enabled: true,
             checked: false,
             submenu: None,
+            shortcut: None,
         }
     }
     fn off(mut self) -> Self {
@@ -188,6 +199,12 @@ impl MenuItem {
     }
     fn check(mut self) -> Self {
         self.checked = true;
+        self
+    }
+    /// Attach a keyboard shortcut (single key name, e.g. "Z"); the
+    /// menu shows it with the platform's command modifier.
+    fn key(mut self, k: &str) -> Self {
+        self.shortcut = Some(shortcut_label(k));
         self
     }
     fn sub(mut self, items: Vec<MenuItem>) -> Self {
@@ -435,6 +452,7 @@ struct App {
     space_down: bool,
     alt_down: bool,
     ctrl_down: bool,
+    super_down: bool,
     shift_down: bool,
     win_size: (u32, u32),
     // render cache
@@ -490,6 +508,7 @@ impl App {
             space_down: false,
             alt_down: false,
             ctrl_down: false,
+            super_down: false,
             shift_down: false,
             win_size: (1280, 800),
             doc_version: 0,
@@ -567,9 +586,9 @@ impl App {
             Menu {
                 title: "File",
                 items: vec![
-                    MenuItem::new("New...", Action::New),
-                    MenuItem::new("Open...", Action::OpenPanel),
-                    MenuItem::new("Save", Action::Save),
+                    MenuItem::new("New...", Action::New).key("N"),
+                    MenuItem::new("Open...", Action::OpenPanel).key("O"),
+                    MenuItem::new("Save", Action::Save).key("S"),
                     MenuItem::new("Save As...", Action::SaveAsPanel),
                     MenuItem::new("Export PNG...", Action::ExportPng),
                     MenuItem::new("Revert", Action::Revert)
@@ -580,7 +599,9 @@ impl App {
             Menu {
                 title: "Edit",
                 items: vec![
-                    MenuItem::new(undo_label, Action::UndoToggle).off_if(!can_undo),
+                    MenuItem::new(undo_label, Action::UndoToggle)
+                        .off_if(!can_undo)
+                        .key("Z"),
                     MenuItem::new("Cut", Action::Cut).off_if(!has_sel),
                     MenuItem::new("Copy", Action::Copy).off_if(!has_sel),
                     MenuItem::new("Paste", Action::Paste)
@@ -610,7 +631,7 @@ impl App {
                         MenuItem::new("Color Balance...", Action::AdjustDialog("cb")),
                         MenuItem::new("Levels...", Action::AdjustDialog("levels")),
                         MenuItem::new("Curves...", Action::AdjustDialog("curves")),
-                        MenuItem::new("Invert", Action::AdjustDialog("invert")),
+                        MenuItem::new("Invert", Action::AdjustDialog("invert")).key("I"),
                         MenuItem::new("Desaturate", Action::AdjustDialog("desat")),
                         MenuItem::new("Posterize...", Action::AdjustDialog("posterize")),
                         MenuItem::new("Threshold...", Action::AdjustDialog("threshold")),
@@ -637,8 +658,8 @@ impl App {
             Menu {
                 title: "Select",
                 items: vec![
-                    MenuItem::new("All", Action::SelectAll),
-                    MenuItem::new("None", Action::SelectNone),
+                    MenuItem::new("All", Action::SelectAll).key("A"),
+                    MenuItem::new("None", Action::SelectNone).key("D"),
                     MenuItem::new("Inverse", Action::SelectInverse).off_if(!has_sel),
                     MenuItem::new("Feather...", Action::FeatherDialog).off_if(!has_sel),
                 ],
@@ -650,10 +671,10 @@ impl App {
                         .check_if(self.show_histogram),
                     MenuItem::new("Brushes", Action::ToggleBrushes).check_if(self.show_brushes),
                     MenuItem::new("Rulers", Action::ToggleRulers).check_if(self.show_rulers),
-                    MenuItem::new("Zoom In", Action::ZoomIn),
-                    MenuItem::new("Zoom Out", Action::ZoomOut),
-                    MenuItem::new("Actual Pixels", Action::Zoom100),
-                    MenuItem::new("Fit on Screen", Action::ZoomFit),
+                    MenuItem::new("Zoom In", Action::ZoomIn).key("+"),
+                    MenuItem::new("Zoom Out", Action::ZoomOut).key("-"),
+                    MenuItem::new("Actual Pixels", Action::Zoom100).key("1"),
+                    MenuItem::new("Fit on Screen", Action::ZoomFit).key("0"),
                 ],
             },
         ]
@@ -1282,7 +1303,14 @@ impl App {
         let w = m
             .items
             .iter()
-            .map(|it| Frame::text_width(&it.label, 1) + 44)
+            .map(|it| {
+                Frame::text_width(&it.label, 1)
+                    + it.shortcut
+                        .as_deref()
+                        .map(|sc| Frame::text_width(sc, 1) + 12)
+                        .unwrap_or(0)
+                    + 44
+            })
             .max()
             .unwrap_or(120);
         Rect::new(tr.x, ui::MENU_H, w, m.items.len() as i32 * 17 + 6)
@@ -1862,6 +1890,10 @@ impl App {
                     f.line(ir.x + 6, ir.y + 12, ir.x + 12, ir.y + 4, c);
                 }
                 f.text(ir.x + 16, ir.y + 4, &item.label, 1, c);
+                if let Some(sc) = &item.shortcut {
+                    let sw = Frame::text_width(sc, 1);
+                    f.text(ir.right() - sw - 6, ir.y + 4, sc, 1, c);
+                }
                 if item.submenu.is_some() {
                     f.text(ir.right() - 16, ir.y + 4, ">", 1, c);
                 }
@@ -1872,7 +1904,14 @@ impl App {
                     let parent = Rect::new(dr.x + 2, dr.y + 3 + si as i32 * 17, dr.w - 4, 17);
                     let sw = sub
                         .iter()
-                        .map(|it| Frame::text_width(&it.label, 1) + 40)
+                        .map(|it| {
+                            Frame::text_width(&it.label, 1)
+                                + it.shortcut
+                                    .as_deref()
+                                    .map(|sc| Frame::text_width(sc, 1) + 12)
+                                    .unwrap_or(0)
+                                + 40
+                        })
                         .max()
                         .unwrap_or(120);
                     let sr = Rect::new(dr.right() - 2, parent.y - 3, sw, sub.len() as i32 * 17 + 6);
@@ -1892,6 +1931,10 @@ impl App {
                             ui::BLACK
                         };
                         f.text(ir.x + 8, ir.y + 4, &item.label, 1, c);
+                        if let Some(sc) = &item.shortcut {
+                            let sw = Frame::text_width(sc, 1);
+                            f.text(ir.right() - sw - 6, ir.y + 4, sc, 1, c);
+                        }
                     }
                 }
             }
@@ -2828,7 +2871,14 @@ impl App {
                     let parent = Rect::new(dr.x + 2, dr.y + 3 + si as i32 * 17, dr.w - 4, 17);
                     let sw = sub
                         .iter()
-                        .map(|it| Frame::text_width(&it.label, 1) + 40)
+                        .map(|it| {
+                            Frame::text_width(&it.label, 1)
+                                + it.shortcut
+                                    .as_deref()
+                                    .map(|sc| Frame::text_width(sc, 1) + 12)
+                                    .unwrap_or(0)
+                                + 40
+                        })
                         .max()
                         .unwrap_or(120);
                     let sr = Rect::new(dr.right() - 2, parent.y - 3, sw, sub.len() as i32 * 17 + 6);
@@ -3040,31 +3090,46 @@ impl App {
         let (mx, my) = (self.cursor.0 as i32, self.cursor.1 as i32);
         if canvas.contains(mx, my) {
             let local = (
-                self.cursor.0 - ui::TOOLBAR_W as f32,
-                self.cursor.1 - ui::MENU_H as f32,
+                self.cursor.0 - canvas.x as f32,
+                self.cursor.1 - canvas.y as f32,
             );
             self.viewport
                 .zoom_at(local, if delta > 0.0 { 1.1 } else { 0.9 });
         }
     }
 
+    /// The command modifier for shortcuts: Cmd on macOS, Ctrl on
+    /// Windows and Linux — the Photoshop convention on each platform.
+    fn primary_down(&self) -> bool {
+        if cfg!(target_os = "macos") {
+            self.super_down
+        } else {
+            self.ctrl_down
+        }
+    }
+
     pub fn key_char(&mut self, c: char) {
+        let primary = self.primary_down();
         // dialog text entry
         if let Some(d) = &mut self.dialog {
-            if d.text_focus && !self.ctrl_down {
+            if d.text_focus && !primary {
                 d.text.push(c);
             }
             return;
         }
-        if self.ctrl_down {
+        if primary {
             match c.to_ascii_lowercase() {
                 'z' => self.do_action(Action::UndoToggle),
                 's' => self.do_action(Action::Save),
                 'o' => self.do_action(Action::OpenPanel),
                 'n' => self.do_action(Action::New),
                 'd' => self.do_action(Action::SelectNone),
+                'a' => self.do_action(Action::SelectAll),
+                'i' => self.do_action(Action::AdjustDialog("invert")),
                 '+' | '=' => self.do_action(Action::ZoomIn),
                 '-' => self.do_action(Action::ZoomOut),
+                '0' => self.do_action(Action::ZoomFit),
+                '1' => self.do_action(Action::Zoom100),
                 _ => {}
             }
             return;
@@ -3794,6 +3859,7 @@ impl ApplicationHandler for Runner {
             WindowEvent::ModifiersChanged(mods) => {
                 let s: ModifiersState = mods.state();
                 self.app.ctrl_down = s.control_key();
+                self.app.super_down = s.super_key();
                 self.app.alt_down = s.alt_key();
                 self.app.shift_down = s.shift_key();
             }
