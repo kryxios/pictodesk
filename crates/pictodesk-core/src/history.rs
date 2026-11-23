@@ -170,12 +170,13 @@ impl Command for DocumentCommand {
 
 /// A layer-offset change (the Move tool): no pixels change, only the
 /// layer's position in the document.
+/// One layer's offset change: (layer index, before, after).
+pub type LayerMove = (usize, (i32, i32), (i32, i32));
+
 #[derive(Clone, Debug)]
 pub struct MoveLayerCommand {
     label: String,
-    layer: usize,
-    before: (i32, i32),
-    after: (i32, i32),
+    moves: Vec<LayerMove>,
 }
 
 impl MoveLayerCommand {
@@ -187,9 +188,15 @@ impl MoveLayerCommand {
     ) -> Self {
         MoveLayerCommand {
             label: label.into(),
-            layer,
-            before,
-            after,
+            moves: vec![(layer, before, after)],
+        }
+    }
+
+    /// One command moving several layers together (linked layers).
+    pub fn new_multi(label: impl Into<String>, moves: Vec<LayerMove>) -> Self {
+        MoveLayerCommand {
+            label: label.into(),
+            moves,
         }
     }
 }
@@ -199,10 +206,14 @@ impl Command for MoveLayerCommand {
         &self.label
     }
     fn apply(&mut self, doc: &mut Document) {
-        doc.layers[self.layer].offset = self.after;
+        for (layer, _, after) in &self.moves {
+            doc.layers[*layer].offset = *after;
+        }
     }
     fn revert(&mut self, doc: &mut Document) {
-        doc.layers[self.layer].offset = self.before;
+        for (layer, before, _) in &self.moves {
+            doc.layers[*layer].offset = *before;
+        }
     }
 }
 

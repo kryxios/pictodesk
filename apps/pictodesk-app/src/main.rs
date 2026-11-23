@@ -178,6 +178,18 @@ enum Action {
     ToggleHistogram,
     ToggleBrushes,
     ToggleChannels,
+    ToggleLayers,
+    NewLayer,
+    DuplicateLayer,
+    DeleteLayer,
+    LayerOptions,
+    BlendMode(usize),
+    BringForward,
+    SendBackward,
+    FreeTransform,
+    MergeDown,
+    MergeVisible,
+    FlattenImage,
     TogglePaths,
     ToggleColor,
     ToggleRulers,
@@ -259,6 +271,9 @@ enum DialogKind {
     GrowSel,
     SimilarSel,
     SavePath,
+    NewLayer,
+    LayerOptions,
+    FreeTransform,
 }
 
 impl DialogKind {
@@ -283,6 +298,9 @@ impl DialogKind {
             DialogKind::GrowSel => "Grow Selection",
             DialogKind::SimilarSel => "Select Similar",
             DialogKind::SavePath => "Save Path",
+            DialogKind::NewLayer => "New Layer",
+            DialogKind::LayerOptions => "Layer Options",
+            DialogKind::FreeTransform => "Free Transform",
         }
     }
     /// Pixel dialogs preview live through a tile-snapshot command.
@@ -343,6 +361,11 @@ impl Dialog {
             DialogKind::Feather => vec![5.0],
             DialogKind::GrowSel | DialogKind::SimilarSel => vec![32.0],
             DialogKind::SavePath => vec![],
+            DialogKind::NewLayer => vec![],
+            DialogKind::LayerOptions => {
+                vec![doc.layers[doc.active_layer].opacity * 100.0]
+            }
+            DialogKind::FreeTransform => vec![100.0, 100.0, 0.0, 0.0],
             DialogKind::Fill => vec![100.0],
             DialogKind::SaveAs => vec![],
         };
@@ -398,7 +421,17 @@ impl Dialog {
             }
             DialogKind::Feather => vec![("Radius", 0.0, 250.0)],
             DialogKind::Fill => vec![("Opacity", 0.0, 100.0)],
-            DialogKind::Curves | DialogKind::SaveAs | DialogKind::SavePath => vec![],
+            DialogKind::Curves
+            | DialogKind::SaveAs
+            | DialogKind::SavePath
+            | DialogKind::NewLayer => vec![],
+            DialogKind::LayerOptions => vec![("Opacity", 0.0, 100.0)],
+            DialogKind::FreeTransform => vec![
+                ("Scale X %", 10.0, 400.0),
+                ("Scale Y %", 10.0, 400.0),
+                ("Rotate", -180.0, 180.0),
+                ("Skew X", -60.0, 60.0),
+            ],
             DialogKind::GrowSel | DialogKind::SimilarSel => vec![("Tolerance", 0.0, 255.0)],
         }
     }
@@ -491,7 +524,7 @@ struct App {
     show_rulers: bool,
     show_palette: bool,
     show_cp: bool,
-    cp_tab: usize, // 0 = Channels, 1 = Paths
+    cp_tab: usize, // 0 = Layers, 1 = Channels, 2 = Paths
     channel_view: ChannelView,
     paint_target: PaintTarget,
     active_path: Option<PathRef>,
@@ -512,6 +545,8 @@ struct App {
     lasso_points: Vec<(f32, f32)>,
     stroke: Option<StrokeState>,
     move_orig_offset: (i32, i32),
+    /// Original offsets of linked layers during a Move drag.
+    move_linked: Vec<(usize, (i32, i32))>,
     space_down: bool,
     alt_down: bool,
     ctrl_down: bool,
@@ -578,6 +613,7 @@ impl App {
             lasso_points: Vec::new(),
             stroke: None,
             move_orig_offset: (0, 0),
+            move_linked: Vec::new(),
             space_down: false,
             alt_down: false,
             ctrl_down: false,
@@ -646,17 +682,12 @@ impl App {
             }
         };
         if self.show_cp {
-            let (rows, btn_h) = if self.cp_tab == 0 {
-                (self.channel_row_count(), 22)
-            } else {
-                (self.path_row_count().max(1), 42)
+            let h = match self.cp_tab {
+                0 => 70 + self.doc.layers.len().min(8) as i32 * 28,
+                1 => 20 + self.channel_row_count() as i32 * 15 + 22,
+                _ => 20 + self.path_row_count().max(1) as i32 * 15 + 42,
             };
-            place(
-                PanelKind::Cp,
-                20 + rows as i32 * 15 + btn_h,
-                &mut out,
-                &mut y,
-            );
+            place(PanelKind::Cp, h, &mut out, &mut y);
         }
         if self.show_brushes {
             place(PanelKind::Brushes, 84, &mut out, &mut y);
@@ -777,6 +808,36 @@ impl App {
                 ],
             },
             Menu {
+                title: "Layer",
+                items: {
+                    let a = self.doc.active_layer;
+                    let cur = self.doc.layers[a].blend_mode;
+                    let blend_items: Vec<MenuItem> = pictodesk_core::blend::ALL_BLEND_MODES
+                        .iter()
+                        .enumerate()
+                        .map(|(i, m)| {
+                            MenuItem::new(m.name(), Action::BlendMode(i)).check_if(*m == cur)
+                        })
+                        .collect();
+                    vec![
+                        MenuItem::new("New Layer...", Action::NewLayer).key("Shift+N"),
+                        MenuItem::new("Duplicate Layer", Action::DuplicateLayer),
+                        MenuItem::new("Delete Layer", Action::DeleteLayer)
+                            .off_if(self.doc.layers.len() <= 1),
+                        MenuItem::new("Layer Options...", Action::LayerOptions),
+                        MenuItem::new("Blend Mode", Action::None).sub(blend_items),
+                        MenuItem::new("Bring Forward", Action::BringForward).key("]"),
+                        MenuItem::new("Send Backward", Action::SendBackward).key("["),
+                        MenuItem::new("Free Transform...", Action::FreeTransform).key("T"),
+                        MenuItem::new("Merge Down", Action::MergeDown)
+                            .key("E")
+                            .off_if(a == 0),
+                        MenuItem::new("Merge Visible", Action::MergeVisible),
+                        MenuItem::new("Flatten Image", Action::FlattenImage),
+                    ]
+                },
+            },
+            Menu {
                 title: "Mode",
                 items: vec![
                     MenuItem::new("RGB Color", Action::ModeRgb)
@@ -829,10 +890,12 @@ impl App {
                     MenuItem::new("Histogram", Action::ToggleHistogram)
                         .check_if(self.show_histogram),
                     MenuItem::new("Brushes", Action::ToggleBrushes).check_if(self.show_brushes),
-                    MenuItem::new("Channels", Action::ToggleChannels)
+                    MenuItem::new("Layers", Action::ToggleLayers)
                         .check_if(self.show_cp && self.cp_tab == 0),
-                    MenuItem::new("Paths", Action::TogglePaths)
+                    MenuItem::new("Channels", Action::ToggleChannels)
                         .check_if(self.show_cp && self.cp_tab == 1),
+                    MenuItem::new("Paths", Action::TogglePaths)
+                        .check_if(self.show_cp && self.cp_tab == 2),
                     MenuItem::new("Color", Action::ToggleColor).check_if(self.show_palette),
                     MenuItem::new("Rulers", Action::ToggleRulers).check_if(self.show_rulers),
                     MenuItem::new("Zoom In", Action::ZoomIn).key("+"),
@@ -910,7 +973,28 @@ impl App {
     }
 
     fn open_path(&mut self, path: &Path) {
-        let result = if path.extension().map(|e| e == "pdesk").unwrap_or(false) {
+        let mut psd_note: Option<String> = None;
+        let result = if path
+            .extension()
+            .map(|e| e.eq_ignore_ascii_case("psd"))
+            .unwrap_or(false)
+        {
+            match std::fs::read(path) {
+                Ok(bytes) => match pictodesk_core::psd::load_psd(&bytes) {
+                    Ok((doc, report)) => {
+                        let mut note = format!("PSD imported: {} layer(s)", report.layers_imported);
+                        if !report.notes.is_empty() {
+                            note.push_str(" — ");
+                            note.push_str(&report.notes.join("; "));
+                        }
+                        psd_note = Some(note);
+                        Ok(doc)
+                    }
+                    Err(e) => Err(e),
+                },
+                Err(e) => Err(e.to_string()),
+            }
+        } else if path.extension().map(|e| e == "pdesk").unwrap_or(false) {
             std::fs::read(path)
                 .map_err(|e| e.to_string())
                 .and_then(|bytes| format::deserialize(&bytes).map_err(|e| e.to_string()))
@@ -935,7 +1019,7 @@ impl App {
                 self.dirty = false;
                 self.doc_version += 1;
                 self.fit_view(self.win_size.0, self.win_size.1);
-                self.status = format!("Opened {}", path.display());
+                self.status = psd_note.unwrap_or_else(|| format!("Opened {}", path.display()));
             }
             Err(e) => {
                 self.status = format!("Open failed: {e}");
@@ -982,7 +1066,7 @@ impl App {
                                 p.extension()
                                     .map(|e| {
                                         let e = e.to_ascii_lowercase();
-                                        ["png", "jpg", "jpeg", "tif", "tiff", "bmp", "pdesk"]
+                                        ["png", "jpg", "jpeg", "tif", "tiff", "bmp", "pdesk", "psd"]
                                             .contains(&e.to_str().unwrap_or(""))
                                     })
                                     .unwrap_or(false)
@@ -1189,7 +1273,7 @@ impl App {
                     let idx = self.doc.save_selection_as_channel(sel);
                     self.status = format!("Selection saved as {}", self.doc.alphas[idx].name);
                     self.show_cp = true;
-                    self.cp_tab = 0;
+                    self.cp_tab = 1;
                     self.touch();
                 }
             }
@@ -1199,7 +1283,87 @@ impl App {
                     self.status = format!("Loaded {}", self.doc.alphas[i].name);
                 }
             }
-            Action::ToggleChannels => {
+            Action::NewLayer => {
+                let mut d = Dialog::new(DialogKind::NewLayer, &self.doc);
+                d.text = format!("Layer {}", self.doc.layers.len() + 1);
+                d.text_focus = true;
+                self.dialog = Some(d);
+            }
+            Action::LayerOptions => {
+                let mut d = Dialog::new(DialogKind::LayerOptions, &self.doc);
+                d.text = self.doc.layers[self.doc.active_layer].name.clone();
+                d.text_focus = true;
+                self.dialog = Some(d);
+            }
+            Action::FreeTransform => {
+                self.dialog = Some(Dialog::new(DialogKind::FreeTransform, &self.doc));
+            }
+            Action::DuplicateLayer => {
+                let a = self.doc.active_layer;
+                self.structural("Duplicate Layer", |d| {
+                    d.duplicate_layer(a);
+                });
+                self.status = "Layer duplicated".into();
+            }
+            Action::DeleteLayer => {
+                let a = self.doc.active_layer;
+                if self.doc.layers.len() > 1 {
+                    self.structural("Delete Layer", |d| {
+                        d.delete_layer(a);
+                    });
+                    self.status = "Layer deleted".into();
+                } else {
+                    self.status = "Cannot delete the only layer".into();
+                }
+            }
+            Action::BlendMode(i) => {
+                let m = pictodesk_core::blend::ALL_BLEND_MODES[i];
+                self.structural("Blend Mode", |d| {
+                    let a = d.active_layer;
+                    d.layers[a].blend_mode = m;
+                });
+                self.status = format!("Blend mode: {}", m.name());
+            }
+            Action::BringForward => {
+                let a = self.doc.active_layer;
+                if a + 1 < self.doc.layers.len() {
+                    self.structural("Bring Forward", |d| {
+                        d.move_layer(a, a + 1);
+                    });
+                }
+            }
+            Action::SendBackward => {
+                let a = self.doc.active_layer;
+                if a > 0 {
+                    self.structural("Send Backward", |d| {
+                        d.move_layer(a, a - 1);
+                    });
+                }
+            }
+            Action::MergeDown => {
+                let a = self.doc.active_layer;
+                if a > 0 {
+                    self.structural("Merge Down", |d| {
+                        d.merge_down(a);
+                    });
+                    self.status = "Merged down".into();
+                } else {
+                    self.status = "Nothing below to merge into".into();
+                }
+            }
+            Action::MergeVisible => {
+                self.structural("Merge Visible", |d| {
+                    d.merge_visible();
+                });
+                self.status = "Visible layers merged".into();
+            }
+            Action::FlattenImage => {
+                self.structural("Flatten Image", |d| {
+                    d.flatten();
+                });
+                self.status = "Image flattened".into();
+            }
+            Action::ToggleLayers => {
                 if self.show_cp && self.cp_tab == 0 {
                     self.show_cp = false;
                 } else {
@@ -1208,12 +1372,21 @@ impl App {
                 }
                 self.fit_view(self.win_size.0, self.win_size.1);
             }
-            Action::TogglePaths => {
+            Action::ToggleChannels => {
                 if self.show_cp && self.cp_tab == 1 {
                     self.show_cp = false;
                 } else {
                     self.show_cp = true;
                     self.cp_tab = 1;
+                }
+                self.fit_view(self.win_size.0, self.win_size.1);
+            }
+            Action::TogglePaths => {
+                if self.show_cp && self.cp_tab == 2 {
+                    self.show_cp = false;
+                } else {
+                    self.show_cp = true;
+                    self.cp_tab = 2;
                 }
                 self.fit_view(self.win_size.0, self.win_size.1);
             }
@@ -1550,6 +1723,48 @@ impl App {
                     self.status = format!("{label} (tolerance {tol})");
                 }
             }
+            DialogKind::NewLayer => {
+                let name = d.text.trim().to_string();
+                let name = if name.is_empty() {
+                    format!("Layer {}", self.doc.layers.len() + 1)
+                } else {
+                    name
+                };
+                self.structural("New Layer", |doc| {
+                    doc.add_layer(name.clone());
+                });
+                self.status = "New layer".into();
+            }
+            DialogKind::LayerOptions => {
+                let name = d.text.trim().to_string();
+                let opacity = (d.vals[0] / 100.0).clamp(0.0, 1.0);
+                self.structural("Layer Options", |doc| {
+                    let a = doc.active_layer;
+                    if !name.is_empty() {
+                        doc.layers[a].name = name.clone();
+                    }
+                    doc.layers[a].opacity = opacity;
+                });
+                self.status = "Layer options set".into();
+            }
+            DialogKind::FreeTransform => {
+                let (sx, sy, rot, skew) =
+                    (d.vals[0] / 100.0, d.vals[1] / 100.0, d.vals[2], d.vals[3]);
+                let targets: Vec<usize> = self
+                    .doc
+                    .layers
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, l)| *i == self.doc.active_layer || l.linked)
+                    .map(|(i, _)| i)
+                    .collect();
+                self.structural("Free Transform", |doc| {
+                    for t in &targets {
+                        pictodesk_core::transform::transform_layer(doc, *t, sx, sy, rot, skew);
+                    }
+                });
+                self.status = "Transformed".into();
+            }
             DialogKind::SavePath if self.doc.work_path.is_some() => {
                 self.begin_path_edit();
                 let mut wp = self.doc.work_path.take().unwrap();
@@ -1650,7 +1865,13 @@ impl App {
         if d.kind == DialogKind::Fill {
             h += 22;
         }
-        if d.kind == DialogKind::SaveAs || d.kind == DialogKind::NewDoc {
+        if matches!(
+            d.kind,
+            DialogKind::SaveAs
+                | DialogKind::NewDoc
+                | DialogKind::NewLayer
+                | DialogKind::LayerOptions
+        ) {
             h += 24; // text field
         }
         let w = 400;
@@ -1662,7 +1883,13 @@ impl App {
         if d.kind == DialogKind::ColorBalance || d.kind == DialogKind::Fill {
             y += 22;
         }
-        if d.kind == DialogKind::SaveAs || d.kind == DialogKind::NewDoc {
+        if matches!(
+            d.kind,
+            DialogKind::SaveAs
+                | DialogKind::NewDoc
+                | DialogKind::NewLayer
+                | DialogKind::LayerOptions
+        ) {
             y += 24;
         }
         let mut slider_rows = Vec::new();
@@ -1699,7 +1926,13 @@ impl App {
         } else {
             Vec::new()
         };
-        let text_field = if d.kind == DialogKind::SaveAs || d.kind == DialogKind::NewDoc {
+        let text_field = if matches!(
+            d.kind,
+            DialogKind::SaveAs
+                | DialogKind::NewDoc
+                | DialogKind::NewLayer
+                | DialogKind::LayerOptions
+        ) {
             Some(Rect::new(rect.x + 12, rect.y + 28, w - 24, 18))
         } else {
             None
@@ -2310,7 +2543,7 @@ impl App {
             return;
         };
         f.panel(r);
-        for (i, label) in ["Channels", "Paths"].iter().enumerate() {
+        for (i, label) in ["Layers", "Channels", "Paths"].iter().enumerate() {
             let tr = Self::cp_tab_rect(r, i);
             if self.cp_tab == i {
                 f.fill_rect(tr, ui::BLACK);
@@ -2321,6 +2554,8 @@ impl App {
             }
         }
         if self.cp_tab == 0 {
+            self.draw_layers_panel(f, r);
+        } else if self.cp_tab == 1 {
             let rows = self.channel_rows();
             for (i, (label, view)) in rows.iter().enumerate() {
                 let rr = Rect::new(r.x + 2, r.y + 20 + i as i32 * 15, r.w - 4, 15);
@@ -2374,11 +2609,154 @@ impl App {
     }
 
     fn cp_tab_rect(r: Rect, i: usize) -> Rect {
-        if i == 0 {
-            Rect::new(r.x + 3, r.y + 3, 74, 15)
-        } else {
-            Rect::new(r.x + 81, r.y + 3, 54, 15)
+        match i {
+            0 => Rect::new(r.x + 3, r.y + 3, 52, 15),
+            1 => Rect::new(r.x + 58, r.y + 3, 70, 15),
+            _ => Rect::new(r.x + 131, r.y + 3, 50, 15),
         }
+    }
+
+    fn layer_row_rect(r: Rect, row: usize) -> Rect {
+        Rect::new(r.x + 2, r.y + 48 + row as i32 * 28, r.w - 4, 28)
+    }
+
+    fn draw_layers_panel(&mut self, f: &mut Frame, r: Rect) {
+        let a = self.doc.active_layer;
+        let (mode_name, opacity) = {
+            let l = &self.doc.layers[a];
+            (l.blend_mode.name(), (l.opacity * 100.0).round() as i32)
+        };
+        f.text(
+            r.x + 6,
+            r.y + 23,
+            &format!("Mode: {mode_name}"),
+            1,
+            ui::BLACK,
+        );
+        f.text(
+            r.x + 6,
+            r.y + 36,
+            &format!("Opacity: {opacity}%"),
+            1,
+            ui::BLACK,
+        );
+        let n = self.doc.layers.len();
+        for row in 0..n.min(8) {
+            let li = n - 1 - row;
+            let rr = Self::layer_row_rect(r, row);
+            let (visible, linked, name) = {
+                let l = &self.doc.layers[li];
+                (l.visible, l.linked, l.name.clone())
+            };
+            let active = li == a;
+            if active {
+                f.fill_rect(rr, ui::BLACK);
+            }
+            let c = if active { ui::WHITE } else { ui::BLACK };
+            let eye = Rect::new(rr.x + 3, rr.y + 7, 14, 14);
+            f.outline_rect(eye, c);
+            if visible {
+                f.fill_rect(Rect::new(eye.x + 4, eye.y + 4, 6, 6), c);
+            }
+            let th = Rect::new(rr.x + 21, rr.y + 2, 36, 24);
+            self.draw_layer_thumb(f, th, li);
+            f.outline_rect(th, c);
+            f.text(rr.x + 61, rr.y + 10, &name, 1, c);
+            let lb = Rect::new(rr.right() - 18, rr.y + 8, 12, 12);
+            if linked {
+                f.fill_rect(lb, c);
+                let tc = if active { ui::BLACK } else { ui::WHITE };
+                f.text(lb.x + 3, lb.y + 2, "L", 1, tc);
+            } else {
+                f.outline_rect(lb, c);
+            }
+        }
+        let labels = ["New", "Dup", "Del"];
+        let bw = (r.w - 8) / 3;
+        for (i, label) in labels.iter().enumerate() {
+            let br = Rect::new(r.x + 4 + i as i32 * bw, r.bottom() - 19, bw - 2, 16);
+            Self::draw_small_button(f, br, label, true);
+        }
+    }
+
+    /// A layer thumbnail: the layer alone over a checkerboard.
+    fn draw_layer_thumb(&self, f: &mut Frame, th: Rect, li: usize) {
+        let (dw, dh) = (
+            (self.doc.width as i32).max(1),
+            (self.doc.height as i32).max(1),
+        );
+        for by in 0..12i32 {
+            for bx in 0..18i32 {
+                let dx = ((bx * 2 + 1) * dw / 36).min(dw - 1);
+                let dy = ((by * 2 + 1) * dh / 24).min(dh - 1);
+                let px = self.doc.render_layer_pixel(li, dx, dy).to_rgba8();
+                let checker = if (bx + by) % 2 == 0 { 255 } else { 170 };
+                let a = px.3 as u32;
+                let blend = |v: u8| ((v as u32 * a + checker * (255 - a)) / 255) as u8;
+                f.fill_rect(
+                    Rect::new(th.x + bx * 2, th.y + by * 2, 2, 2),
+                    (blend(px.0), blend(px.1), blend(px.2)),
+                );
+            }
+        }
+    }
+
+    fn layers_panel_click(&mut self, r: Rect, mx: i32, my: i32) -> bool {
+        // Header: blend mode cycles; opacity opens Layer Options.
+        if Rect::new(r.x + 2, r.y + 20, r.w - 4, 13).contains(mx, my) {
+            let cur = self.doc.layers[self.doc.active_layer].blend_mode;
+            let idx = pictodesk_core::blend::ALL_BLEND_MODES
+                .iter()
+                .position(|m| *m == cur)
+                .unwrap_or(0);
+            let next = (idx + 1) % pictodesk_core::blend::ALL_BLEND_MODES.len();
+            self.do_action(Action::BlendMode(next));
+            return true;
+        }
+        if Rect::new(r.x + 2, r.y + 33, r.w - 4, 13).contains(mx, my) {
+            self.do_action(Action::LayerOptions);
+            return true;
+        }
+        let n = self.doc.layers.len();
+        for row in 0..n.min(8) {
+            let li = n - 1 - row;
+            let rr = Self::layer_row_rect(r, row);
+            if !rr.contains(mx, my) {
+                continue;
+            }
+            let eye = Rect::new(rr.x + 3, rr.y + 7, 14, 14);
+            if eye.contains(mx, my) {
+                self.structural("Toggle Visibility", |d| {
+                    d.layers[li].visible = !d.layers[li].visible;
+                });
+                return true;
+            }
+            let lb = Rect::new(rr.right() - 18, rr.y + 8, 12, 12);
+            if lb.contains(mx, my) {
+                self.structural("Toggle Link", |d| {
+                    d.layers[li].linked = !d.layers[li].linked;
+                });
+                return true;
+            }
+            self.doc.active_layer = li;
+            self.channel_view = ChannelView::Composite;
+            self.paint_target = PaintTarget::Image;
+            self.touch();
+            return true;
+        }
+        let bw = (r.w - 8) / 3;
+        for i in 0..3 {
+            let br = Rect::new(r.x + 4 + i * bw, r.bottom() - 19, bw - 2, 16);
+            if br.contains(mx, my) {
+                match i {
+                    0 => self.do_action(Action::NewLayer),
+                    1 => self.do_action(Action::DuplicateLayer),
+                    _ => self.do_action(Action::DeleteLayer),
+                }
+                return true;
+            }
+        }
+        true // clicks inside the group are consumed
     }
 
     fn channel_button(&mut self, i: usize) {
@@ -2698,15 +3076,18 @@ impl App {
         // Channels / Paths group
         if let Some(r) = self.group_rect(PanelKind::Cp) {
             if r.contains(mx, my) {
-                for i in 0..2 {
+                for i in 0..3 {
                     let tr = Self::cp_tab_rect(r, i);
                     if tr.contains(mx, my) {
                         self.cp_tab = i;
                         return true;
                     }
                 }
-                let row = (my - (r.y + 20)) / 15;
                 if self.cp_tab == 0 {
+                    return self.layers_panel_click(r, mx, my);
+                }
+                let row = (my - (r.y + 20)) / 15;
+                if self.cp_tab == 1 {
                     let rows = self.channel_rows();
                     if row >= 0 && (row as usize) < rows.len() {
                         let view = rows[row as usize].1;
@@ -3485,6 +3866,15 @@ impl App {
             Tool::Move => {
                 self.drag = DragMode::MoveLayer;
                 self.move_orig_offset = self.doc.layers[self.doc.active_layer].offset;
+                let a = self.doc.active_layer;
+                self.move_linked = self
+                    .doc
+                    .layers
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, l)| *i != a && l.linked)
+                    .map(|(i, l)| (i, l.offset))
+                    .collect();
             }
             Tool::Brush
             | Tool::Pencil
@@ -4045,6 +4435,9 @@ impl App {
                 let dy = (dp.1 - self.drag_start_doc.1).round() as i32;
                 self.doc.layers[layer].offset =
                     (self.move_orig_offset.0 + dx, self.move_orig_offset.1 + dy);
+                for (li, orig) in &self.move_linked {
+                    self.doc.layers[*li].offset = (orig.0 + dx, orig.1 + dy);
+                }
                 self.doc_version += 1;
             }
             DragMode::Paint => {
@@ -4201,17 +4594,18 @@ impl App {
             DragMode::MoveLayer => {
                 let layer = self.doc.active_layer;
                 let now = self.doc.layers[layer].offset;
-                if now != self.move_orig_offset {
-                    self.hist.push(Box::new(MoveLayerCommand::new(
-                        "Move",
-                        layer,
-                        self.move_orig_offset,
-                        now,
-                    )));
+                let mut moves = vec![(layer, self.move_orig_offset, now)];
+                for (li, orig) in &self.move_linked {
+                    moves.push((*li, *orig, self.doc.layers[*li].offset));
+                }
+                if moves.iter().any(|(_, b, a)| b != a) {
+                    self.hist
+                        .push(Box::new(MoveLayerCommand::new_multi("Move", moves)));
                     self.last_label = Some("Move".into());
                     self.status = "Move".into();
                     self.touch();
                 }
+                self.move_linked.clear();
             }
             _ => {}
         }
@@ -4252,6 +4646,11 @@ impl App {
         }
         if primary {
             match c.to_ascii_lowercase() {
+                'n' if self.shift_down => self.do_action(Action::NewLayer),
+                'e' => self.do_action(Action::MergeDown),
+                't' => self.do_action(Action::FreeTransform),
+                ']' => self.do_action(Action::BringForward),
+                '[' => self.do_action(Action::SendBackward),
                 'z' => self.do_action(Action::UndoToggle),
                 's' => self.do_action(Action::Save),
                 'o' => self.do_action(Action::OpenPanel),
@@ -4647,6 +5046,7 @@ fn run_shot(args: &[String]) -> i32 {
     let mut dialog_name: Option<String> = None;
     let mut size = (1280u32, 800u32);
     let mut demo2 = false;
+    let mut demo3 = false;
     let mut tab: Option<String> = None;
     let mut cmyk = false;
     let mut view: Option<String> = None;
@@ -4666,6 +5066,7 @@ fn run_shot(args: &[String]) -> i32 {
                 i += 1;
             }
             "--demo2" => demo2 = true,
+            "--demo3" => demo3 = true,
             "--cmyk" => cmyk = true,
             "--tab" => {
                 tab = args.get(i + 1).cloned();
@@ -4740,10 +5141,10 @@ fn run_shot(args: &[String]) -> i32 {
         app.active_path = Some(PathRef::Work);
         app.pen_anchor = Some((0, 0));
         app.show_cp = true;
-        app.cp_tab = if tab.as_deref() == Some("paths") {
-            1
-        } else {
-            0
+        app.cp_tab = match tab.as_deref() {
+            Some("paths") => 2,
+            Some("channels") => 1,
+            _ => 0,
         };
         match view.as_deref() {
             Some("alpha") => {
@@ -4753,6 +5154,47 @@ fn run_shot(args: &[String]) -> i32 {
             Some("channel") => app.channel_view = ChannelView::Channel(0),
             _ => {}
         }
+        app.fit_view(size.0, size.1);
+    }
+    if demo3 {
+        // Phase 3 demo state: a four-layer composite (sky, mountains,
+        // a Screen sun linked to the sky, a translucent title bar)
+        // with the Layers panel up front and the Move tool active.
+        let mut doc = Document::new(640, 400);
+        doc.layers[0].name = "Sky".into();
+        for y in 0..400i32 {
+            for x in 0..640i32 {
+                let v = 205 - y / 4;
+                doc.layers[0].set_pixel(x, y, Pixel16::from_rgba8(110, 155, v as u8, 255));
+            }
+        }
+        let mtn = doc.add_layer("Mountains");
+        for y in 170..400i32 {
+            for x in 0..640i32 {
+                if (x - 320).abs() < (y - 160) * 2 {
+                    doc.layers[mtn].set_pixel(x, y, Pixel16::from_rgba8(95, 85, 75, 255));
+                }
+            }
+        }
+        let sun = doc.add_layer("Sun");
+        for y in 40..130i32 {
+            for x in 460..550i32 {
+                if (x - 505) * (x - 505) + (y - 85) * (y - 85) < 1900 {
+                    doc.layers[sun].set_pixel(x, y, Pixel16::from_rgba8(255, 225, 130, 255));
+                }
+            }
+        }
+        doc.layers[sun].blend_mode = pictodesk_core::blend::BlendMode::Screen;
+        doc.layers[sun].linked = true;
+        let title = doc.add_layer("Title Bar");
+        doc.layers[title].fill_rect(0, 0, 640, 64, Pixel16::from_rgba8(18, 18, 28, 255));
+        doc.layers[title].opacity = 0.85;
+        doc.active_layer = title;
+        app.doc = doc;
+        app.doc_version += 1;
+        app.tool = Tool::Move;
+        app.show_cp = true;
+        app.cp_tab = 0;
         app.fit_view(size.0, size.1);
     }
     if let Some(m) = menu {

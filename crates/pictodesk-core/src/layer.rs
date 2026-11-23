@@ -26,6 +26,8 @@ pub struct Layer {
     /// live in `tiles` (in Pixel16's r/g/b/a slots) and alpha lives
     /// here. Empty in RGB/Grayscale documents.
     pub cmyk_alpha: HashMap<TileCoord, Vec<u16>>,
+    /// Linked layers move together with the Move tool.
+    pub linked: bool,
 }
 
 impl Layer {
@@ -38,6 +40,7 @@ impl Layer {
             blend_mode: BlendMode::Normal,
             offset: (0, 0),
             cmyk_alpha: HashMap::new(),
+            linked: false,
         }
     }
 

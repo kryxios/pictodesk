@@ -20,6 +20,7 @@ pub mod layer;
 pub mod mode;
 pub mod path;
 pub mod pixel;
+pub mod psd;
 pub mod selection;
 pub mod tile;
 pub mod transform;

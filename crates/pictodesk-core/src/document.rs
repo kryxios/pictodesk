@@ -95,6 +95,208 @@ impl Document {
         self.active_layer
     }
 
+    /// Duplicate a layer in place (copy sits directly above).
+    pub fn duplicate_layer(&mut self, idx: usize) -> Option<usize> {
+        let mut copy = self.layers.get(idx)?.clone();
+        copy.name = format!("{} copy", copy.name);
+        self.layers.insert(idx + 1, copy);
+        self.active_layer = idx + 1;
+        Some(idx + 1)
+    }
+
+    /// Delete a layer; refuses when it's the only one left.
+    pub fn delete_layer(&mut self, idx: usize) -> bool {
+        if self.layers.len() <= 1 || idx >= self.layers.len() {
+            return false;
+        }
+        self.layers.remove(idx);
+        if self.active_layer >= self.layers.len() {
+            self.active_layer = self.layers.len() - 1;
+        }
+        true
+    }
+
+    /// Move a layer to a new stack position (0 = bottom).
+    pub fn move_layer(&mut self, from: usize, to: usize) {
+        if from >= self.layers.len() || to >= self.layers.len() || from == to {
+            return;
+        }
+        let layer = self.layers.remove(from);
+        self.layers.insert(to, layer);
+        if self.active_layer == from {
+            self.active_layer = to;
+        }
+    }
+
+    /// Merge layer `idx` into the layer below it, honoring the top
+    /// layer's blend mode, opacity, and visibility.
+    pub fn merge_down(&mut self, idx: usize) -> bool {
+        if idx == 0 || idx >= self.layers.len() {
+            return false;
+        }
+        let top = self.layers.remove(idx);
+        if top.visible {
+            match self.mode {
+                ColorMode::Cmyk => {
+                    for y in 0..self.height as i32 {
+                        for x in 0..self.width as i32 {
+                            let (tc, tm, ty, tk, ta) = {
+                                let p = top.get_pixel(x, y).to_f32s();
+                                (p.0, p.1, p.2, p.3, top.get_alpha(x, y) as f32 / 65535.0)
+                            };
+                            if ta <= 0.0 {
+                                continue;
+                            }
+                            let (bc, bm, by, bk, ba) = self.get_cmyk(idx - 1, x, y);
+                            let bf = |v: u16| v as f32 / 65535.0;
+                            let (out, oa) = composite_over_inks(
+                                ([bf(bc), bf(bm), bf(by), bf(bk)], bf(ba)),
+                                ([tc, tm, ty, tk], ta),
+                                top.blend_mode,
+                                top.opacity,
+                            );
+                            let e = |v: f32| (v.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
+                            self.set_cmyk(
+                                idx - 1,
+                                x,
+                                y,
+                                (e(out[0]), e(out[1]), e(out[2]), e(out[3]), e(oa)),
+                            );
+                        }
+                    }
+                }
+                _ => {
+                    for y in 0..self.height as i32 {
+                        for x in 0..self.width as i32 {
+                            let tp = top.get_pixel(x, y);
+                            if tp.a == 0 {
+                                continue;
+                            }
+                            let bp = self.layers[idx - 1].get_pixel(x, y);
+                            let out = composite_over(
+                                bp.to_f32s(),
+                                tp.to_f32s(),
+                                top.blend_mode,
+                                top.opacity,
+                            );
+                            self.layers[idx - 1].set_pixel(
+                                x,
+                                y,
+                                Pixel16::from_f32s(out.0, out.1, out.2, out.3),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        if self.active_layer >= self.layers.len() {
+            self.active_layer = self.layers.len() - 1;
+        }
+        true
+    }
+
+    /// Merge Visible: bake all visible layers into the lowest
+    /// visible one; hidden layers are kept untouched.
+    pub fn merge_visible(&mut self) {
+        let Some(base) = self.layers.iter().position(|l| l.visible) else {
+            return;
+        };
+        let mut flat = Layer::new(self.layers[base].name.clone());
+        match self.mode {
+            ColorMode::Cmyk => {
+                for y in 0..self.height as i32 {
+                    for x in 0..self.width as i32 {
+                        let (ink, a) = self.composite_inks(x, y);
+                        if a > 0.0 {
+                            let e = |v: f32| (v.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
+                            flat.set_pixel(
+                                x,
+                                y,
+                                Pixel16::from_f32s(ink[0], ink[1], ink[2], ink[3]),
+                            );
+                            flat.set_alpha(x, y, e(a));
+                        }
+                    }
+                }
+            }
+            _ => {
+                for y in 0..self.height as i32 {
+                    for x in 0..self.width as i32 {
+                        let p = self.render_pixel(x, y);
+                        if p.a > 0 {
+                            flat.set_pixel(x, y, p);
+                        }
+                    }
+                }
+            }
+        }
+        self.layers[base] = flat;
+        // Remove the other visible layers, top-down.
+        for i in (0..self.layers.len()).rev() {
+            if i != base && self.layers[i].visible {
+                self.layers.remove(i);
+            }
+        }
+        // Layers removed were all above `base`, so its index holds.
+        self.active_layer = base;
+    }
+
+    /// Render one layer alone (for thumbnails): RGB-space result.
+    pub fn render_layer_pixel(&self, layer: usize, x: i32, y: i32) -> Pixel16 {
+        let l = &self.layers[layer];
+        if !l.visible {
+            return l.get_pixel(x, y);
+        }
+        match self.mode {
+            ColorMode::Cmyk => {
+                let (c, m, y, k, a) = self.get_cmyk(layer, x, y);
+                let bf = |v: u16| v as f32 / 65535.0;
+                let (r, g, b) = crate::color::cmyk_to_rgb(bf(c), bf(m), bf(y), bf(k));
+                Pixel16::from_f32s(r, g, b, bf(a) * l.opacity)
+            }
+            _ => {
+                let p = l.get_pixel(x, y).to_f32s();
+                Pixel16::from_f32s(p.0, p.1, p.2, p.3 * l.opacity)
+            }
+        }
+    }
+
+    /// Flatten: bake the visible composite into a single layer.
+    /// Hidden layers are discarded, as in the classic dialog flow.
+    pub fn flatten(&mut self) {
+        let mut flat = Layer::new("Background");
+        match self.mode {
+            ColorMode::Cmyk => {
+                for y in 0..self.height as i32 {
+                    for x in 0..self.width as i32 {
+                        let (ink, a) = self.composite_inks(x, y);
+                        if a > 0.0 {
+                            let e = |v: f32| (v.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
+                            flat.set_pixel(
+                                x,
+                                y,
+                                Pixel16::from_f32s(ink[0], ink[1], ink[2], ink[3]),
+                            );
+                            flat.set_alpha(x, y, e(a));
+                        }
+                    }
+                }
+            }
+            _ => {
+                for y in 0..self.height as i32 {
+                    for x in 0..self.width as i32 {
+                        let p = self.render_pixel(x, y);
+                        if p.a > 0 {
+                            flat.set_pixel(x, y, p);
+                        }
+                    }
+                }
+            }
+        }
+        self.layers = vec![flat];
+        self.active_layer = 0;
+    }
+
     /// One pixel of `layer` as CMYK + alpha, each 0..=65535: the ink
     /// values from the tile slots and alpha from the layer's alpha
     /// plane. Meaningful when `mode == ColorMode::Cmyk`.

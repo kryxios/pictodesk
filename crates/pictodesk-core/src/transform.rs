@@ -21,6 +21,7 @@ fn rebuild_layer(
     out.opacity = layer.opacity;
     out.visible = layer.visible;
     out.blend_mode = layer.blend_mode;
+    out.linked = layer.linked;
     let has_alpha = !layer.cmyk_alpha.is_empty();
     let mut coords: Vec<_> = layer.tiles.keys().copied().collect();
     if has_alpha {
@@ -140,6 +141,151 @@ pub fn crop(doc: &mut Document, x: i32, y: i32, w: u32, h: u32) {
     rebuild_all_clipped(doc, (nw, nh), move |px, py| (px - x0, py - y0));
     doc.width = nw;
     doc.height = nh;
+}
+
+/// Layer > Move: translate one layer's content by (dx, dy).
+/// Off-canvas content is kept (tiles support negative coords).
+pub fn translate_layer(doc: &mut Document, layer: usize, dx: i32, dy: i32) {
+    if dx == 0 && dy == 0 {
+        return;
+    }
+    let src = doc.layers[layer].clone();
+    doc.layers[layer] = rebuild_layer(&src, None, |x, y| (x + dx, y + dy));
+}
+
+/// Free Transform v1 for one layer: scale, rotate, and skew about
+/// the center of the layer's painted bounds, bilinear sampling.
+/// `skew_x_deg` shears x by tan(angle) * (y - cy). Content that
+/// lands outside the canvas is kept (layers are unbounded).
+pub fn transform_layer(
+    doc: &mut Document,
+    layer: usize,
+    scale_x: f32,
+    scale_y: f32,
+    rotate_deg: f32,
+    skew_x_deg: f32,
+) {
+    let src = doc.layers[layer].clone();
+    // Painted bounds (document coords).
+    let mut bounds: Option<(i32, i32, i32, i32)> = None;
+    let grow = |b: &mut Option<(i32, i32, i32, i32)>, x: i32, y: i32| {
+        *b = Some(match *b {
+            None => (x, y, x + 1, y + 1),
+            Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x + 1), y1.max(y + 1)),
+        });
+    };
+    for (coord, tile) in &src.tiles {
+        for ly in 0..256i32 {
+            for lx in 0..256i32 {
+                if tile.get(lx as u32, ly as u32) != Pixel16::TRANSPARENT {
+                    grow(
+                        &mut bounds,
+                        coord.0 * 256 + lx + src.offset.0,
+                        coord.1 * 256 + ly + src.offset.1,
+                    );
+                }
+            }
+        }
+    }
+    if !src.cmyk_alpha.is_empty() {
+        for (coord, data) in &src.cmyk_alpha {
+            for (i, &a) in data.iter().enumerate() {
+                if a > 0 {
+                    grow(
+                        &mut bounds,
+                        coord.0 * 256 + (i % 256) as i32 + src.offset.0,
+                        coord.1 * 256 + (i / 256) as i32 + src.offset.1,
+                    );
+                }
+            }
+        }
+    }
+    let Some((bx0, by0, bx1, by1)) = bounds else {
+        return;
+    };
+    let (cx, cy) = ((bx0 + bx1) as f32 / 2.0, (by0 + by1) as f32 / 2.0);
+    let th = rotate_deg.to_radians();
+    let (sin, cos) = (th.sin(), th.cos());
+    let sh = skew_x_deg.to_radians().tan();
+    // Forward matrix F = T(c) * R * Sh * S * T(-c), mapping src->dst:
+    // [a b tx; c d ty] with x' = a*x + b*y + tx, y' = c*x + d*y + ty.
+    // R*Sh*S = [[cos, cos*sh - sin],[sin, sin*sh + cos]] * diag(sx, sy)
+    let (a, b) = (cos * scale_x, (cos * sh - sin) * scale_y);
+    let (c, d) = (sin * scale_x, (sin * sh + cos) * scale_y);
+    let (tx, ty) = (cx - (a * cx + b * cy), cy - (c * cx + d * cy));
+    let det = a * d - b * c;
+    if det.abs() < 1e-9 {
+        return;
+    }
+    // Destination bounds: forward-transform the painted corners.
+    let mut db: Option<(i32, i32, i32, i32)> = None;
+    for (px, py) in [(bx0, by0), (bx1, by0), (bx0, by1), (bx1, by1)] {
+        let fx = a * px as f32 + b * py as f32 + tx;
+        let fy = c * px as f32 + d * py as f32 + ty;
+        grow(&mut db, fx.floor() as i32, fy.floor() as i32);
+    }
+    let (dx0, dy0, dx1, dy1) = db.unwrap();
+    let cmyk = doc.mode == crate::document::ColorMode::Cmyk;
+    let mut out = Layer::new(src.name.clone());
+    out.opacity = src.opacity;
+    out.visible = src.visible;
+    out.blend_mode = src.blend_mode;
+    out.linked = src.linked;
+    for dy in dy0..dy1 {
+        for dx in dx0..dx1 {
+            // Inverse map dest pixel center -> source coords.
+            let (ex, ey) = (dx as f32 + 0.5 - tx, dy as f32 + 0.5 - ty);
+            let sx = (d * ex - b * ey) / det - 0.5;
+            let sy = (-c * ex + a * ey) / det - 0.5;
+            let (x0, y0) = (sx.floor() as i32, sy.floor() as i32);
+            let (fx, fy) = (sx - x0 as f32, sy - y0 as f32);
+            if cmyk {
+                let smp = |x: i32, y: i32| -> [f32; 5] {
+                    let p = src.get_pixel(x, y).to_f32s();
+                    [p.0, p.1, p.2, p.3, src.get_alpha(x, y) as f32 / 65535.0]
+                };
+                let (sa, sb, sc, sd) = (
+                    smp(x0, y0),
+                    smp(x0 + 1, y0),
+                    smp(x0, y0 + 1),
+                    smp(x0 + 1, y0 + 1),
+                );
+                let mut v = [0.0f32; 5];
+                for i in 0..5 {
+                    let top = sa[i] + (sb[i] - sa[i]) * fx;
+                    let bot = sc[i] + (sd[i] - sc[i]) * fx;
+                    v[i] = top + (bot - top) * fy;
+                }
+                if v[4] > 0.001 {
+                    out.set_pixel(dx, dy, Pixel16::from_f32s(v[0], v[1], v[2], v[3]));
+                    out.set_alpha(dx, dy, (v[4].clamp(0.0, 1.0) * 65535.0 + 0.5) as u16);
+                }
+            } else {
+                let smp = |x: i32, y: i32| src.get_pixel(x, y).to_f32s();
+                let (sa, sb, sc, sd) = (
+                    smp(x0, y0),
+                    smp(x0 + 1, y0),
+                    smp(x0, y0 + 1),
+                    smp(x0 + 1, y0 + 1),
+                );
+                let lerp = |p: (f32, f32, f32, f32), q: (f32, f32, f32, f32), t: f32| {
+                    (
+                        p.0 + (q.0 - p.0) * t,
+                        p.1 + (q.1 - p.1) * t,
+                        p.2 + (q.2 - p.2) * t,
+                        p.3 + (q.3 - p.3) * t,
+                    )
+                };
+                let top = lerp(sa, sb, fx);
+                let bot = lerp(sc, sd, fx);
+                let v = lerp(top, bot, fy);
+                if v.3 > 0.001 {
+                    out.set_pixel(dx, dy, Pixel16::from_f32s(v.0, v.1, v.2, v.3));
+                }
+            }
+        }
+    }
+    doc.layers[layer] = out;
 }
 
 /// Image > Image Size: resample every layer to the new dimensions

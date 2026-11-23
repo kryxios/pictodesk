@@ -14,7 +14,27 @@ pub enum BlendMode {
     Darken,
     Lighten,
     Difference,
+    Hue,
+    Saturation,
+    Color,
+    Luminosity,
 }
+
+/// All modes in menu order.
+pub const ALL_BLEND_MODES: [BlendMode; 12] = [
+    BlendMode::Normal,
+    BlendMode::Multiply,
+    BlendMode::Screen,
+    BlendMode::Overlay,
+    BlendMode::SoftLight,
+    BlendMode::Darken,
+    BlendMode::Lighten,
+    BlendMode::Difference,
+    BlendMode::Hue,
+    BlendMode::Saturation,
+    BlendMode::Color,
+    BlendMode::Luminosity,
+];
 
 impl BlendMode {
     pub fn to_id(self) -> u8 {
@@ -27,7 +47,37 @@ impl BlendMode {
             BlendMode::Darken => 5,
             BlendMode::Lighten => 6,
             BlendMode::Difference => 7,
+            BlendMode::Hue => 8,
+            BlendMode::Saturation => 9,
+            BlendMode::Color => 10,
+            BlendMode::Luminosity => 11,
         }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            BlendMode::Normal => "Normal",
+            BlendMode::Multiply => "Multiply",
+            BlendMode::Screen => "Screen",
+            BlendMode::Overlay => "Overlay",
+            BlendMode::SoftLight => "Soft Light",
+            BlendMode::Darken => "Darken",
+            BlendMode::Lighten => "Lighten",
+            BlendMode::Difference => "Difference",
+            BlendMode::Hue => "Hue",
+            BlendMode::Saturation => "Saturation",
+            BlendMode::Color => "Color",
+            BlendMode::Luminosity => "Luminosity",
+        }
+    }
+
+    /// The component modes (Hue/Saturation/Color/Luminosity) blend
+    /// whole RGB triples, not per-channel values.
+    pub fn is_component(self) -> bool {
+        matches!(
+            self,
+            BlendMode::Hue | BlendMode::Saturation | BlendMode::Color | BlendMode::Luminosity
+        )
     }
 
     pub fn from_id(id: u8) -> Option<BlendMode> {
@@ -40,6 +90,10 @@ impl BlendMode {
             5 => BlendMode::Darken,
             6 => BlendMode::Lighten,
             7 => BlendMode::Difference,
+            8 => BlendMode::Hue,
+            9 => BlendMode::Saturation,
+            10 => BlendMode::Color,
+            11 => BlendMode::Luminosity,
             _ => return None,
         })
     }
@@ -72,8 +126,76 @@ impl BlendMode {
             BlendMode::Darken => b.min(s),
             BlendMode::Lighten => b.max(s),
             BlendMode::Difference => (b - s).abs(),
+            // Component modes never reach blend_channel (see blend_rgb).
+            BlendMode::Hue | BlendMode::Saturation | BlendMode::Color | BlendMode::Luminosity => s,
         }
     }
+}
+
+// ---- Component blend modes (the classic PDF/SVG formulation) ----
+
+fn lum(c: (f32, f32, f32)) -> f32 {
+    0.3 * c.0 + 0.59 * c.1 + 0.11 * c.2
+}
+
+fn sat(c: (f32, f32, f32)) -> f32 {
+    c.0.max(c.1).max(c.2) - c.0.min(c.1).min(c.2)
+}
+
+fn clip_color(mut c: (f32, f32, f32)) -> (f32, f32, f32) {
+    let l = lum(c);
+    let n = c.0.min(c.1).min(c.2);
+    if n < 0.0 {
+        let f = l / (l - n);
+        c.0 = l + (c.0 - l) * f;
+        c.1 = l + (c.1 - l) * f;
+        c.2 = l + (c.2 - l) * f;
+    }
+    let x = c.0.max(c.1).max(c.2);
+    if x > 1.0 {
+        let f = (1.0 - l) / (x - l);
+        c.0 = l + (c.0 - l) * f;
+        c.1 = l + (c.1 - l) * f;
+        c.2 = l + (c.2 - l) * f;
+    }
+    c
+}
+
+fn set_lum(c: (f32, f32, f32), l: f32) -> (f32, f32, f32) {
+    let d = l - lum(c);
+    clip_color((c.0 + d, c.1 + d, c.2 + d))
+}
+
+fn set_sat(c: (f32, f32, f32), s: f32) -> (f32, f32, f32) {
+    // Order channels by value; stretch the min..max range to s.
+    let mut idx = [0usize, 1, 2];
+    let v = [c.0, c.1, c.2];
+    idx.sort_by(|&a, &b| v[a].partial_cmp(&v[b]).unwrap());
+    let (mn, md, mx) = (v[idx[0]], v[idx[1]], v[idx[2]]);
+    let mut out = [0.0f32; 3];
+    if mx > mn {
+        let mid = (md - mn) * s / (mx - mn);
+        out[idx[0]] = 0.0;
+        out[idx[1]] = mid;
+        out[idx[2]] = s;
+    }
+    (out[0], out[1], out[2])
+}
+
+/// Blend whole RGB triples for the component modes; None for the
+/// per-channel modes.
+pub fn blend_rgb(
+    mode: BlendMode,
+    b: (f32, f32, f32),
+    s: (f32, f32, f32),
+) -> Option<(f32, f32, f32)> {
+    Some(match mode {
+        BlendMode::Hue => set_lum(set_sat(s, sat(b)), lum(b)),
+        BlendMode::Saturation => set_lum(set_sat(b, sat(s)), lum(b)),
+        BlendMode::Color => set_lum(s, lum(b)),
+        BlendMode::Luminosity => set_lum(b, lum(s)),
+        _ => return None,
+    })
 }
 
 /// Composite a source pixel over a backdrop pixel (Porter-Duff "over"
@@ -100,8 +222,14 @@ pub fn composite_over(
     }
     // Blended color where both overlap, then standard over-composite of
     // the blended result treated at the source's coverage.
-    let blend = |b: f32, s: f32| mode.blend_channel(b, s);
-    let (mr, mg, mb) = (blend(br, sr), blend(bg, sg), blend(bb, sb));
+    let (mr, mg, mb) = match blend_rgb(mode, (br, bg, bb), (sr, sg, sb)) {
+        Some(m) => m,
+        None => (
+            mode.blend_channel(br, sr),
+            mode.blend_channel(bg, sg),
+            mode.blend_channel(bb, sb),
+        ),
+    };
     // Weight: source contribution vs backdrop showing through.
     let chan = |m: f32, b: f32, s: f32| -> f32 {
         // Result of blending where source is opaque, mixed by coverage:
@@ -134,10 +262,26 @@ pub fn composite_over_inks(
     if out_a <= 0.0 {
         return ([0.0; 4], 0.0);
     }
+    let blended: [f32; 4] = match blend_rgb(
+        mode,
+        crate::color::cmyk_to_rgb(b[0], b[1], b[2], b[3]),
+        crate::color::cmyk_to_rgb(s[0], s[1], s[2], s[3]),
+    ) {
+        Some(m) => {
+            let (c, m2, y, k) = crate::color::rgb_to_cmyk(m.0, m.1, m.2);
+            [c, m2, y, k]
+        }
+        None => {
+            let mut r = [0.0f32; 4];
+            for i in 0..4 {
+                r[i] = mode.blend_channel(b[i], s[i]);
+            }
+            r
+        }
+    };
     let mut out = [0.0f32; 4];
     for i in 0..4 {
-        let m = mode.blend_channel(b[i], s[i]);
-        out[i] = (sa * (1.0 - ba) * s[i] + sa * ba * m + (1.0 - sa) * ba * b[i]) / out_a;
+        out[i] = (sa * (1.0 - ba) * s[i] + sa * ba * blended[i] + (1.0 - sa) * ba * b[i]) / out_a;
     }
     (out, out_a)
 }
@@ -204,7 +348,7 @@ mod tests {
 
     #[test]
     fn ids_round_trip() {
-        for id in 0..=7u8 {
+        for id in 0..=11u8 {
             assert_eq!(BlendMode::from_id(id).unwrap().to_id(), id);
         }
         assert!(BlendMode::from_id(99).is_none());

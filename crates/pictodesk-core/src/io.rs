@@ -238,6 +238,15 @@ pub fn export_image(
 
 pub fn load_file(path: &Path) -> Result<Document, IoError> {
     let bytes = std::fs::read(path)?;
+    if path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("psd"))
+        .unwrap_or(false)
+    {
+        let (doc, _report) = crate::psd::load_psd(&bytes).map_err(IoError::Decode)?;
+        return Ok(doc);
+    }
     import_image(&bytes)
 }
 

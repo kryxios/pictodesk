@@ -106,6 +106,36 @@ re-apply, commit on OK), a file-open panel, drag-and-drop, and the
 1.0-authentic single level of Undo (`History::set_limit(Some(1))` —
 the engine itself is unlimited; later phases raise the cap).
 
+## Phase 3 additions (v0.3.0)
+
+- Layers become the working surface: the document's layer stack
+  gets the full operation set (`duplicate_layer`, `delete_layer`,
+  `move_layer`, `merge_down`, `merge_visible`, `flatten` — the
+  merge/flatten bakes are mode-aware, with ink-space paths for
+  CMYK documents). Layers carry a `linked` flag (persisted as an
+  optional trailing section in the `.pdesk` extension block, so
+  older v3 files still load).
+- `blend.rs` — the component modes (Hue, Saturation, Color,
+  Luminosity) join the eight per-channel modes, using the classic
+  Lum/Sat/ClipColor formulation on whole RGB triples; ink-space
+  compositing routes them through RGB.
+- `transform.rs` — `translate_layer` plus `transform_layer`: Free
+  Transform (scale / rotate / skew about the painted-bounds
+  center, bilinear, mode-aware sampling; off-canvas content is
+  kept because layers are unbounded tile maps).
+- `psd.rs` — PSD import v1: 8-bit RGB / CMYK / Grayscale, raw and
+  PackBits channel data, layer records (stored top-first in the
+  file) with names, bounds (kept as layer offsets), opacity,
+  visibility, and the classic blend keys. Everything skipped —
+  groups, type/effects layers, unknown blend keys, ZIP channels —
+  is reported in a `PsdReport`, never silently dropped. A file
+  with no layer data imports its merged composite instead.
+- The shell gains a Layer menu (with a Blend Mode submenu),
+  a third dock tab — Layers, beside Channels and Paths — with
+  thumbnails rendered from `Document::render_layer_pixel`, and
+  linked-layer dragging in the Move tool (one multi-layer
+  `MoveLayerCommand`).
+
 ## Phase 2 additions (v0.2.0)
 
 - `path.rs` — Bézier paths: anchors with in/out direction points,

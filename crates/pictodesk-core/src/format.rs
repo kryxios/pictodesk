@@ -233,9 +233,9 @@ fn serialize_ext(w: &mut Writer, doc: &Document) {
         }
         None => w.u8(0),
     }
-    // CMYK alpha planes (v0.2.1 addition, appended last so files
-    // written before it still parse: the reader treats the section
-    // as optional trailing data). Per layer: tile count, then per
+    // CMYK alpha planes (v0.2.1 addition, appended so files written
+    // before it still parse: the reader treats the section as
+    // optional trailing data). Per layer: tile count, then per
     // tile (coord, TILE_PIXELS x u16).
     for layer in &doc.layers {
         w.u32(layer.cmyk_alpha.len() as u32);
@@ -248,6 +248,10 @@ fn serialize_ext(w: &mut Writer, doc: &Document) {
                 w.u16(*v);
             }
         }
+    }
+    // Layer link flags (v0.3.0 addition, also optional trailing).
+    for layer in &doc.layers {
+        w.u8(layer.linked as u8);
     }
 }
 
@@ -404,6 +408,12 @@ fn parse_ext(payload: &[u8], doc: &mut Document) -> Result<(), FormatError> {
                 }
                 layer.cmyk_alpha.insert(coord, data);
             }
+        }
+    }
+    // Optional trailing section: layer link flags (v0.3.0).
+    if r.pos < payload.len() {
+        for layer in &mut doc.layers {
+            layer.linked = r.u8()? != 0;
         }
     }
     Ok(())
