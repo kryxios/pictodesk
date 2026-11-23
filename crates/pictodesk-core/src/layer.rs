@@ -1,4 +1,4 @@
-//! A layer: a sparse grid of tiles plus the properties Photoshop 3.0
+//! A layer: a sparse grid of tiles plus the classic properties the third generation
 //! made famous — opacity, visibility, blend mode. Layers exist in the
 //! Phase 0 document model even though the UI won't expose them until
 //! the Phase 3 milestone; the engine never has to be rewritten for them.

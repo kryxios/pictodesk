@@ -4,9 +4,10 @@ An open-source desktop photo and image editor — local files, no cloud,
 no account, no subscription. Built feature by feature, in the open.
 
 **Status: v0.1.2 — Phase 1 complete: a real photo editor.** The UI
-and menus deliberately mirror Photoshop 1.0 (1990): same menu bar
-(File, Edit, Image, Mode, Filter, Select, Window), same toolbox,
-same dialogs — and, for now, the same single level of Undo.
+follows the classic early-90s editor design: a File / Edit / Image /
+Mode / Filter / Select / Window menu bar, a compact two-column
+toolbox, modal dialogs with live preview — and, for now, a single
+level of Undo.
 
 What exists today:
 
@@ -30,7 +31,7 @@ What exists today:
   no platform-specific code). Keyboard shortcuts follow each
   platform's convention: Ctrl on Windows/Linux, Cmd on macOS, and
   the menus label them accordingly.
-- A desktop shell (`apps/pictodesk-app`): the Photoshop 1.0 workbench
+- A desktop shell (`apps/pictodesk-app`): the classic 1990-era workbench
   — platinum menu bar and toolbox, rulers, floating Brushes/Histogram
   palettes, modal dialogs with live preview, one level of Undo.
   Open a file with `pictodesk-app photo.png`, or drag a file onto the

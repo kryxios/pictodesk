@@ -1,5 +1,5 @@
 //! Pixel type: RGBA, 16 bits per channel — the internal pipeline depth.
-//! Photoshop 1.0 was 8-bit; we build 16-bit from day one (Phase 0 rule:
+//! The 1990 original was 8-bit; we build 16-bit from day one (Phase 0 rule:
 //! features in Adobe's order, engine modern underneath).
 
 /// One pixel: red, green, blue, alpha — each 0..=65535, alpha is straight

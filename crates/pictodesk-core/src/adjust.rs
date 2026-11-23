@@ -1,10 +1,10 @@
-//! Destructive adjustments — the Photoshop 1.0 Image > Adjust menu.
+//! Destructive adjustments — the classic Image > Adjust menu.
 //! Each function edits one layer in place, masked by the optional
 //! selection (partial mask values blend the effect, which is what
 //! feathered selections are for). Wrap calls in
 //! `history::run_tile_edit` to make them undoable.
 //!
-//! Photoshop semantics kept: alpha is never created or destroyed by a
+//! Classic semantics kept: alpha is never created or destroyed by a
 //! color adjustment — fully transparent pixels are left untouched,
 //! and every adjustment preserves the pixel's alpha.
 
@@ -63,7 +63,7 @@ fn map_rgb(p: Pixel16, f: impl Fn(f32, f32, f32) -> (f32, f32, f32)) -> Pixel16 
     Pixel16::from_f32s(r, g, b, a)
 }
 
-/// Image > Adjust > Brightness/Contrast (legacy Photoshop math).
+/// Image > Adjust > Brightness/Contrast (legacy editor math).
 /// brightness: -150..=150, contrast: -100..=100.
 pub fn brightness_contrast(
     doc: &mut Document,
@@ -92,7 +92,7 @@ pub fn invert(doc: &mut Document, layer: usize, sel: Option<&Selection>) {
     });
 }
 
-/// Image > Adjust > Desaturate — Photoshop's method: gray = HSL
+/// Image > Adjust > Desaturate — the classic method: gray = HSL
 /// lightness, (max + min) / 2 of the RGB channels.
 pub fn desaturate(doc: &mut Document, layer: usize, sel: Option<&Selection>) {
     map_layer_pixels(doc, layer, sel, |p| {
@@ -183,7 +183,7 @@ pub fn hue_saturation(
 
 /// Image > Adjust > Color Balance. Each range is (cyan-red,
 /// magenta-green, yellow-blue) shifts in -100..=100, applied with
-/// Photoshop-style luminance weighting per range.
+/// Classic luminance weighting per range.
 pub fn color_balance(
     doc: &mut Document,
     layer: usize,

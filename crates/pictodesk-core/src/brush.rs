@@ -1,10 +1,10 @@
-//! Painting tools — the Photoshop 1.0 toolbox's pixel pushers:
+//! Painting tools — the classic toolbox's pixel pushers:
 //! Brush (soft, spaced stamps), Pencil (hard), Eraser, Clone Stamp
 //! (Rubber Stamp in 1.0), Paint Bucket, Gradient, and the basic
 //! Blur/Sharpen/Smudge stamp tools.
 //!
 //! Every stamp respects the selection mask. Strokes interpolate
-//! stamps along the path (spacing = 25% of diameter, Photoshop's
+//! stamps along the path (spacing = 25% of diameter, the classic
 //! default) and return their bounding box so the caller can wrap
 //! the stroke in a tile-snapshot history command.
 
@@ -392,7 +392,7 @@ pub fn stroke_brush(
 }
 
 /// A full Clone stroke. `src_start` is the source point aligned with
-/// the stroke's first point (Photoshop's "Aligned" mode).
+/// the stroke's first point (the classic "Aligned" mode).
 pub fn stroke_clone(
     doc: &mut Document,
     layer: usize,
@@ -438,7 +438,7 @@ pub fn fill_selection(doc: &mut Document, layer: usize, sel: &Selection, color: 
 }
 
 /// Paint Bucket: flood the contiguous (or global) similar-color
-/// region under (x, y) with `color`, Photoshop-style.
+/// region under (x, y) with `color`, classic-style.
 pub fn paint_bucket(
     doc: &mut Document,
     layer: usize,
@@ -454,7 +454,7 @@ pub fn paint_bucket(
 
 /// The Gradient tool: linear gradient from `fg` at `from` to `bg` at
 /// `to`, drawn through the selection (or whole layer). Pixels beyond
-/// the endpoints clamp to the end colors, as in Photoshop.
+/// the endpoints clamp to the end colors, as in the classics.
 #[allow(clippy::too_many_arguments)]
 pub fn gradient(
     doc: &mut Document,

@@ -1,4 +1,4 @@
-//! Filters v1 — the Photoshop 1.0 Filter menu: Gaussian Blur,
+//! Filters v1 — the classic Filter menu: Gaussian Blur,
 //! Sharpen, Unsharp Mask, Add Noise. Filters read a snapshot of the
 //! layer region first (no feedback smearing), then write back
 //! blended by the selection mask.
@@ -130,7 +130,7 @@ fn blur_region(src: &Region, sigma: f32) -> Region {
     }
 }
 
-/// Filter > Blur > Gaussian Blur. `radius` is Photoshop's radius:
+/// Filter > Blur > Gaussian Blur. `radius` is the classic radius:
 /// roughly the blur's standard deviation in pixels.
 pub fn gaussian_blur(doc: &mut Document, layer: usize, sel: Option<&Selection>, radius: f32) {
     if radius <= 0.0 {
@@ -174,7 +174,7 @@ pub fn sharpen(doc: &mut Document, layer: usize, sel: Option<&Selection>) {
     );
 }
 
-/// Filter > Sharpen > Unsharp Mask. amount: 0.0..=5.0 (Photoshop's
+/// Filter > Sharpen > Unsharp Mask. amount: 0.0..=5.0 (the classic
 /// percent / 100), radius: blur radius, threshold: 0..=255 levels
 /// that must differ before sharpening applies.
 pub fn unsharp_mask(
@@ -228,7 +228,7 @@ fn hash_unit(seed: u64, x: i32, y: i32, ch: u64) -> f32 {
     (z >> 40) as f32 / (1u64 << 24) as f32
 }
 
-/// Filter > Noise > Add Noise. amount: 0.0..=1.0 (Photoshop percent
+/// Filter > Noise > Add Noise. amount: 0.0..=1.0 (percent
 /// / 100), uniform distribution, per-channel (not monochromatic).
 pub fn add_noise(
     doc: &mut Document,

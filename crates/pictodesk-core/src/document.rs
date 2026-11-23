@@ -7,6 +7,54 @@ use crate::color::WorkingSpace;
 use crate::layer::Layer;
 use crate::pixel::Pixel16;
 
+/// The document's color mode — the classic Mode menu. Pixel
+/// storage stays 16-bit RGB internally; CMYK mode means the stored
+/// values are the CMYK-round-tripped (gamut-clipped) ones, channels
+/// are presented and exported as CMYK, and the screen shows the
+/// printable result (a built-in soft proof).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ColorMode {
+    Rgb,
+    Cmyk,
+    Grayscale,
+}
+
+/// An alpha channel: a document-sized grayscale buffer. Holds saved
+/// selections (Select > Save Selection) and, when `spot_color` is
+/// set, a spot-color channel shown tinted in the Channels panel.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AlphaChannel {
+    pub name: String,
+    pub spot_color: Option<(u8, u8, u8)>,
+    pub data: Vec<u8>, // width * height, row-major
+}
+
+impl AlphaChannel {
+    pub fn new(name: impl Into<String>, width: u32, height: u32) -> Self {
+        AlphaChannel {
+            name: name.into(),
+            spot_color: None,
+            data: vec![0; (width * height) as usize],
+        }
+    }
+    pub fn value(&self, width: u32, x: i32, y: i32) -> u8 {
+        if x < 0 || y < 0 || x >= width as i32 {
+            return 0;
+        }
+        let i = (y as u32 * width + x as u32) as usize;
+        self.data.get(i).copied().unwrap_or(0)
+    }
+    pub fn set(&mut self, width: u32, x: i32, y: i32, v: u8) {
+        if x < 0 || y < 0 || x >= width as i32 {
+            return;
+        }
+        let i = (y as u32 * width + x as u32) as usize;
+        if i < self.data.len() {
+            self.data[i] = v;
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Document {
     pub width: u32,
@@ -14,6 +62,11 @@ pub struct Document {
     pub layers: Vec<Layer>,
     pub active_layer: usize,
     pub working_space: WorkingSpace,
+    pub mode: ColorMode,
+    pub alphas: Vec<AlphaChannel>,
+    pub paths: Vec<crate::path::Path>,
+    pub work_path: Option<crate::path::Path>,
+    pub clipping_path: Option<usize>,
 }
 
 impl Document {
@@ -27,6 +80,11 @@ impl Document {
             layers: vec![Layer::new("Background")],
             active_layer: 0,
             working_space: WorkingSpace::Srgb,
+            mode: ColorMode::Rgb,
+            alphas: Vec::new(),
+            paths: Vec::new(),
+            work_path: None,
+            clipping_path: None,
         }
     }
 
@@ -69,6 +127,29 @@ impl Document {
 
     pub fn render_full_rgba8(&self) -> Vec<u8> {
         self.render_region_rgba8(0, 0, self.width, self.height)
+    }
+
+    /// Save the current selection as a new alpha channel; returns its
+    /// index. This is Select > Save Selection, and the Channels panel
+    /// is where it lives afterwards.
+    pub fn save_selection_as_channel(&mut self, sel: &crate::selection::Selection) -> usize {
+        let n = self.alphas.len() + 1;
+        let mut ch = AlphaChannel::new(format!("Alpha {n}"), self.width, self.height);
+        ch.data.copy_from_slice(sel.raw_mask());
+        self.alphas.push(ch);
+        self.alphas.len() - 1
+    }
+
+    /// Load an alpha channel back as a selection.
+    pub fn channel_as_selection(&self, idx: usize) -> Option<crate::selection::Selection> {
+        let ch = self.alphas.get(idx)?;
+        let mut sel = crate::selection::Selection::none(self.width, self.height);
+        for y in 0..self.height as i32 {
+            for x in 0..self.width as i32 {
+                sel.set(x, y, ch.value(self.width, x, y));
+            }
+        }
+        Some(sel)
     }
 
     /// Simple FNV-1a checksum of the flattened render — used by tests

@@ -1,8 +1,8 @@
 //! Blend modes + alpha compositing.
 //!
-//! Phase 0 ships the core mode set; the full Photoshop set completes by
+//! Phase 0 ships the core mode set; the full classic set completes by
 //! Phase 5 of the game plan. Modes operate per-channel on encoded values
-//! in 0.0..=1.0, matching Photoshop's default (non-linear) blending.
+//! in 0.0..=1.0, matching the classic default (non-linear) blending.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BlendMode {

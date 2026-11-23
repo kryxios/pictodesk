@@ -90,14 +90,14 @@ Core modules, all selection-aware and history-wrapped:
   (whole-document snapshot) in `history.rs`, which also gained a
   configurable undo-depth limit and `MoveLayerCommand`.
 - `brush.rs` — the painting tools as stamp/stroke functions with
-  Photoshop spacing (25% of diameter): Brush, Pencil, Eraser, Clone
+  classic spacing (25% of diameter): Brush, Pencil, Eraser, Clone
   Stamp (aligned), Paint Bucket, Gradient, Blur/Sharpen/Smudge
   stamps, plus the eyedropper's averaged sampler.
 - `io.rs` — PNG/JPEG/TIFF/BMP via the pure-Rust `image` crate;
   embedded ICC profiles are converted into the working space on
   import. `histogram.rs` feeds the Histogram palette.
 
-The app shell is now a Photoshop 1.0 workbench drawn on the CPU into
+The app shell is now a classic 1990-era workbench drawn on the CPU into
 a framebuffer (platinum chrome, `font8x8` pixel text) and uploaded
 as one GPU texture per frame: menu bar with submenus, two-column
 toolbox, FG/BG swatches + color palette, Brushes and Histogram

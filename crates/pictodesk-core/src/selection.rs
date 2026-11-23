@@ -1,10 +1,10 @@
-//! Selections, Photoshop-style: a grayscale mask over the document.
+//! Selections, classic-style: a grayscale mask over the document.
 //! 255 = fully selected, 0 = not selected, feathered edges land in
 //! between. Every paint, adjustment, and filter in Phase 1 respects
-//! this mask — that's what made Photoshop 1.0 a retouching tool
+//! this mask — that's what made the 1990 original a retouching tool
 //! rather than a paint program.
 //!
-//! Constructors mirror the 1.0 selection tools: Rectangular and
+//! Constructors follow the classic selection tools: Rectangular and
 //! Elliptical Marquee, Lasso (freehand polygon), Magic Wand (color
 //! flood with tolerance). Select > Feather blurs the mask edge;
 //! Select > Inverse flips it.
@@ -91,8 +91,12 @@ impl Selection {
             }
             nodes.sort_by(|a, b| a.partial_cmp(b).unwrap());
             for pair in nodes.as_chunks::<2>().0 {
-                let xa = (pair[0].ceil() as i32).max(0);
-                let xb = (pair[1].floor() as i32).min(width as i32 - 1);
+                // Pixel-center sampling on x too (the y axis already
+                // samples at centers): a pixel is in when its center
+                // lies within the span. Keeps path->selection fills
+                // from growing a pixel on the right/bottom edges.
+                let xa = ((pair[0] - 0.5).ceil() as i32).max(0);
+                let xb = ((pair[1] - 0.5).ceil() as i32 - 1).min(width as i32 - 1);
                 for xx in xa..=xb {
                     s.set(xx, yy, 255);
                 }
@@ -192,6 +196,87 @@ impl Selection {
         }
     }
 
+    /// Select > Similar: every pixel in the image whose color falls
+    /// within the selected pixels' per-channel range, expanded by
+    /// `tolerance` on each side. `img` is the flattened RGBA8 render.
+    pub fn similar(&self, img: &[u8], tolerance: u8) -> Selection {
+        let (mut lo, mut hi) = ([255u8; 3], [0u8; 3]);
+        let mut any = false;
+        for i in 0..self.mask.len() {
+            if self.mask[i] >= 128 {
+                any = true;
+                for c in 0..3 {
+                    lo[c] = lo[c].min(img[i * 4 + c]);
+                    hi[c] = hi[c].max(img[i * 4 + c]);
+                }
+            }
+        }
+        let mut out = Selection::none(self.width, self.height);
+        if !any {
+            return out;
+        }
+        let t = tolerance as i32;
+        for i in 0..out.mask.len() {
+            let inside = (0..3).all(|c| {
+                let v = img[i * 4 + c] as i32;
+                v >= lo[c] as i32 - t && v <= hi[c] as i32 + t
+            });
+            if inside {
+                out.mask[i] = 255;
+            }
+        }
+        out
+    }
+
+    /// Select > Grow: flood outward from the selection boundary,
+    /// absorbing neighboring pixels whose color is within
+    /// `tolerance` (max per-channel difference) of the frontier
+    /// pixel they grow from — the Magic Wand's contiguous logic,
+    /// seeded from the whole boundary at once.
+    pub fn grow(&self, img: &[u8], tolerance: u8) -> Selection {
+        let w = self.width as i32;
+        let h = self.height as i32;
+        let mut out = self.clone();
+        let tol = tolerance as i32;
+        let close = |a: usize, b: usize| -> bool {
+            (0..3).all(|c| (img[a * 4 + c] as i32 - img[b * 4 + c] as i32).abs() <= tol)
+        };
+        // Frontier: selected pixels with an unselected neighbor.
+        let mut stack: Vec<(i32, i32)> = Vec::new();
+        for y in 0..h {
+            for x in 0..w {
+                if self.value(x, y) < 128 {
+                    continue;
+                }
+                let edge = [(x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)]
+                    .iter()
+                    .any(|&(nx, ny)| {
+                        nx < 0 || ny < 0 || nx >= w || ny >= h || self.value(nx, ny) < 128
+                    });
+                if edge {
+                    stack.push((x, y));
+                }
+            }
+        }
+        while let Some((x, y)) = stack.pop() {
+            let src = (y * w + x) as usize;
+            for (nx, ny) in [(x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)] {
+                if nx < 0 || ny < 0 || nx >= w || ny >= h {
+                    continue;
+                }
+                if out.value(nx, ny) >= 128 {
+                    continue;
+                }
+                let dst = (ny * w + nx) as usize;
+                if close(src, dst) {
+                    out.set(nx, ny, 255);
+                    stack.push((nx, ny));
+                }
+            }
+        }
+        out
+    }
+
     pub fn invert(&mut self) {
         for v in &mut self.mask {
             *v = 255 - *v;
@@ -199,7 +284,7 @@ impl Selection {
     }
 
     /// Select > Feather: blur the mask edge by `radius` pixels
-    /// (two separable box-blur passes approximate Photoshop's falloff).
+    /// (two separable box-blur passes approximate the classic falloff).
     pub fn feather(&mut self, radius: u32) {
         if radius == 0 || self.is_empty() {
             return;

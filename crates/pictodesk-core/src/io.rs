@@ -1,5 +1,5 @@
-//! Raster file IO — File > Open / Save for the formats Photoshop
-//! 1.0 spoke: PNG, JPEG, TIFF (plus BMP). Decoding/encoding is the
+//! Raster file IO — File > Open / Save for the classic formats:
+//! PNG, JPEG, TIFF (plus BMP). Decoding/encoding is the
 //! pure-Rust `image` crate; pixels land in a one-layer document.
 //!
 //! Color: if the file carries an embedded ICC profile (PNG/JPEG),
@@ -83,6 +83,59 @@ pub fn import_image(bytes: &[u8]) -> Result<Document, IoError> {
     let icc = embedded_icc(bytes, format);
     let img: DynamicImage =
         image::load_from_memory(bytes).map_err(|e| IoError::Decode(e.to_string()))?;
+    let (w, h) = (img.width(), img.height());
+    // 16-bit sources keep their full precision end to end (Phase 2:
+    // 16-bit/channel editing exposed). The ICC conversion path works
+    // at 8-bit, so it applies to 8-bit sources; a 16-bit file's
+    // profile conversion is a later refinement.
+    let pixels16: Option<Vec<Pixel16>> = if let Some(buf) = img.as_rgba16() {
+        Some(
+            buf.as_raw()
+                .chunks_exact(4)
+                .map(|c| Pixel16::new(c[0], c[1], c[2], c[3]))
+                .collect(),
+        )
+    } else if let Some(buf) = img.as_rgb16() {
+        Some(
+            buf.as_raw()
+                .chunks_exact(3)
+                .map(|c| Pixel16::new(c[0], c[1], c[2], 65535))
+                .collect(),
+        )
+    } else {
+        None
+    };
+    let mut doc = Document::new(w, h);
+    if let Some(pixels) = &pixels16 {
+        for ty in 0..(h as i32 + 255) / 256 {
+            for tx in 0..(w as i32 + 255) / 256 {
+                let mut tile = Tile::new_transparent();
+                let mut any = false;
+                for ly in 0..256u32 {
+                    let y = ty as u32 * 256 + ly;
+                    if y >= h {
+                        break;
+                    }
+                    for lx in 0..256u32 {
+                        let x = tx as u32 * 256 + lx;
+                        if x >= w {
+                            break;
+                        }
+                        let p = pixels[(y * w + x) as usize];
+                        if p != Pixel16::TRANSPARENT {
+                            any = true;
+                        }
+                        tile.set(lx, ly, p);
+                    }
+                }
+                if any {
+                    tile.dirty = true;
+                    doc.layers[0].tiles.insert((tx, ty), tile);
+                }
+            }
+        }
+        return Ok(doc);
+    }
     let mut rgba = img.to_rgba8();
     if let Some(profile_bytes) = icc {
         if let Ok(src_profile) = IccProfile::from_bytes(&profile_bytes) {
@@ -96,8 +149,6 @@ pub fn import_image(bytes: &[u8]) -> Result<Document, IoError> {
             }
         }
     }
-    let (w, h) = (rgba.width(), rgba.height());
-    let mut doc = Document::new(w, h);
     let raw = rgba.as_raw();
     // Fill tiles directly (row-segment copies) instead of per-pixel
     // set_pixel — imports of real photos stay fast.
@@ -235,4 +286,136 @@ mod tests {
     fn garbage_bytes_are_a_decode_error() {
         assert!(import_image(b"not an image at all").is_err());
     }
+}
+
+// ------------------------------------------------------- CMYK TIFF
+//
+// A hand-rolled classic TIFF writer for CMYK export: the `image`
+// crate's TIFF encoder cannot attach Photoshop image resources, and
+// the clipping path (tag 34377) is the point of a print export.
+// Uncompressed, single strip, little-endian — every print shop and
+// every TIFF reader accepts this shape.
+
+fn photoshop_path_resource(path: &crate::path::Path, doc_w: u32, doc_h: u32) -> Vec<u8> {
+    // Path data in Adobe's documented format: per subpath, a length
+    // record (u16 BE knot count + 24 zero bytes), then one 26-byte
+    // record per knot: selector, padding, then the preceding control
+    // point, anchor, and following control point, each as (vertical,
+    // horizontal) 8.24 fixed-point fractions of the image size.
+    let mut data: Vec<u8> = Vec::new();
+    let frac = |v: f32, dim: u32| -> [u8; 4] {
+        let n = (v / dim.max(1) as f32 * 16_777_216.0).round() as i32;
+        n.to_be_bytes()
+    };
+    for sp in &path.subpaths {
+        if sp.anchors.len() < 2 {
+            continue;
+        }
+        data.extend_from_slice(&(sp.anchors.len() as u16).to_be_bytes());
+        data.extend_from_slice(&[0u8; 24]);
+        let selector: u8 = if sp.closed { 2 } else { 5 };
+        for a in &sp.anchors {
+            data.push(selector);
+            data.push(0);
+            for pt in [a.in_ctrl, a.point, a.out_ctrl] {
+                data.extend_from_slice(&frac(pt.1, doc_h));
+                data.extend_from_slice(&frac(pt.0, doc_w));
+            }
+        }
+    }
+    // Image resource block: "8BIM" | u16 id | Pascal name (padded to
+    // even) | u32 data size | data (padded to even).
+    let mut irb: Vec<u8> = Vec::new();
+    let mut block = |id: u16, name: &str, payload: &[u8], irb: &mut Vec<u8>| {
+        irb.extend_from_slice(b"8BIM");
+        irb.extend_from_slice(&id.to_be_bytes());
+        let nb = name.as_bytes();
+        irb.push(nb.len() as u8);
+        irb.extend_from_slice(nb);
+        if (1 + nb.len()) % 2 == 1 {
+            irb.push(0);
+        }
+        irb.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        irb.extend_from_slice(payload);
+        if payload.len() % 2 == 1 {
+            irb.push(0);
+        }
+    };
+    block(2000, "", &data, &mut irb);
+    // Resource 2999: the name of the clipping path.
+    let mut name_payload: Vec<u8> = Vec::new();
+    let nb = path.name.as_bytes();
+    name_payload.push(nb.len() as u8);
+    name_payload.extend_from_slice(nb);
+    block(2999, "", &name_payload, &mut irb);
+    irb
+}
+
+/// Export the document as a CMYK TIFF (8 bits per channel, C,M,Y,K
+/// byte order per pixel). When the document has a clipping path set,
+/// it is embedded as a Photoshop image resource (tag 34377), the way
+/// print workflows expect.
+pub fn export_tiff_cmyk(doc: &Document) -> Vec<u8> {
+    let (w, h) = (doc.width, doc.height);
+    let rgba = doc.render_full_rgba8();
+    let mut pixels: Vec<u8> = Vec::with_capacity((w * h * 4) as usize);
+    for px in rgba.chunks_exact(4) {
+        let (c, m, y, k) = crate::color::rgb_to_cmyk(
+            px[0] as f32 / 255.0,
+            px[1] as f32 / 255.0,
+            px[2] as f32 / 255.0,
+        );
+        pixels.push((c * 255.0).round() as u8);
+        pixels.push((m * 255.0).round() as u8);
+        pixels.push((y * 255.0).round() as u8);
+        pixels.push((k * 255.0).round() as u8);
+    }
+    let irb = doc
+        .clipping_path
+        .and_then(|i| doc.paths.get(i))
+        .map(|p| photoshop_path_resource(p, w, h));
+
+    // Layout: header (8) | IFD | external data (bits-per-sample,
+    // strip pixels, IRB). Entries sorted by tag, as TIFF requires.
+    let n_entries: u16 = if irb.is_some() { 11 } else { 10 };
+    let ifd_size = 2 + n_entries as u32 * 12 + 4;
+    let bits_off = 8 + ifd_size;
+    let strip_off = bits_off + 8;
+    let irb_off = strip_off + pixels.len() as u32;
+
+    let mut out: Vec<u8> = Vec::new();
+    let mut u16le = |v: u16, out: &mut Vec<u8>| out.extend_from_slice(&v.to_le_bytes());
+    let mut u32le = |v: u32, out: &mut Vec<u8>| out.extend_from_slice(&v.to_le_bytes());
+    out.extend_from_slice(b"II");
+    u16le(42, &mut out);
+    u32le(8, &mut out); // IFD offset
+    u16le(n_entries, &mut out);
+    let mut entry = |tag: u16, typ: u16, count: u32, val: u32, out: &mut Vec<u8>| {
+        u16le(tag, out);
+        u16le(typ, out);
+        u32le(count, out);
+        u32le(val, out);
+    };
+    entry(256, 4, 1, w, &mut out); // ImageWidth (LONG)
+    entry(257, 4, 1, h, &mut out); // ImageLength
+    entry(258, 3, 4, bits_off, &mut out); // BitsPerSample -> offset
+    entry(259, 3, 1, 1, &mut out); // Compression = none
+    entry(262, 3, 1, 5, &mut out); // Photometric = CMYK separations
+    entry(273, 4, 1, strip_off, &mut out); // StripOffsets
+    entry(277, 3, 1, 4, &mut out); // SamplesPerPixel
+    entry(278, 4, 1, h, &mut out); // RowsPerStrip
+    entry(279, 4, 1, pixels.len() as u32, &mut out); // StripByteCounts
+    entry(284, 3, 1, 1, &mut out); // PlanarConfig = chunky
+    if let Some(irb) = &irb {
+        entry(34377, 1, irb.len() as u32, irb_off, &mut out); // Photoshop IRB
+    }
+    u32le(0, &mut out); // no next IFD
+    for _ in 0..4 {
+        u16le(8, &mut out); // BitsPerSample values 8,8,8,8
+    }
+    out.extend_from_slice(&pixels);
+    if let Some(irb) = &irb {
+        out.extend_from_slice(irb);
+    }
+    out
 }

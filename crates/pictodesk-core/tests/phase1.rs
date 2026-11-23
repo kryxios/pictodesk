@@ -1,7 +1,7 @@
 //! Phase 1 exit test — the game plan's task test, end to end:
 //! "take a scanned/dull photo → correct it with Levels, clone out a
 //! dust spot, crop, resize, export a clean JPEG." Plus the history
-//! contract: adjustments undo exactly, and Photoshop 1.0's single
+//! contract: adjustments undo exactly, and the era's single
 //! level of undo behaves like 1.0 (toggle Undo/Redo).
 
 use pictodesk_core::adjust;
@@ -106,7 +106,7 @@ fn adjustment_undo_is_exact_and_single_level_toggles() {
     doc.layers[0].fill_rect(0, 0, 32, 32, Pixel16::from_rgba8(90, 90, 90, 255));
     let original = doc.render_checksum();
 
-    // Photoshop 1.0 mode: exactly one level of undo.
+    // 1990 mode: exactly one level of undo.
     let mut hist = History::new();
     hist.set_limit(Some(1));
     let tiles = Selection::tiles_in_rect(0, 0, 32, 32);

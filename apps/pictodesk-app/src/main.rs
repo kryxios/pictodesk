@@ -1,11 +1,11 @@
-//! PictoDesk desktop shell — Phase 1: a Photoshop 1.0 workbench.
+//! PictoDesk desktop shell — Phase 1: a classic 1990-era workbench.
 //!
 //! The chrome is deliberate 1990: platinum menu bar (File, Edit,
 //! Image, Mode, Filter, Select, Window), a two-column toolbox with
 //! the 1.0 tool set, foreground/background swatches, floating
 //! palettes (Brushes, Histogram), modal adjustment dialogs with
 //! live preview, and exactly ONE level of Undo in the Edit menu —
-//! because that's how Photoshop 1.0 worked. (The engine underneath
+//! because that's how the 1990 original worked. (The engine underneath
 //! already supports unlimited history; Phase 5 will expose it.)
 //!
 //! All UI is drawn on the CPU into a framebuffer and uploaded as a
@@ -97,7 +97,7 @@ impl Tool {
     }
 }
 
-/// Toolbox order, two columns, Photoshop-style grouping.
+/// Toolbox order, two columns, classic grouping.
 const TOOLS: [Tool; 17] = [
     Tool::Move,
     Tool::MarqueeRect,
@@ -426,7 +426,7 @@ struct App {
     dirty: bool,
     status: String,
     /// Label of the most recent history command — drives the Edit
-    /// menu's "Undo <action>" text, as in Photoshop.
+    /// menu's "Undo <action>" text, as in the classics.
     last_label: Option<String>,
     // ui state
     open_menu: Option<usize>,
@@ -467,7 +467,7 @@ struct App {
 impl App {
     fn new(doc: Document, file_path: Option<PathBuf>) -> Self {
         let mut hist = History::new();
-        hist.set_limit(Some(1)); // Photoshop 1.0: a single level of Undo
+        hist.set_limit(Some(1)); // 1990 rules: a single level of Undo
         App {
             doc,
             hist,
@@ -1441,7 +1441,7 @@ impl App {
         }
     }
 
-    /// Photoshop-style rulers along the top and left of the canvas:
+    /// Classic rulers along the top and left of the canvas:
     /// pixel coordinates in document space, tick spacing adapts to
     /// zoom, and a marker tracks the cursor on each ruler.
     fn draw_rulers(&self, f: &mut Frame) {
@@ -1707,7 +1707,7 @@ impl App {
             }
             draw_tool_icon(f, *t, r);
         }
-        // foreground/background swatches (Photoshop layout: FG overlaps BG)
+        // foreground/background swatches (classic layout: FG overlaps BG)
         let sy = area.bottom() - 52;
         f.text(6, sy - 12, "Color", 1, ui::BLACK);
         let bg_r = Rect::new(24, sy + 12, 20, 20);
@@ -3099,7 +3099,7 @@ impl App {
     }
 
     /// The command modifier for shortcuts: Cmd on macOS, Ctrl on
-    /// Windows and Linux — the Photoshop convention on each platform.
+    /// Windows and Linux — each platform's own convention.
     fn primary_down(&self) -> bool {
         if cfg!(target_os = "macos") {
             self.super_down
@@ -3150,7 +3150,7 @@ impl App {
             }
             _ => {
                 let lc = c.to_ascii_lowercase();
-                // cycle within the key's tool group (Photoshop behavior)
+                // cycle within the key's tool group (classic behavior)
                 let group: Vec<Tool> = TOOLS.iter().copied().filter(|t| t.key() == lc).collect();
                 if !group.is_empty() {
                     if let Some(pos) = group.iter().position(|t| *t == self.tool) {

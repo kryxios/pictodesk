@@ -199,7 +199,7 @@ impl Command for MoveLayerCommand {
 pub struct History {
     undo_stack: Vec<Box<dyn Command>>,
     redo_stack: Vec<Box<dyn Command>>,
-    /// Cap on undo depth. Photoshop 1.0 exposed exactly ONE level of
+    /// Cap on undo depth. The 1990 original exposed exactly ONE level of
     /// undo (Edit > Undo toggled with Redo), so the Phase 1 app sets
     /// this to 1; the engine itself is unlimited by default.
     limit: Option<usize>,

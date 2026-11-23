@@ -15,6 +15,8 @@ pub mod format;
 pub mod histogram;
 pub mod history;
 pub mod icc;
+pub mod mode;
+pub mod path;
 pub mod io;
 pub mod layer;
 pub mod pixel;
@@ -23,6 +25,8 @@ pub mod tile;
 pub mod transform;
 
 pub use blend::BlendMode;
+pub use document::ColorMode;
+pub use path::Path;
 pub use color::WorkingSpace;
 pub use document::Document;
 pub use history::History;

@@ -95,7 +95,7 @@ pub fn rotate_90_ccw(doc: &mut Document) {
 
 /// Image > Canvas Size. Content is anchored: `anchor` is (x, y) with
 /// each in -1 (left/top), 0 (center), 1 (right/bottom) — the 3x3
-/// anchor grid in Photoshop's dialog. Content outside the new canvas
+/// anchor grid in the classic dialog. Content outside the new canvas
 /// is cropped away; new area is transparent.
 pub fn canvas_size(doc: &mut Document, new_w: u32, new_h: u32, anchor: (i32, i32)) {
     let dx = ((new_w as i32 - doc.width as i32) * (anchor.0 + 1)) / 2;

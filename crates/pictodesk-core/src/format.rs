@@ -1,8 +1,17 @@
-//! The `.pdesk` file format — v2 (v1 still readable).
+//! The `.pdesk` file format — v3 (v1 and v2 still readable).
 //!
-//! v2 layout (all integers little-endian):
-//!   magic "PDSK" | u32 version (=2) | u32 uncompressed_len
-//!   DEFLATE stream of the complete v1 payload (below)
+//! v3 layout: the v2 envelope (magic "PDSK" | u32 version (=3) |
+//! u32 uncompressed_len | DEFLATE stream) around a payload that is
+//! the v1 payload plus an extension block:
+//!   "PX2E" | u8 color mode (0=RGB, 1=CMYK, 2=Grayscale)
+//!   u32 alpha_count; per alpha: u16 name_len + name | u8 spot flag
+//!     (+ 3 bytes RGB when spot) | u32 data_len + data bytes
+//!   i32 clipping_path index (-1 = none)
+//!   u32 path_count; per path: u16 name_len + name | u32 subpaths;
+//!     per subpath: u8 closed | u32 anchors; per anchor 6 x f32
+//!     (point, in_ctrl, out_ctrl)
+//!   u8 has_work_path (+ one path body when 1, name may be empty)
+//! v2 files carry no extension block and load with defaults.
 //!
 //! v1 payload layout:
 //!   magic "PDSK" | u32 version (=1)
@@ -32,7 +41,8 @@ use crate::pixel::Pixel16;
 use crate::tile::{Tile, TILE_PIXELS};
 
 pub const MAGIC: &[u8; 4] = b"PDSK";
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
+pub const V2_VERSION: u32 = 2;
 pub const LEGACY_VERSION: u32 = 1;
 pub const FILE_EXTENSION: &str = "pdesk";
 
@@ -171,12 +181,72 @@ pub fn serialize_v1(doc: &Document) -> Vec<u8> {
     w.buf
 }
 
-/// The current (v2) serialization: header + DEFLATE-compressed v1 payload.
+fn serialize_ext(w: &mut Writer, doc: &Document) {
+    fn write_path(w: &mut Writer, path: &crate::path::Path) {
+        let name = path.name.as_bytes();
+        w.u16(name.len() as u16);
+        w.bytes(name);
+        w.u32(path.subpaths.len() as u32);
+        for sp in &path.subpaths {
+            w.u8(if sp.closed { 1 } else { 0 });
+            w.u32(sp.anchors.len() as u32);
+            for a in &sp.anchors {
+                for v in [a.point, a.in_ctrl, a.out_ctrl] {
+                    w.f32(v.0);
+                    w.f32(v.1);
+                }
+            }
+        }
+    }
+    w.bytes(b"PX2E");
+    w.u8(match doc.mode {
+        crate::document::ColorMode::Rgb => 0,
+        crate::document::ColorMode::Cmyk => 1,
+        crate::document::ColorMode::Grayscale => 2,
+    });
+    w.u32(doc.alphas.len() as u32);
+    for ch in &doc.alphas {
+        let name = ch.name.as_bytes();
+        w.u16(name.len() as u16);
+        w.bytes(name);
+        match ch.spot_color {
+            Some((r, g, b)) => {
+                w.u8(1);
+                w.u8(r);
+                w.u8(g);
+                w.u8(b);
+            }
+            None => w.u8(0),
+        }
+        w.u32(ch.data.len() as u32);
+        w.bytes(&ch.data);
+    }
+    w.i32(doc.clipping_path.map(|i| i as i32).unwrap_or(-1));
+    w.u32(doc.paths.len() as u32);
+    for path in &doc.paths {
+        write_path(w, path);
+    }
+    match &doc.work_path {
+        Some(wp) => {
+            w.u8(1);
+            write_path(w, wp);
+        }
+        None => w.u8(0),
+    }
+}
+
+/// The current (v3) serialization: header + DEFLATE-compressed
+/// payload (v1 body + Phase 2 extension block).
 pub fn serialize(doc: &Document) -> Vec<u8> {
     use flate2::write::DeflateEncoder;
     use flate2::Compression;
     use std::io::Write;
-    let payload = serialize_v1(doc);
+    let mut payload = serialize_v1(doc);
+    {
+        let mut w = Writer { buf: Vec::new() };
+        serialize_ext(&mut w, doc);
+        payload.extend_from_slice(&w.buf);
+    }
     let mut enc = DeflateEncoder::new(Vec::new(), Compression::default());
     enc.write_all(&payload)
         .expect("deflate into memory cannot fail");
@@ -196,7 +266,7 @@ pub fn deserialize(buf: &[u8]) -> Result<Document, FormatError> {
     let version = u32::from_le_bytes(buf[4..8].try_into().unwrap());
     match version {
         LEGACY_VERSION => deserialize_v1(buf),
-        FORMAT_VERSION => {
+        FORMAT_VERSION | V2_VERSION => {
             use flate2::read::DeflateDecoder;
             use std::io::Read;
             if buf.len() < 12 {
@@ -210,10 +280,99 @@ pub fn deserialize(buf: &[u8]) -> Result<Document, FormatError> {
             if payload.len() != expected_len {
                 return Err(FormatError::Corrupt("decompressed size mismatch"));
             }
-            deserialize_v1(&payload)
+            let mut doc = deserialize_v1(&payload)?;
+            if version == FORMAT_VERSION {
+                parse_ext(&payload, &mut doc)?;
+            }
+            Ok(doc)
         }
         v => Err(FormatError::UnsupportedVersion(v)),
     }
+}
+
+fn parse_ext(payload: &[u8], doc: &mut Document) -> Result<(), FormatError> {
+    // Re-walk the v1 body to find where the extension block starts.
+    let mut r = Reader { buf: payload, pos: 0 };
+    r.take(4)?;
+    r.u32()?; // version
+    r.u32()?;
+    r.u32()?;
+    r.u8()?; // working space
+    let layer_count = r.u32()?;
+    for _ in 0..layer_count {
+        let name_len = r.u16()? as usize;
+        r.take(name_len)?;
+        r.f32()?;
+        r.u8()?;
+        r.u8()?;
+        r.i32()?;
+        r.i32()?;
+        let tile_count = r.u32()?;
+        let bytes_per_tile = crate::tile::TILE_PIXELS * 4 * 2;
+        r.take(tile_count as usize * (8 + bytes_per_tile))?;
+    }
+    if r.take(4)? != b"PX2E" {
+        return Err(FormatError::Corrupt("missing extension block"));
+    }
+    fn read_path(r: &mut Reader) -> Result<crate::path::Path, FormatError> {
+        let name_len = r.u16()? as usize;
+        let name = String::from_utf8(r.take(name_len)?.to_vec())
+            .map_err(|_| FormatError::Corrupt("path name not UTF-8"))?;
+        let mut path = crate::path::Path::new(name);
+        let subs = r.u32()?;
+        for _ in 0..subs {
+            let closed = r.u8()? != 0;
+            let n = r.u32()?;
+            let mut anchors = Vec::new();
+            for _ in 0..n {
+                let mut v = [0f32; 6];
+                for v in v.iter_mut() {
+                    *v = r.f32()?;
+                }
+                anchors.push(crate::path::Anchor {
+                    point: (v[0], v[1]),
+                    in_ctrl: (v[2], v[3]),
+                    out_ctrl: (v[4], v[5]),
+                });
+            }
+            path.subpaths.push(crate::path::Subpath { anchors, closed });
+        }
+        Ok(path)
+    }
+    doc.mode = match r.u8()? {
+        0 => crate::document::ColorMode::Rgb,
+        1 => crate::document::ColorMode::Cmyk,
+        2 => crate::document::ColorMode::Grayscale,
+        _ => return Err(FormatError::Corrupt("unknown color mode")),
+    };
+    let alpha_count = r.u32()?;
+    for _ in 0..alpha_count {
+        let name_len = r.u16()? as usize;
+        let name = String::from_utf8(r.take(name_len)?.to_vec())
+            .map_err(|_| FormatError::Corrupt("channel name not UTF-8"))?;
+        let spot = if r.u8()? != 0 {
+            Some((r.u8()?, r.u8()?, r.u8()?))
+        } else {
+            None
+        };
+        let len = r.u32()? as usize;
+        let data = r.take(len)?.to_vec();
+        doc.alphas.push(crate::document::AlphaChannel {
+            name,
+            spot_color: spot,
+            data,
+        });
+    }
+    let clip = r.i32()?;
+    doc.clipping_path = if clip >= 0 { Some(clip as usize) } else { None };
+    let path_count = r.u32()?;
+    for _ in 0..path_count {
+        doc.paths.push(read_path(&mut r)?);
+    }
+    if r.u8()? != 0 {
+        doc.work_path = Some(read_path(&mut r)?);
+    }
+    Ok(())
 }
 
 fn deserialize_v1(buf: &[u8]) -> Result<Document, FormatError> {

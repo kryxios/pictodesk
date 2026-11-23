@@ -1,4 +1,4 @@
-//! Classic-Photoshop UI kit: a CPU framebuffer with platinum-gray
+//! Classic-era UI kit: a CPU framebuffer with platinum-gray
 //! panels, black pixel-font text, and the drawing primitives the
 //! menu bar, toolbox, palettes, and dialogs are built from.
 //! Everything is drawn in the style of the 1990 original: light gray
@@ -224,7 +224,7 @@ impl Frame {
     }
 }
 
-/// The classic Photoshop palette of preset colors for the color
+/// The classic preset palette of colors for the color
 /// picker panel (a compact 8x8 grid + gray ramp is drawn by caller).
 pub const PALETTE: [Rgb; 64] = [
     (0, 0, 0),
