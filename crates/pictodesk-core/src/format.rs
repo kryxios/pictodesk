@@ -292,7 +292,10 @@ pub fn deserialize(buf: &[u8]) -> Result<Document, FormatError> {
 
 fn parse_ext(payload: &[u8], doc: &mut Document) -> Result<(), FormatError> {
     // Re-walk the v1 body to find where the extension block starts.
-    let mut r = Reader { buf: payload, pos: 0 };
+    let mut r = Reader {
+        buf: payload,
+        pos: 0,
+    };
     r.take(4)?;
     r.u32()?; // version
     r.u32()?;

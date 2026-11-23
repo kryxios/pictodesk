@@ -3,11 +3,11 @@
 An open-source desktop photo and image editor — local files, no cloud,
 no account, no subscription. Built feature by feature, in the open.
 
-**Status: v0.1.2 — Phase 1 complete: a real photo editor.** The UI
-follows the classic early-90s editor design: a File / Edit / Image /
-Mode / Filter / Select / Window menu bar, a compact two-column
-toolbox, modal dialogs with live preview — and, for now, a single
-level of Undo.
+**Status: v0.2.0 — Phase 2 complete: paths, channels, and CMYK.**
+The UI follows the classic early-90s editor design: a File / Edit /
+Image / Mode / Filter / Select / Window menu bar, a compact
+two-column toolbox, modal dialogs with live preview, docked tabbed
+palettes — and, for now, a single level of Undo.
 
 What exists today:
 
@@ -31,9 +31,21 @@ What exists today:
   no platform-specific code). Keyboard shortcuts follow each
   platform's convention: Ctrl on Windows/Linux, Cmd on macOS, and
   the menus label them accordingly.
+- Phase 2: the Pen tool (click for corner points, drag for smooth
+  points, click the first anchor to close) with a Paths panel — save
+  named paths, fill/stroke them, convert path <-> selection, and mark
+  a clipping path; a Channels panel with per-channel viewing, alpha
+  channels (saved selections) you can paint on directly, and basic
+  spot channels; real RGB / CMYK / Grayscale modes (CMYK is a
+  soft-proof: pixels stay 16-bit RGB internally and convert on
+  export); Select > Grow and Similar; 16-bit files now import
+  bit-exact; CMYK documents save as true CMYK TIFFs with the
+  clipping path embedded. The `.pdesk` format is now v3 (v1/v2
+  files still load).
 - A desktop shell (`apps/pictodesk-app`): the classic 1990-era workbench
-  — platinum menu bar and toolbox, rulers, floating Brushes/Histogram
-  palettes, modal dialogs with live preview, one level of Undo.
+  — platinum menu bar and toolbox, rulers, docked tabbed palettes
+  (Channels/Paths, Brushes, Histogram, Color), modal dialogs with
+  live preview, one level of Undo.
   Open a file with `pictodesk-app photo.png`, or drag a file onto the
   window. Verify the UI headlessly with
   `cargo run -p pictodesk-app -- --shot out.ppm [--menu N] [--dialog levels]`.

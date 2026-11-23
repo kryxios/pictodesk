@@ -49,18 +49,6 @@ pub struct Path {
     pub subpaths: Vec<Subpath>,
 }
 
-fn cubic(p0: (f32, f32), p1: (f32, f32), p2: (f32, f32), p3: (f32, f32), t: f32) -> (f32, f32) {
-    let u = 1.0 - t;
-    let a = u * u * u;
-    let b = 3.0 * u * u * t;
-    let c = 3.0 * u * t * t;
-    let d = t * t * t;
-    (
-        a * p0.0 + b * p1.0 + c * p2.0 + d * p3.0,
-        a * p0.1 + b * p1.1 + c * p2.1 + d * p3.1,
-    )
-}
-
 fn flatten_segment(
     out: &mut Vec<(f32, f32)>,
     p0: (f32, f32),
@@ -207,9 +195,8 @@ impl Path {
 pub fn selection_to_path(sel: &Selection) -> Path {
     let w = sel.width as i32;
     let h = sel.height as i32;
-    let inside = |x: i32, y: i32| -> bool {
-        x >= 0 && y >= 0 && x < w && y < h && sel.value(x, y) >= 128
-    };
+    let inside =
+        |x: i32, y: i32| -> bool { x >= 0 && y >= 0 && x < w && y < h && sel.value(x, y) >= 128 };
     // Directed boundary edges on pixel corners, interior on the left
     // of travel... we chain purely by endpoint matching; direction
     // does not matter for even-odd fill.
@@ -268,7 +255,7 @@ pub fn selection_to_path(sel: &Selection) -> Path {
                     continue;
                 }
                 let e = edges[ci];
-                let nd = (e.1.0 - e.0.0, e.1.1 - e.0.1);
+                let nd = (e.1 .0 - e.0 .0, e.1 .1 - e.0 .1);
                 // score: right turn +2, straight +1, left 0, back -1
                 let cross = dir.0 * nd.1 - dir.1 * nd.0;
                 let dot = dir.0 * nd.0 + dir.1 * nd.1;
@@ -365,7 +352,11 @@ mod tests {
     fn flatten_ellipse_is_round_and_closed_shape() {
         let p = ellipse_path();
         let line = p.subpaths[0].flatten();
-        assert!(line.len() > 24, "curve should subdivide, got {}", line.len());
+        assert!(
+            line.len() > 24,
+            "curve should subdivide, got {}",
+            line.len()
+        );
         let (x0, y0, x1, y1) = p.bounds().unwrap();
         assert!((x0 - 100.0).abs() < 1.5 && (x1 - 300.0).abs() < 1.5);
         assert!((y0 - 50.0).abs() < 1.5 && (y1 - 150.0).abs() < 1.5);

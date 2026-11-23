@@ -492,6 +492,77 @@ pub fn gradient(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+/// Stamp the brush tip into a raw channel buffer (alpha/spot)
+/// channels): pixels move toward `value` by tip coverage x opacity.
+/// This is how painting works when a channel, not the image, is the
+/// paint target.
+pub fn stamp_channel(
+    data: &mut [u8],
+    width: u32,
+    height: u32,
+    cx: f32,
+    cy: f32,
+    tip: &BrushTip,
+    value: u8,
+    opacity: f32,
+) {
+    let (x0, y0, x1, y1) = tip.bbox(cx, cy);
+    for y in y0..y1 {
+        for x in x0..x1 {
+            if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
+                continue;
+            }
+            let d = ((x as f32 + 0.5 - cx).powi(2) + (y as f32 + 0.5 - cy).powi(2)).sqrt();
+            let cov = tip.falloff(d) * opacity;
+            if cov <= 0.0 {
+                continue;
+            }
+            let i = (y as u32 * width + x as u32) as usize;
+            let cur = data[i] as f32;
+            data[i] = (cur + (value as f32 - cur) * cov).round() as u8;
+        }
+    }
+}
+
+/// Flood a channel buffer from (x, y): contiguous pixels within
+/// `tolerance` of the start value are set to `value`. The Paint
+/// Bucket on a channel target.
+pub fn flood_channel(
+    data: &mut [u8],
+    width: u32,
+    height: u32,
+    x: i32,
+    y: i32,
+    value: u8,
+    tolerance: u8,
+) {
+    if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
+        return;
+    }
+    let w = width as i32;
+    let start = data[(y * w + x) as usize] as i32;
+    let tol = tolerance as i32;
+    let mut seen = vec![false; data.len()];
+    let mut stack = vec![(x, y)];
+    while let Some((cx, cy)) = stack.pop() {
+        let i = (cy * w + cx) as usize;
+        if seen[i] {
+            continue;
+        }
+        seen[i] = true;
+        if (data[i] as i32 - start).abs() > tol {
+            continue;
+        }
+        data[i] = value;
+        for (nx, ny) in [(cx + 1, cy), (cx - 1, cy), (cx, cy + 1), (cx, cy - 1)] {
+            if nx >= 0 && ny >= 0 && nx < w && ny < height as i32 {
+                stack.push((nx, ny));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

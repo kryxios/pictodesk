@@ -248,11 +248,12 @@ impl Selection {
                 if self.value(x, y) < 128 {
                     continue;
                 }
-                let edge = [(x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)]
-                    .iter()
-                    .any(|&(nx, ny)| {
-                        nx < 0 || ny < 0 || nx >= w || ny >= h || self.value(nx, ny) < 128
-                    });
+                let edge =
+                    [(x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1)]
+                        .iter()
+                        .any(|&(nx, ny)| {
+                            nx < 0 || ny < 0 || nx >= w || ny >= h || self.value(nx, ny) < 128
+                        });
                 if edge {
                     stack.push((x, y));
                 }

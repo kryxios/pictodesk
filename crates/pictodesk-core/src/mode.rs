@@ -59,7 +59,9 @@ mod tests {
         let (r, g, b, _) = clipped.to_f32s();
         let (c, m, y, k) = rgb_to_cmyk(r, g, b);
         let back = cmyk_to_rgb(c, m, y, k);
-        assert!((back.0 - r).abs() < 0.002 && (back.1 - g).abs() < 0.002 && (back.2 - b).abs() < 0.002);
+        assert!(
+            (back.0 - r).abs() < 0.002 && (back.1 - g).abs() < 0.002 && (back.2 - b).abs() < 0.002
+        );
         // An in-gamut gray-blue survives almost unchanged.
         let kept = doc.render_pixel(3, 0).to_rgba8();
         assert!((kept.0 as i32 - 120).abs() <= 2 && (kept.2 as i32 - 140).abs() <= 2);

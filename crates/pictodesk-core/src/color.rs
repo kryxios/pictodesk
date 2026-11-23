@@ -155,6 +155,27 @@ impl WorkingSpace {
     }
 }
 
+/// RGB -> CMYK (each component 0.0..=1.0), simple undercolor removal:
+/// K is the full common black, CMY are what remains — the classic
+/// conversion every early-90s editor shipped.
+pub fn rgb_to_cmyk(r: f32, g: f32, b: f32) -> (f32, f32, f32, f32) {
+    let k = 1.0 - r.max(g).max(b);
+    if k >= 0.99999 {
+        return (0.0, 0.0, 0.0, 1.0);
+    }
+    let d = 1.0 - k;
+    ((1.0 - r - k) / d, (1.0 - g - k) / d, (1.0 - b - k) / d, k)
+}
+
+/// CMYK -> RGB, the exact inverse of the forward formulas.
+pub fn cmyk_to_rgb(c: f32, m: f32, y: f32, k: f32) -> (f32, f32, f32) {
+    (
+        (1.0 - c) * (1.0 - k),
+        (1.0 - m) * (1.0 - k),
+        (1.0 - y) * (1.0 - k),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,30 +229,4 @@ mod tests {
         let back = m.inverse().mul_vec(v);
         assert!(close(back.0, 0.2, 1e-5) && close(back.1, 0.3, 1e-5) && close(back.2, 0.4, 1e-5));
     }
-}
-
-/// RGB -> CMYK (each component 0.0..=1.0), simple undercolor removal:
-/// K is the full common black, CMY are what remains — the classic
-/// conversion every early-90s editor shipped.
-pub fn rgb_to_cmyk(r: f32, g: f32, b: f32) -> (f32, f32, f32, f32) {
-    let k = 1.0 - r.max(g).max(b);
-    if k >= 0.99999 {
-        return (0.0, 0.0, 0.0, 1.0);
-    }
-    let d = 1.0 - k;
-    (
-        (1.0 - r - k) / d,
-        (1.0 - g - k) / d,
-        (1.0 - b - k) / d,
-        k,
-    )
-}
-
-/// CMYK -> RGB, the exact inverse of the forward formulas.
-pub fn cmyk_to_rgb(c: f32, m: f32, y: f32, k: f32) -> (f32, f32, f32) {
-    (
-        (1.0 - c) * (1.0 - k),
-        (1.0 - m) * (1.0 - k),
-        (1.0 - y) * (1.0 - k),
-    )
 }

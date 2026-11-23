@@ -20,11 +20,13 @@ use std::sync::Arc;
 
 use pictodesk_core::adjust;
 use pictodesk_core::brush::{self, BrushTip};
+use pictodesk_core::document::{AlphaChannel, ColorMode};
 use pictodesk_core::filter;
 use pictodesk_core::format;
 use pictodesk_core::histogram::Histogram;
 use pictodesk_core::history::{run_tile_edit, DocumentCommand, MoveLayerCommand, TileEditCommand};
 use pictodesk_core::io::{self, ExportFormat};
+use pictodesk_core::path::{Anchor, Path as BezPath, Subpath};
 use pictodesk_core::selection::Selection;
 use pictodesk_core::transform;
 use pictodesk_core::{Document, History, Pixel16};
@@ -48,6 +50,7 @@ enum Tool {
     Pencil,
     Eraser,
     Stamp,
+    Pen,
     Bucket,
     Gradient,
     Blur,
@@ -70,6 +73,7 @@ impl Tool {
             Tool::Pencil => "Pencil",
             Tool::Eraser => "Eraser",
             Tool::Stamp => "Clone Stamp",
+            Tool::Pen => "Pen",
             Tool::Bucket => "Paint Bucket",
             Tool::Gradient => "Gradient",
             Tool::Blur => "Blur",
@@ -87,9 +91,10 @@ impl Tool {
             Tool::Hand => 'h',
             Tool::Zoom => 'z',
             Tool::Brush => 'b',
-            Tool::Pencil => 'p',
+            Tool::Pencil => 'b',
             Tool::Eraser => 'e',
             Tool::Stamp => 's',
+            Tool::Pen => 'p',
             Tool::Bucket => 'k',
             Tool::Gradient => 'g',
             Tool::Blur | Tool::Sharpen | Tool::Smudge => 'r',
@@ -98,12 +103,13 @@ impl Tool {
 }
 
 /// Toolbox order, two columns, classic grouping.
-const TOOLS: [Tool; 17] = [
+const TOOLS: [Tool; 18] = [
     Tool::Move,
     Tool::MarqueeRect,
     Tool::MarqueeEllipse,
     Tool::Lasso,
     Tool::Wand,
+    Tool::Pen,
     Tool::Eyedropper,
     Tool::Brush,
     Tool::Pencil,
@@ -117,6 +123,16 @@ const TOOLS: [Tool; 17] = [
     Tool::Hand,
     Tool::Zoom,
 ];
+
+pub const DOCK_W: i32 = 216;
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum PanelKind {
+    Cp,
+    Brushes,
+    Histogram,
+    Color,
+}
 
 // ---------------------------------------------------------------- actions
 
@@ -144,7 +160,9 @@ enum Action {
     FlipHorizontal,
     FlipVertical,
     AdjustDialog(&'static str),
+    ModeRgb,
     ModeGrayscale,
+    ModeCmyk,
     FilterGaussian,
     FilterSharpen,
     FilterUnsharp,
@@ -153,8 +171,15 @@ enum Action {
     SelectNone,
     SelectInverse,
     FeatherDialog,
+    SelectGrow,
+    SelectSimilar,
+    SaveSelection,
+    LoadSelection(usize),
     ToggleHistogram,
     ToggleBrushes,
+    ToggleChannels,
+    TogglePaths,
+    ToggleColor,
     ToggleRulers,
     ZoomIn,
     ZoomOut,
@@ -192,14 +217,6 @@ impl MenuItem {
             submenu: None,
             shortcut: None,
         }
-    }
-    fn off(mut self) -> Self {
-        self.enabled = false;
-        self
-    }
-    fn check(mut self) -> Self {
-        self.checked = true;
-        self
     }
     /// Attach a keyboard shortcut (single key name, e.g. "Z"); the
     /// menu shows it with the platform's command modifier.
@@ -239,6 +256,9 @@ enum DialogKind {
     Fill,
     NewDoc,
     SaveAs,
+    GrowSel,
+    SimilarSel,
+    SavePath,
 }
 
 impl DialogKind {
@@ -260,6 +280,9 @@ impl DialogKind {
             DialogKind::Fill => "Fill",
             DialogKind::NewDoc => "New Image",
             DialogKind::SaveAs => "Save As",
+            DialogKind::GrowSel => "Grow Selection",
+            DialogKind::SimilarSel => "Select Similar",
+            DialogKind::SavePath => "Save Path",
         }
     }
     /// Pixel dialogs preview live through a tile-snapshot command.
@@ -318,6 +341,8 @@ impl Dialog {
                 vec![doc.width as f32, doc.height as f32]
             }
             DialogKind::Feather => vec![5.0],
+            DialogKind::GrowSel | DialogKind::SimilarSel => vec![32.0],
+            DialogKind::SavePath => vec![],
             DialogKind::Fill => vec![100.0],
             DialogKind::SaveAs => vec![],
         };
@@ -373,7 +398,8 @@ impl Dialog {
             }
             DialogKind::Feather => vec![("Radius", 0.0, 250.0)],
             DialogKind::Fill => vec![("Opacity", 0.0, 100.0)],
-            DialogKind::Curves | DialogKind::SaveAs => vec![],
+            DialogKind::Curves | DialogKind::SaveAs | DialogKind::SavePath => vec![],
+            DialogKind::GrowSel | DialogKind::SimilarSel => vec![("Tolerance", 0.0, 255.0)],
         }
     }
 
@@ -401,6 +427,8 @@ enum DragMode {
     GradientLine,
     MoveLayer,
     MenuNav,
+    PenNew,
+    PenDrag,
 }
 
 struct StrokeState {
@@ -409,6 +437,29 @@ struct StrokeState {
     last_point: (f32, f32),
     smudge_carry: Pixel16,
     tiles_seen: Vec<(i32, i32)>,
+}
+
+/// What the canvas is showing: the composite, one color channel,
+/// or one alpha/spot channel (as grayscale, or tinted for spot).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ChannelView {
+    Composite,
+    Channel(usize), // index into the mode's channel list (R,G,B / C,M,Y,K / Gray)
+    Alpha(usize),
+}
+
+/// Where painting lands: the image itself, or one alpha channel.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum PaintTarget {
+    Image,
+    Alpha(usize),
+}
+
+/// A path identity: the unsaved work path or a saved path by index.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum PathRef {
+    Work,
+    Saved(usize),
 }
 
 struct App {
@@ -439,6 +490,15 @@ struct App {
     show_brushes: bool,
     show_rulers: bool,
     show_palette: bool,
+    show_cp: bool,
+    cp_tab: usize, // 0 = Channels, 1 = Paths
+    channel_view: ChannelView,
+    paint_target: PaintTarget,
+    active_path: Option<PathRef>,
+    pen_hit: Option<(usize, usize, u8)>, // subpath, anchor, part (0 point, 1 in, 2 out)
+    pen_anchor: Option<(usize, usize)>,
+    alpha_cmd: Option<DocumentCommand>,
+    alpha_last: (f32, f32),
     file_panel: Option<Vec<PathBuf>>,
     // interaction
     cursor: (f32, f32),
@@ -496,6 +556,15 @@ impl App {
             show_brushes: false,
             show_rulers: true,
             show_palette: false,
+            show_cp: false,
+            cp_tab: 0,
+            channel_view: ChannelView::Composite,
+            paint_target: PaintTarget::Image,
+            active_path: None,
+            pen_hit: None,
+            pen_anchor: None,
+            alpha_cmd: None,
+            alpha_last: (0.0, 0.0),
             file_panel: None,
             cursor: (0.0, 0.0),
             mouse_down: false,
@@ -531,12 +600,77 @@ impl App {
         } else {
             (0, 0)
         };
+        let dock = if self.dock_open() { DOCK_W } else { 0 };
         Rect::new(
             ui::TOOLBAR_W + rx,
             ui::MENU_H + ry,
-            (win_w as i32 - ui::TOOLBAR_W - rx).max(10),
+            (win_w as i32 - ui::TOOLBAR_W - rx - dock).max(10),
             (win_h as i32 - ui::MENU_H - ui::STATUS_H - ry).max(10),
         )
+    }
+
+    fn dock_open(&self) -> bool {
+        self.show_cp || self.show_brushes || self.show_histogram || self.show_palette
+    }
+
+    fn channel_row_count(&self) -> usize {
+        let base = match self.doc.mode {
+            ColorMode::Rgb => 3,
+            ColorMode::Cmyk => 4,
+            ColorMode::Grayscale => 1,
+        };
+        1 + base + self.doc.alphas.len()
+    }
+
+    fn path_row_count(&self) -> usize {
+        (if self.doc.work_path.is_some() { 1 } else { 0 }) + self.doc.paths.len()
+    }
+
+    /// The dock's panel groups, stacked top-down on the right edge.
+    fn panel_groups(&self) -> Vec<(PanelKind, Rect)> {
+        let mut out = Vec::new();
+        if !self.dock_open() {
+            return out;
+        }
+        let x = self.win_size.0 as i32 - DOCK_W;
+        let bottom = self.win_size.1 as i32 - ui::STATUS_H;
+        let mut y = ui::MENU_H;
+        let place = |kind: PanelKind, h: i32, out: &mut Vec<(PanelKind, Rect)>, y: &mut i32| {
+            if *y + h <= bottom {
+                out.push((kind, Rect::new(x, *y, DOCK_W, h)));
+                *y += h + 2;
+            }
+        };
+        if self.show_cp {
+            let (rows, btn_h) = if self.cp_tab == 0 {
+                (self.channel_row_count(), 22)
+            } else {
+                (self.path_row_count().max(1), 42)
+            };
+            place(
+                PanelKind::Cp,
+                20 + rows as i32 * 15 + btn_h,
+                &mut out,
+                &mut y,
+            );
+        }
+        if self.show_brushes {
+            place(PanelKind::Brushes, 84, &mut out, &mut y);
+        }
+        if self.show_histogram {
+            place(PanelKind::Histogram, 132, &mut out, &mut y);
+        }
+        if self.show_palette {
+            place(PanelKind::Color, 168, &mut out, &mut y);
+        }
+        out
+    }
+
+    fn group_rect(&self, kind: PanelKind) -> Option<Rect> {
+        self.panel_groups()
+            .into_iter()
+            .find(|(k, _)| *k == kind)
+            .map(|(_, r)| r)
     }
 
     fn fit_view(&mut self, win_w: u32, win_h: u32) {
@@ -641,9 +775,12 @@ impl App {
             Menu {
                 title: "Mode",
                 items: vec![
-                    MenuItem::new("RGB Color", Action::None).check(),
-                    MenuItem::new("Grayscale", Action::ModeGrayscale),
-                    MenuItem::new("CMYK Color (Phase 2)", Action::None).off(),
+                    MenuItem::new("RGB Color", Action::ModeRgb)
+                        .check_if(self.doc.mode == ColorMode::Rgb),
+                    MenuItem::new("Grayscale", Action::ModeGrayscale)
+                        .check_if(self.doc.mode == ColorMode::Grayscale),
+                    MenuItem::new("CMYK Color", Action::ModeCmyk)
+                        .check_if(self.doc.mode == ColorMode::Cmyk),
                 ],
             },
             Menu {
@@ -657,12 +794,30 @@ impl App {
             },
             Menu {
                 title: "Select",
-                items: vec![
-                    MenuItem::new("All", Action::SelectAll).key("A"),
-                    MenuItem::new("None", Action::SelectNone).key("D"),
-                    MenuItem::new("Inverse", Action::SelectInverse).off_if(!has_sel),
-                    MenuItem::new("Feather...", Action::FeatherDialog).off_if(!has_sel),
-                ],
+                items: {
+                    let mut items = vec![
+                        MenuItem::new("All", Action::SelectAll).key("A"),
+                        MenuItem::new("None", Action::SelectNone).key("D"),
+                        MenuItem::new("Inverse", Action::SelectInverse).off_if(!has_sel),
+                        MenuItem::new("Feather...", Action::FeatherDialog).off_if(!has_sel),
+                        MenuItem::new("Grow...", Action::SelectGrow).off_if(!has_sel),
+                        MenuItem::new("Similar...", Action::SelectSimilar).off_if(!has_sel),
+                        MenuItem::new("Save Selection", Action::SaveSelection).off_if(!has_sel),
+                    ];
+                    let load_items: Vec<MenuItem> = self
+                        .doc
+                        .alphas
+                        .iter()
+                        .enumerate()
+                        .map(|(i, ch)| MenuItem::new(ch.name.clone(), Action::LoadSelection(i)))
+                        .collect();
+                    items.push(
+                        MenuItem::new("Load Selection", Action::None)
+                            .off_if(load_items.is_empty())
+                            .sub(load_items),
+                    );
+                    items
+                },
             },
             Menu {
                 title: "Window",
@@ -670,6 +825,11 @@ impl App {
                     MenuItem::new("Histogram", Action::ToggleHistogram)
                         .check_if(self.show_histogram),
                     MenuItem::new("Brushes", Action::ToggleBrushes).check_if(self.show_brushes),
+                    MenuItem::new("Channels", Action::ToggleChannels)
+                        .check_if(self.show_cp && self.cp_tab == 0),
+                    MenuItem::new("Paths", Action::TogglePaths)
+                        .check_if(self.show_cp && self.cp_tab == 1),
+                    MenuItem::new("Color", Action::ToggleColor).check_if(self.show_palette),
                     MenuItem::new("Rulers", Action::ToggleRulers).check_if(self.show_rulers),
                     MenuItem::new("Zoom In", Action::ZoomIn).key("+"),
                     MenuItem::new("Zoom Out", Action::ZoomOut).key("-"),
@@ -711,8 +871,6 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-// ---------------------------------------------------------------- actions
-
 use pictodesk_core::history::Command as _;
 
 impl App {
@@ -741,6 +899,13 @@ impl App {
                 self.hist.set_limit(Some(1));
                 self.last_label = None;
                 self.sel = None;
+                self.channel_view = ChannelView::Composite;
+                self.paint_target = PaintTarget::Image;
+                self.active_path = if self.doc.work_path.is_some() {
+                    Some(PathRef::Work)
+                } else {
+                    None
+                };
                 self.file_path = Some(path.to_path_buf());
                 self.dirty = false;
                 self.doc_version += 1;
@@ -970,21 +1135,66 @@ impl App {
                 "threshold" => self.open_dialog(DialogKind::Threshold),
                 _ => {}
             },
+            Action::ModeRgb => {
+                self.structural("RGB Color", |d| {
+                    pictodesk_core::mode::convert_mode(d, ColorMode::Rgb)
+                });
+                self.channel_view = ChannelView::Composite;
+            }
+            Action::ModeCmyk => {
+                self.structural("CMYK Color", |d| {
+                    pictodesk_core::mode::convert_mode(d, ColorMode::Cmyk)
+                });
+                self.channel_view = ChannelView::Composite;
+            }
             Action::ModeGrayscale => {
-                let tiles = self.sel_tiles();
-                run_tile_edit(
-                    &mut self.doc,
-                    &mut self.hist,
-                    "Grayscale",
-                    layer,
-                    &tiles,
-                    |d| {
-                        adjust::desaturate(d, layer, None);
-                    },
-                );
-                self.last_label = Some("Grayscale".into());
-                self.status = "Mode: Grayscale (desaturated)".into();
-                self.touch();
+                self.structural("Grayscale", |d| {
+                    pictodesk_core::mode::convert_mode(d, ColorMode::Grayscale)
+                });
+                self.channel_view = ChannelView::Composite;
+            }
+            Action::SelectGrow => {
+                self.dialog = Some(Dialog::new(DialogKind::GrowSel, &self.doc));
+            }
+            Action::SelectSimilar => {
+                self.dialog = Some(Dialog::new(DialogKind::SimilarSel, &self.doc));
+            }
+            Action::SaveSelection => {
+                if let Some(sel) = &self.sel {
+                    let idx = self.doc.save_selection_as_channel(sel);
+                    self.status = format!("Selection saved as {}", self.doc.alphas[idx].name);
+                    self.show_cp = true;
+                    self.cp_tab = 0;
+                    self.touch();
+                }
+            }
+            Action::LoadSelection(i) => {
+                if let Some(sel) = self.doc.channel_as_selection(i) {
+                    self.sel = Some(sel);
+                    self.status = format!("Loaded {}", self.doc.alphas[i].name);
+                }
+            }
+            Action::ToggleChannels => {
+                if self.show_cp && self.cp_tab == 0 {
+                    self.show_cp = false;
+                } else {
+                    self.show_cp = true;
+                    self.cp_tab = 0;
+                }
+                self.fit_view(self.win_size.0, self.win_size.1);
+            }
+            Action::TogglePaths => {
+                if self.show_cp && self.cp_tab == 1 {
+                    self.show_cp = false;
+                } else {
+                    self.show_cp = true;
+                    self.cp_tab = 1;
+                }
+                self.fit_view(self.win_size.0, self.win_size.1);
+            }
+            Action::ToggleColor => {
+                self.show_palette = !self.show_palette;
+                self.fit_view(self.win_size.0, self.win_size.1);
             }
             Action::FilterGaussian => self.open_dialog(DialogKind::GaussianBlur),
             Action::FilterUnsharp => self.open_dialog(DialogKind::Unsharp),
@@ -1023,8 +1233,14 @@ impl App {
             Action::FeatherDialog => {
                 self.dialog = Some(Dialog::new(DialogKind::Feather, &self.doc));
             }
-            Action::ToggleHistogram => self.show_histogram = !self.show_histogram,
-            Action::ToggleBrushes => self.show_brushes = !self.show_brushes,
+            Action::ToggleHistogram => {
+                self.show_histogram = !self.show_histogram;
+                self.fit_view(self.win_size.0, self.win_size.1);
+            }
+            Action::ToggleBrushes => {
+                self.show_brushes = !self.show_brushes;
+                self.fit_view(self.win_size.0, self.win_size.1);
+            }
             Action::ToggleRulers => {
                 self.show_rulers = !self.show_rulers;
                 self.fit_view(self.win_size.0, self.win_size.1);
@@ -1052,6 +1268,24 @@ impl App {
     }
 
     fn clear_selection(&mut self) {
+        if let PaintTarget::Alpha(a) = self.paint_target {
+            let sel = self
+                .sel
+                .clone()
+                .unwrap_or_else(|| Selection::all(self.doc.width, self.doc.height));
+            self.structural("Clear", |d| {
+                if let Some(ch) = d.alphas.get_mut(a) {
+                    for idx in 0..ch.data.len() {
+                        let m = sel.raw_mask()[idx];
+                        if m > 0 {
+                            let cur = ch.data[idx] as u32;
+                            ch.data[idx] = (cur * (255 - m as u32) / 255) as u8;
+                        }
+                    }
+                }
+            });
+            return;
+        }
         let layer = self.doc.active_layer;
         if let Some(sel) = self.sel.clone() {
             if let Some((x, y, w, h)) = sel.bounds() {
@@ -1206,7 +1440,28 @@ impl App {
                 }
             }
             DialogKind::Fill => {
-                if let Some(sel) = self
+                if let PaintTarget::Alpha(a) = self.paint_target {
+                    let sel = self
+                        .sel
+                        .clone()
+                        .unwrap_or_else(|| Selection::all(self.doc.width, self.doc.height));
+                    let src = if d.fill_bg { self.bg } else { self.fg };
+                    let (r, g, b, _) = src.to_rgba8();
+                    let v = ((r as u32 * 77 + g as u32 * 150 + b as u32 * 29) / 256) as u8;
+                    let op = d.vals[0] / 100.0;
+                    self.structural("Fill", |doc| {
+                        if let Some(ch) = doc.alphas.get_mut(a) {
+                            for idx in 0..ch.data.len() {
+                                let m = sel.raw_mask()[idx] as f32 / 255.0 * op;
+                                if m > 0.0 {
+                                    let cur = ch.data[idx] as f32;
+                                    ch.data[idx] = (cur + (v as f32 - cur) * m).round() as u8;
+                                }
+                            }
+                        }
+                    });
+                    self.last_label = Some("Fill".into());
+                } else if let Some(sel) = self
                     .sel
                     .clone()
                     .or_else(|| Some(Selection::all(self.doc.width, self.doc.height)))
@@ -1239,6 +1494,9 @@ impl App {
                 let mut doc = Document::new(w, h);
                 doc.layers[0].fill_rect(0, 0, w, h, self.bg);
                 self.doc = doc;
+                self.channel_view = ChannelView::Composite;
+                self.paint_target = PaintTarget::Image;
+                self.active_path = None;
                 self.hist = History::new();
                 self.hist.set_limit(Some(1));
                 self.last_label = None;
@@ -1252,6 +1510,34 @@ impl App {
             DialogKind::SaveAs => {
                 let path = PathBuf::from(d.text.trim());
                 self.save_to(&path);
+            }
+            DialogKind::GrowSel | DialogKind::SimilarSel => {
+                if let Some(sel) = self.sel.clone() {
+                    self.ensure_render_cache();
+                    let img = self.cached_render.clone();
+                    let tol = d.vals[0].round().clamp(0.0, 255.0) as u8;
+                    let (new_sel, label) = if d.kind == DialogKind::GrowSel {
+                        (sel.grow(&img, tol), "Grow Selection")
+                    } else {
+                        (sel.similar(&img, tol), "Select Similar")
+                    };
+                    self.sel = Some(new_sel);
+                    self.status = format!("{label} (tolerance {tol})");
+                }
+            }
+            DialogKind::SavePath => {
+                if let Some(mut wp) = self.doc.work_path.take() {
+                    let name = d.text.trim().to_string();
+                    wp.name = if name.is_empty() {
+                        format!("Path {}", self.doc.paths.len() + 1)
+                    } else {
+                        name
+                    };
+                    self.doc.paths.push(wp);
+                    self.active_path = Some(PathRef::Saved(self.doc.paths.len() - 1));
+                    self.status = format!("Saved path '{}'", self.doc.paths.last().unwrap().name);
+                    self.touch();
+                }
             }
             _ => {}
         }
@@ -1411,6 +1697,17 @@ impl App {
             self.draw_rulers(f);
         }
         self.draw_toolbox(f);
+        if self.dock_open() {
+            f.fill_rect(
+                Rect::new(
+                    f.w as i32 - DOCK_W,
+                    ui::MENU_H,
+                    DOCK_W,
+                    f.h as i32 - ui::MENU_H - ui::STATUS_H,
+                ),
+                ui::PLATINUM,
+            );
+        }
         if self.show_palette {
             self.draw_palette(f);
         }
@@ -1419,6 +1716,9 @@ impl App {
         }
         if self.show_histogram {
             self.draw_histogram_panel(f);
+        }
+        if self.show_cp {
+            self.draw_channels_paths(f);
         }
         self.draw_menu_bar(f);
         self.draw_status(f);
@@ -1449,7 +1749,7 @@ impl App {
         let top = Rect::new(
             ui::TOOLBAR_W,
             ui::MENU_H,
-            f.w as i32 - ui::TOOLBAR_W,
+            c.right() - ui::TOOLBAR_W,
             ui::RULER_H,
         );
         let left = Rect::new(
@@ -1468,7 +1768,7 @@ impl App {
             Rect::new(
                 ui::TOOLBAR_W,
                 ui::MENU_H + ui::RULER_H - 1,
-                f.w as i32 - ui::TOOLBAR_W,
+                c.right() - ui::TOOLBAR_W,
                 1,
             ),
             ui::DARK,
@@ -1540,6 +1840,45 @@ impl App {
         }
     }
 
+    /// The on-screen color for one document pixel when a single
+    /// channel is being viewed (grayscale, or tinted for spot).
+    fn view_pixel(&self, dx: i32, dy: i32, r: u8, g: u8, b: u8) -> (u8, u8, u8) {
+        match self.channel_view {
+            ChannelView::Composite => (r, g, b),
+            ChannelView::Channel(ci) => {
+                let v = match self.doc.mode {
+                    ColorMode::Rgb => [r, g, b][ci.min(2)],
+                    ColorMode::Grayscale => {
+                        (0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32) as u8
+                    }
+                    ColorMode::Cmyk => {
+                        let (c, m, y, k) = pictodesk_core::color::rgb_to_cmyk(
+                            r as f32 / 255.0,
+                            g as f32 / 255.0,
+                            b as f32 / 255.0,
+                        );
+                        (255.0 - [c, m, y, k][ci.min(3)] * 255.0) as u8
+                    }
+                };
+                (v, v, v)
+            }
+            ChannelView::Alpha(ai) => {
+                let Some(ch) = self.doc.alphas.get(ai) else {
+                    return (r, g, b);
+                };
+                let v = ch.value(self.doc.width, dx, dy);
+                match ch.spot_color {
+                    Some((sr, sg, sb)) => (
+                        255 - ((255 - sr) as u32 * v as u32 / 255) as u8,
+                        255 - ((255 - sg) as u32 * v as u32 / 255) as u8,
+                        255 - ((255 - sb) as u32 * v as u32 / 255) as u8,
+                    ),
+                    None => (v, v, v),
+                }
+            }
+        }
+    }
+
     fn draw_canvas(&mut self, f: &mut Frame) {
         self.ensure_render_cache();
         let c = self.canvas_rect(f.w, f.h);
@@ -1572,6 +1911,11 @@ impl App {
                     self.cached_render[i + 2],
                     self.cached_render[i + 3],
                 );
+                if self.channel_view != ChannelView::Composite {
+                    let v = self.view_pixel(dx, dy, r, g, b);
+                    f.set(sx, sy, v);
+                    continue;
+                }
                 if a == 255 {
                     f.set(sx, sy, (r, g, b));
                 } else {
@@ -1655,6 +1999,44 @@ impl App {
             }
             _ => {}
         }
+        // path overlay: the active path (work or selected saved path)
+        if let Some((_, path)) = self.active_path_clone() {
+            let to_scr = |p: (f32, f32)| {
+                let s = self.viewport.doc_to_screen(p);
+                (c.x + s.0 as i32, c.y + s.1 as i32)
+            };
+            let ink = (50, 50, 190);
+            for sub in &path.subpaths {
+                let pts = sub.flatten();
+                for w in pts.windows(2) {
+                    let a = to_scr(w[0]);
+                    let b = to_scr(w[1]);
+                    f.line(a.0, a.1, b.0, b.1, ink);
+                }
+                if sub.closed && pts.len() > 2 {
+                    let a = to_scr(*pts.last().unwrap());
+                    let b = to_scr(pts[0]);
+                    f.line(a.0, a.1, b.0, b.1, ink);
+                }
+            }
+            if self.tool == Tool::Pen {
+                for (si, sub) in path.subpaths.iter().enumerate() {
+                    for (ai, a) in sub.anchors.iter().enumerate() {
+                        let pnt = to_scr(a.point);
+                        if self.pen_anchor == Some((si, ai)) && !a.is_corner() {
+                            let ic = to_scr(a.in_ctrl);
+                            let oc = to_scr(a.out_ctrl);
+                            f.line(pnt.0, pnt.1, ic.0, ic.1, ui::SHADOW);
+                            f.line(pnt.0, pnt.1, oc.0, oc.1, ui::SHADOW);
+                            f.fill_rect(Rect::new(ic.0 - 2, ic.1 - 2, 4, 4), ink);
+                            f.fill_rect(Rect::new(oc.0 - 2, oc.1 - 2, 4, 4), ink);
+                        }
+                        f.fill_rect(Rect::new(pnt.0 - 3, pnt.1 - 3, 6, 6), ui::WHITE);
+                        f.outline_rect(Rect::new(pnt.0 - 3, pnt.1 - 3, 6, 6), ink);
+                    }
+                }
+            }
+        }
         // brush cursor ring
         if matches!(
             self.tool,
@@ -1731,9 +2113,11 @@ impl App {
     }
 
     fn draw_palette(&mut self, f: &mut Frame) {
-        let r = Rect::new(ui::TOOLBAR_W + 6, ui::MENU_H + 8, 8 * 17 + 10, 8 * 17 + 24);
+        let Some(r) = self.group_rect(PanelKind::Color) else {
+            return;
+        };
         f.panel(r);
-        f.text(r.x + 6, r.y + 5, "Color Picker", 1, ui::BLACK);
+        f.text(r.x + 6, r.y + 5, "Color", 1, ui::BLACK);
         for (i, c) in ui::PALETTE.iter().enumerate() {
             let cell = Rect::new(
                 r.x + 5 + (i % 8) as i32 * 17,
@@ -1746,8 +2130,10 @@ impl App {
         }
     }
 
-    fn palette_cell_rect(i: usize) -> Rect {
-        let r = Rect::new(ui::TOOLBAR_W + 6, ui::MENU_H + 8, 0, 0);
+    fn palette_cell_rect(&self, i: usize) -> Rect {
+        let r = self
+            .group_rect(PanelKind::Color)
+            .unwrap_or(Rect::new(0, 0, 0, 0));
         Rect::new(
             r.x + 5 + (i % 8) as i32 * 17,
             r.y + 18 + (i / 8) as i32 * 17,
@@ -1757,7 +2143,9 @@ impl App {
     }
 
     fn draw_brushes(&mut self, f: &mut Frame) {
-        let r = Rect::new(ui::TOOLBAR_W + 6, ui::MENU_H + 8, 264, 76);
+        let Some(r) = self.group_rect(PanelKind::Brushes) else {
+            return;
+        };
         f.panel(r);
         f.text(r.x + 6, r.y + 5, "Brushes", 1, ui::BLACK);
         f.text(
@@ -1770,9 +2158,9 @@ impl App {
         let sizes = [1.0f32, 3.0, 5.0, 9.0, 13.0, 21.0, 35.0, 50.0];
         for (row, hardness) in [(0, 1.0f32), (1, 0.0f32)] {
             for (i, s) in sizes.iter().enumerate() {
-                let cx = r.x + 18 + i as i32 * 31;
-                let cy = r.y + 26 + row * 26;
-                let rad = (s / 2.0).min(10.0) as i32;
+                let cx = r.x + 16 + i as i32 * 23;
+                let cy = r.y + 30 + row * 26;
+                let rad = (s / 2.0).min(8.0) as i32;
                 let col = if hardness == 1.0 {
                     ui::BLACK
                 } else {
@@ -1786,20 +2174,24 @@ impl App {
                     }
                 }
                 if (self.tip.size - s).abs() < 0.1 && (self.tip.hardness - hardness).abs() < 0.1 {
-                    f.outline_rect(Rect::new(cx - 12, cy - 12, 24, 24), ui::BLACK);
+                    f.outline_rect(Rect::new(cx - 10, cy - 10, 20, 20), ui::BLACK);
                 }
             }
         }
     }
 
     fn brushes_cell(&self, i: usize, row: usize) -> Rect {
-        let r = Rect::new(ui::TOOLBAR_W + 6, ui::MENU_H + 8, 0, 0);
-        Rect::new(r.x + 6 + i as i32 * 31, r.y + 14 + row as i32 * 26, 24, 24)
+        let r = self
+            .group_rect(PanelKind::Brushes)
+            .unwrap_or(Rect::new(0, 0, 0, 0));
+        Rect::new(r.x + 5 + i as i32 * 23, r.y + 19 + row as i32 * 26, 22, 22)
     }
 
     fn draw_histogram_panel(&mut self, f: &mut Frame) {
         self.ensure_render_cache();
-        let r = Rect::new(f.w as i32 - 252, ui::MENU_H + 8, 244, 128);
+        let Some(r) = self.group_rect(PanelKind::Histogram) else {
+            return;
+        };
         f.panel(r);
         f.text(r.x + 6, r.y + 5, "Histogram", 1, ui::BLACK);
         let mut lum = [0u32; 256];
@@ -1808,14 +2200,14 @@ impl App {
             lum[l.min(255)] += 1;
         }
         let peak = lum.iter().max().copied().unwrap_or(1).max(1);
-        let graph = Rect::new(r.x + 8, r.y + 18, 228, 84);
+        let graph = Rect::new(r.x + 8, r.y + 18, r.w - 16, 84);
         f.fill_rect(graph, ui::WHITE);
         f.bevel_sunken(graph);
-        for i in 0..228 {
-            let bin = lum[i * 256 / 228];
+        for i in 0..(r.w - 16) {
+            let bin = lum[i as usize * 256 / (r.w - 16) as usize];
             let hgt = ((bin as f32 / peak as f32).sqrt() * graph.h as f32) as i32;
             f.fill_rect(
-                Rect::new(graph.x + i as i32, graph.bottom() - hgt, 1, hgt),
+                Rect::new(graph.x + i, graph.bottom() - hgt, 1, hgt),
                 ui::BLACK,
             );
         }
@@ -1831,6 +2223,496 @@ impl App {
             1,
             ui::BLACK,
         );
+    }
+
+    // ------------------------------------------------------------ dock panels
+
+    fn channel_rows(&self) -> Vec<(String, ChannelView)> {
+        let mut rows = Vec::new();
+        let comp = match self.doc.mode {
+            ColorMode::Rgb => "RGB",
+            ColorMode::Cmyk => "CMYK",
+            ColorMode::Grayscale => "Gray",
+        };
+        rows.push((comp.to_string(), ChannelView::Composite));
+        let names: &[&str] = match self.doc.mode {
+            ColorMode::Rgb => &["Red", "Green", "Blue"],
+            ColorMode::Cmyk => &["Cyan", "Magenta", "Yellow", "Black"],
+            ColorMode::Grayscale => &["Gray"],
+        };
+        for (i, n) in names.iter().enumerate() {
+            rows.push((n.to_string(), ChannelView::Channel(i)));
+        }
+        for (i, ch) in self.doc.alphas.iter().enumerate() {
+            let mut label = ch.name.clone();
+            if ch.spot_color.is_some() {
+                label += " (spot)";
+            }
+            rows.push((label, ChannelView::Alpha(i)));
+        }
+        rows
+    }
+
+    fn path_rows(&self) -> Vec<(String, PathRef)> {
+        let mut rows = Vec::new();
+        if self.doc.work_path.is_some() {
+            rows.push(("Work Path".to_string(), PathRef::Work));
+        }
+        for (i, p) in self.doc.paths.iter().enumerate() {
+            let mut label = if p.name.is_empty() {
+                format!("Path {}", i + 1)
+            } else {
+                p.name.clone()
+            };
+            if self.doc.clipping_path == Some(i) {
+                label += " (clipping)";
+            }
+            rows.push((label, PathRef::Saved(i)));
+        }
+        rows
+    }
+
+    fn draw_small_button(f: &mut Frame, r: Rect, label: &str, enabled: bool) {
+        f.fill_rect(r, ui::PLATINUM);
+        f.bevel_raised(r);
+        let c = if enabled { ui::BLACK } else { ui::DISABLED };
+        let tw = Frame::text_width(label, 1);
+        f.text(r.x + (r.w - tw) / 2, r.y + 4, label, 1, c);
+    }
+
+    fn draw_channels_paths(&mut self, f: &mut Frame) {
+        let Some(r) = self.group_rect(PanelKind::Cp) else {
+            return;
+        };
+        f.panel(r);
+        for (i, label) in ["Channels", "Paths"].iter().enumerate() {
+            let tr = Self::cp_tab_rect(r, i);
+            if self.cp_tab == i {
+                f.fill_rect(tr, ui::BLACK);
+                f.text(tr.x + 5, tr.y + 3, label, 1, ui::WHITE);
+            } else {
+                f.outline_rect(tr, ui::SHADOW);
+                f.text(tr.x + 5, tr.y + 3, label, 1, ui::BLACK);
+            }
+        }
+        if self.cp_tab == 0 {
+            let rows = self.channel_rows();
+            for (i, (label, view)) in rows.iter().enumerate() {
+                let rr = Rect::new(r.x + 2, r.y + 20 + i as i32 * 15, r.w - 4, 15);
+                let selected = self.channel_view == *view;
+                if selected {
+                    f.fill_rect(rr, ui::BLACK);
+                }
+                let c = if selected { ui::WHITE } else { ui::BLACK };
+                if let ChannelView::Alpha(a) = view {
+                    if self.paint_target == PaintTarget::Alpha(*a) {
+                        f.fill_rect(Rect::new(rr.x + 3, rr.y + 5, 5, 5), c);
+                    }
+                }
+                f.text(rr.x + 13, rr.y + 3, label, 1, c);
+            }
+            let labels = ["Save", "Load", "New", "Del", "Spot"];
+            let bw = (r.w - 8) / 5;
+            for (i, label) in labels.iter().enumerate() {
+                let br = Rect::new(r.x + 4 + i as i32 * bw, r.bottom() - 19, bw - 2, 16);
+                Self::draw_small_button(f, br, label, true);
+            }
+        } else {
+            let rows = self.path_rows();
+            if rows.is_empty() {
+                f.text(r.x + 8, r.y + 24, "No paths yet.", 1, ui::DARK);
+                f.text(r.x + 8, r.y + 36, "Draw with the Pen (P),", 1, ui::DARK);
+                f.text(r.x + 8, r.y + 48, "or Make from a selection.", 1, ui::DARK);
+            }
+            for (i, (label, pref)) in rows.iter().enumerate() {
+                let rr = Rect::new(r.x + 2, r.y + 20 + i as i32 * 15, r.w - 4, 15);
+                let selected = self.active_path == Some(*pref);
+                if selected {
+                    f.fill_rect(rr, ui::BLACK);
+                }
+                let c = if selected { ui::WHITE } else { ui::BLACK };
+                f.text(rr.x + 6, rr.y + 3, label, 1, c);
+            }
+            let row1 = ["Fill", "Stroke", "Select", "Make"];
+            let row2 = ["Save", "Clip", "Del"];
+            let bw = (r.w - 8) / 4;
+            for (i, label) in row1.iter().enumerate() {
+                let br = Rect::new(r.x + 4 + i as i32 * bw, r.bottom() - 39, bw - 2, 16);
+                Self::draw_small_button(f, br, label, true);
+            }
+            let bw2 = (r.w - 8) / 3;
+            for (i, label) in row2.iter().enumerate() {
+                let br = Rect::new(r.x + 4 + i as i32 * bw2, r.bottom() - 19, bw2 - 2, 16);
+                Self::draw_small_button(f, br, label, true);
+            }
+        }
+    }
+
+    fn cp_tab_rect(r: Rect, i: usize) -> Rect {
+        if i == 0 {
+            Rect::new(r.x + 3, r.y + 3, 74, 15)
+        } else {
+            Rect::new(r.x + 81, r.y + 3, 54, 15)
+        }
+    }
+
+    fn channel_button(&mut self, i: usize) {
+        match i {
+            0 => self.do_action(Action::SaveSelection),
+            1 => {
+                if let ChannelView::Alpha(a) = self.channel_view {
+                    self.do_action(Action::LoadSelection(a));
+                } else {
+                    self.status = "Select an alpha channel to load".into();
+                }
+            }
+            2 => {
+                let n = self.doc.alphas.len() + 1;
+                self.doc.alphas.push(AlphaChannel::new(
+                    format!("Alpha {n}"),
+                    self.doc.width,
+                    self.doc.height,
+                ));
+                let idx = self.doc.alphas.len() - 1;
+                self.channel_view = ChannelView::Alpha(idx);
+                self.paint_target = PaintTarget::Alpha(idx);
+                self.status = format!("New channel: Alpha {n}");
+                self.touch();
+            }
+            3 => {
+                if let ChannelView::Alpha(a) = self.channel_view {
+                    if a < self.doc.alphas.len() {
+                        let name = self.doc.alphas.remove(a).name;
+                        if self.paint_target == PaintTarget::Alpha(a) {
+                            self.paint_target = PaintTarget::Image;
+                        }
+                        self.channel_view = ChannelView::Composite;
+                        self.status = format!("Deleted {name}");
+                        self.touch();
+                    }
+                }
+            }
+            4 => {
+                if let ChannelView::Alpha(a) = self.channel_view {
+                    if let Some(ch) = self.doc.alphas.get_mut(a) {
+                        ch.spot_color = if ch.spot_color.is_some() {
+                            None
+                        } else {
+                            let (r, g, b, _) = self.fg.to_rgba8();
+                            Some((r, g, b))
+                        };
+                        self.status = "Spot channel toggled".into();
+                        self.touch();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn target_path_mut(&mut self) -> Option<&mut BezPath> {
+        match self.active_path? {
+            PathRef::Work => self.doc.work_path.as_mut(),
+            PathRef::Saved(i) => self.doc.paths.get_mut(i),
+        }
+    }
+
+    fn ensure_pen_target(&mut self) {
+        let ok = match self.active_path {
+            Some(PathRef::Work) => self.doc.work_path.is_some(),
+            Some(PathRef::Saved(i)) => i < self.doc.paths.len(),
+            None => false,
+        };
+        if !ok {
+            if self.doc.work_path.is_none() {
+                self.doc.work_path = Some(BezPath::new(""));
+            }
+            self.active_path = Some(PathRef::Work);
+        }
+    }
+
+    fn active_path_clone(&self) -> Option<(PathRef, BezPath)> {
+        match self.active_path? {
+            PathRef::Work => self.doc.work_path.clone().map(|p| (PathRef::Work, p)),
+            PathRef::Saved(i) => self
+                .doc
+                .paths
+                .get(i)
+                .cloned()
+                .map(|p| (PathRef::Saved(i), p)),
+        }
+    }
+
+    fn path_button(&mut self, i: usize) {
+        // Make Work Path works from a selection, no active path needed.
+        if i == 3 {
+            if let Some(sel) = &self.sel {
+                let mut p = pictodesk_core::path::selection_to_path(sel);
+                p.name = String::new();
+                self.doc.work_path = Some(p);
+                self.active_path = Some(PathRef::Work);
+                self.status = "Made work path from selection".into();
+                self.touch();
+            } else {
+                self.status = "Make Path needs a selection".into();
+            }
+            return;
+        }
+        let Some((pref, path)) = self.active_path_clone() else {
+            self.status = "No path selected".into();
+            return;
+        };
+        let layer = self.doc.active_layer;
+        match i {
+            0 => {
+                // Fill path
+                let sel = path.to_selection(self.doc.width, self.doc.height);
+                match self.paint_target {
+                    PaintTarget::Alpha(a) => {
+                        let v = {
+                            let (r, g, b, _) = self.fg.to_rgba8();
+                            ((r as u32 * 77 + g as u32 * 150 + b as u32 * 29) / 256) as u8
+                        };
+                        self.structural("Fill Path", |d| {
+                            if let Some(ch) = d.alphas.get_mut(a) {
+                                for idx in 0..ch.data.len() {
+                                    let m = sel.raw_mask()[idx];
+                                    if m > 0 {
+                                        let cur = ch.data[idx] as u32;
+                                        ch.data[idx] =
+                                            (cur + (v as u32 - cur) * m as u32 / 255) as u8;
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    PaintTarget::Image => {
+                        if let Some((x, y, w, h)) = sel.bounds() {
+                            let tiles = Selection::tiles_in_rect(x, y, w, h);
+                            let fg = self.fg;
+                            run_tile_edit(
+                                &mut self.doc,
+                                &mut self.hist,
+                                "Fill Path",
+                                layer,
+                                &tiles,
+                                |d| brush::fill_selection(d, layer, &sel, fg),
+                            );
+                            self.last_label = Some("Fill Path".into());
+                            self.status = "Fill Path".into();
+                            self.touch();
+                        }
+                    }
+                }
+            }
+            1 => {
+                // Stroke path with the current brush
+                let spacing = (self.tip.size * 0.25).max(1.0);
+                let pts = path.stroke_points(spacing);
+                match self.paint_target {
+                    PaintTarget::Alpha(a) => {
+                        let tip = self.tip;
+                        let v = {
+                            let (r, g, b, _) = self.fg.to_rgba8();
+                            ((r as u32 * 77 + g as u32 * 150 + b as u32 * 29) / 256) as u8
+                        };
+                        let (w, h) = (self.doc.width, self.doc.height);
+                        self.structural("Stroke Path", |d| {
+                            if let Some(ch) = d.alphas.get_mut(a) {
+                                for pt in &pts {
+                                    brush::stamp_channel(
+                                        &mut ch.data,
+                                        w,
+                                        h,
+                                        pt.0,
+                                        pt.1,
+                                        &tip,
+                                        v,
+                                        1.0,
+                                    );
+                                }
+                            }
+                        });
+                    }
+                    PaintTarget::Image => {
+                        if let Some((bx, by, bw, bh)) = path.bounds() {
+                            let tiles = Selection::tiles_in_rect(
+                                bx as i32 - 32,
+                                by as i32 - 32,
+                                bw as u32 + 64,
+                                bh as u32 + 64,
+                            );
+                            let tip = self.tip;
+                            let fg = self.fg;
+                            run_tile_edit(
+                                &mut self.doc,
+                                &mut self.hist,
+                                "Stroke Path",
+                                layer,
+                                &tiles,
+                                |d| {
+                                    for pt in &pts {
+                                        brush::stamp_brush(
+                                            d, layer, None, pt.0, pt.1, fg, &tip, 1.0,
+                                        );
+                                    }
+                                },
+                            );
+                            self.last_label = Some("Stroke Path".into());
+                            self.status = "Stroke Path".into();
+                            self.touch();
+                        }
+                    }
+                }
+            }
+            2 => {
+                self.sel = Some(path.to_selection(self.doc.width, self.doc.height));
+                self.status = "Path converted to selection".into();
+            }
+            4 => {
+                // Save work path under a name
+                if pref == PathRef::Work && self.doc.work_path.is_some() {
+                    let mut d = Dialog::new(DialogKind::SavePath, &self.doc);
+                    d.text = format!("Path {}", self.doc.paths.len() + 1);
+                    d.text_focus = true;
+                    self.dialog = Some(d);
+                } else {
+                    self.status = "Only the work path needs saving".into();
+                }
+            }
+            5 => {
+                if let PathRef::Saved(idx) = pref {
+                    self.doc.clipping_path = if self.doc.clipping_path == Some(idx) {
+                        None
+                    } else {
+                        Some(idx)
+                    };
+                    self.status = if self.doc.clipping_path == Some(idx) {
+                        "Clipping path set (exports with CMYK TIFF)"
+                    } else {
+                        "Clipping path cleared"
+                    }
+                    .into();
+                    self.touch();
+                } else {
+                    self.status = "Save the path before making it a clipping path".into();
+                }
+            }
+            6 => match pref {
+                PathRef::Work => {
+                    self.doc.work_path = None;
+                    self.active_path = None;
+                    self.status = "Work path discarded".into();
+                    self.touch();
+                }
+                PathRef::Saved(idx) => {
+                    if idx < self.doc.paths.len() {
+                        self.doc.paths.remove(idx);
+                        self.doc.clipping_path = match self.doc.clipping_path {
+                            Some(c) if c == idx => None,
+                            Some(c) if c > idx => Some(c - 1),
+                            other => other,
+                        };
+                        self.active_path = None;
+                        self.status = "Path deleted".into();
+                        self.touch();
+                    }
+                }
+            },
+            _ => {}
+        }
+    }
+
+    /// Dock mouse routing. Returns true when the click landed in the
+    /// dock and was consumed.
+    fn panel_mouse(&mut self, mx: i32, my: i32) -> bool {
+        if !self.dock_open() || mx < self.win_size.0 as i32 - DOCK_W {
+            return false;
+        }
+        // Color palette cells
+        if self.show_palette {
+            for i in 0..64 {
+                if self.palette_cell_rect(i).contains(mx, my) {
+                    let c = ui::PALETTE[i];
+                    let p = Pixel16::from_rgba8(c.0, c.1, c.2, 255);
+                    if self.alt_down {
+                        self.bg = p;
+                    } else {
+                        self.fg = p;
+                    }
+                    return true;
+                }
+            }
+        }
+        // Brushes cells
+        if self.show_brushes {
+            let sizes = [1.0f32, 3.0, 5.0, 9.0, 13.0, 21.0, 35.0, 50.0];
+            for row in 0..2 {
+                for (i, sz) in sizes.iter().enumerate() {
+                    if self.brushes_cell(i, row).contains(mx, my) {
+                        self.tip = BrushTip::new(*sz, if row == 0 { 1.0 } else { 0.0 });
+                        return true;
+                    }
+                }
+            }
+        }
+        // Channels / Paths group
+        if let Some(r) = self.group_rect(PanelKind::Cp) {
+            if r.contains(mx, my) {
+                for i in 0..2 {
+                    let tr = Self::cp_tab_rect(r, i);
+                    if tr.contains(mx, my) {
+                        self.cp_tab = i;
+                        return true;
+                    }
+                }
+                let row = (my - (r.y + 20)) / 15;
+                if self.cp_tab == 0 {
+                    let rows = self.channel_rows();
+                    if row >= 0 && (row as usize) < rows.len() {
+                        let view = rows[row as usize].1;
+                        self.channel_view = view;
+                        match view {
+                            ChannelView::Alpha(a) => self.paint_target = PaintTarget::Alpha(a),
+                            _ => self.paint_target = PaintTarget::Image,
+                        }
+                        return true;
+                    }
+                    let bw = (r.w - 8) / 5;
+                    for i in 0..5 {
+                        let br = Rect::new(r.x + 4 + i as i32 * bw, r.bottom() - 19, bw - 2, 16);
+                        if br.contains(mx, my) {
+                            self.channel_button(i);
+                            return true;
+                        }
+                    }
+                } else {
+                    let rows = self.path_rows();
+                    if row >= 0 && (row as usize) < rows.len() {
+                        self.active_path = Some(rows[row as usize].1);
+                        return true;
+                    }
+                    let bw = (r.w - 8) / 4;
+                    for i in 0..4 {
+                        let br = Rect::new(r.x + 4 + i as i32 * bw, r.bottom() - 39, bw - 2, 16);
+                        if br.contains(mx, my) {
+                            self.path_button(i);
+                            return true;
+                        }
+                    }
+                    let bw2 = (r.w - 8) / 3;
+                    for i in 0..3 {
+                        let br = Rect::new(r.x + 4 + i as i32 * bw2, r.bottom() - 19, bw2 - 2, 16);
+                        if br.contains(mx, my) {
+                            self.path_button(i + 4);
+                            return true;
+                        }
+                    }
+                }
+                return true; // clicks inside the group are consumed
+            }
+        }
+        false
     }
 
     fn draw_menu_bar(&mut self, f: &mut Frame) {
@@ -2218,6 +3100,13 @@ fn draw_tool_icon(f: &mut Frame, tool: Tool, r: Rect) {
                 }
             }
         }
+        Tool::Pen => {
+            f.line(cx - 5, cy + 7, cx, cy - 7, b);
+            f.line(cx, cy - 7, cx + 5, cy + 7, b);
+            f.line(cx - 5, cy + 7, cx + 5, cy + 7, b);
+            f.fill_rect(Rect::new(cx - 1, cy, 3, 3), b);
+            f.line(cx, cy + 7, cx, cy + 9, b);
+        }
         Tool::Pencil => {
             f.line(cx - 6, cy + 6, cx + 5, cy - 5, b);
             f.line(cx - 5, cy + 7, cx + 6, cy - 4, b);
@@ -2402,40 +3291,9 @@ impl App {
             }
             return;
         }
-        // ---- color palette panel
-        if self.show_palette {
-            let mut hit = false;
-            for i in 0..64 {
-                if Self::palette_cell_rect(i).contains(mx, my) {
-                    let c = ui::PALETTE[i];
-                    let p = Pixel16::from_rgba8(c.0, c.1, c.2, 255);
-                    if self.alt_down {
-                        self.bg = p;
-                    } else {
-                        self.fg = p;
-                    }
-                    hit = true;
-                    break;
-                }
-            }
-            if hit {
-                return;
-            }
-            if !(self.swatches_area().contains(mx, my)) {
-                self.show_palette = false;
-            }
-        }
-        // ---- brushes panel
-        if self.show_brushes {
-            let sizes = [1.0f32, 3.0, 5.0, 9.0, 13.0, 21.0, 35.0, 50.0];
-            for row in 0..2 {
-                for (i, s) in sizes.iter().enumerate() {
-                    if self.brushes_cell(i, row).contains(mx, my) {
-                        self.tip = BrushTip::new(*s, if row == 0 { 1.0 } else { 0.0 });
-                        return;
-                    }
-                }
-            }
+        // ---- dock panels
+        if self.panel_mouse(mx, my) {
+            return;
         }
         // ---- menu bar / open dropdown
         if my < ui::MENU_H {
@@ -2503,6 +3361,14 @@ impl App {
                     .zoom_at(local, if self.alt_down { 0.5 } else { 2.0 });
             }
             Tool::Eyedropper => {
+                if let ChannelView::Alpha(a) = self.channel_view {
+                    if let Some(ch) = self.doc.alphas.get(a) {
+                        let v = ch.value(self.doc.width, dp.0.floor() as i32, dp.1.floor() as i32);
+                        self.fg = Pixel16::from_rgba8(v, v, v, 255);
+                        self.status = format!("Channel value: {v}");
+                        return;
+                    }
+                }
                 let p = self
                     .doc
                     .render_pixel(dp.0.floor() as i32, dp.1.floor() as i32);
@@ -2529,7 +3395,24 @@ impl App {
                 ));
                 self.status = "Magic Wand selection".into();
             }
+            Tool::Pen => {
+                self.pen_down(x, y, dp);
+            }
             Tool::Bucket => {
+                if let PaintTarget::Alpha(a) = self.paint_target {
+                    let mut cmd = DocumentCommand::begin("Paint Bucket", &self.doc);
+                    let (w, h) = (self.doc.width, self.doc.height);
+                    let v = self.fg_luminance();
+                    if let Some(ch) = self.doc.alphas.get_mut(a) {
+                        brush::flood_channel(&mut ch.data, w, h, dp.0 as i32, dp.1 as i32, v, 32);
+                    }
+                    cmd.finish(&self.doc);
+                    self.hist.push(Box::new(cmd));
+                    self.last_label = Some("Paint Bucket".into());
+                    self.status = "Paint Bucket (channel)".into();
+                    self.touch();
+                    return;
+                }
                 let region = Selection::wand(&self.doc, dp.0 as i32, dp.1 as i32, 32, true);
                 if let Some((bx, by, bw, bh)) = region.bounds() {
                     let tiles = Selection::tiles_in_rect(bx, by, bw, bh);
@@ -2571,6 +3454,18 @@ impl App {
             | Tool::Blur
             | Tool::Sharpen
             | Tool::Smudge => {
+                if let PaintTarget::Alpha(_) = self.paint_target {
+                    if matches!(self.tool, Tool::Brush | Tool::Pencil | Tool::Eraser) {
+                        self.alpha_cmd =
+                            Some(DocumentCommand::begin("Paint on channel", &self.doc));
+                        self.alpha_last = dp;
+                        self.alpha_stamp(dp);
+                        self.drag = DragMode::Paint;
+                    } else {
+                        self.status = "That tool paints on the image, not on a channel".into();
+                    }
+                    return;
+                }
                 if self.tool == Tool::Stamp && self.alt_down {
                     self.clone_src = Some(dp);
                     self.status = "Clone source set".into();
@@ -2661,6 +3556,173 @@ impl App {
             }
         }
         false
+    }
+
+    fn fg_luminance(&self) -> u8 {
+        let (r, g, b, _) = self.fg.to_rgba8();
+        ((r as u32 * 77 + g as u32 * 150 + b as u32 * 29) / 256) as u8
+    }
+
+    /// One brush/pencil/eraser stamp into the targeted alpha channel.
+    fn alpha_stamp(&mut self, center: (f32, f32)) {
+        let PaintTarget::Alpha(a) = self.paint_target else {
+            return;
+        };
+        let value = if self.tool == Tool::Eraser {
+            0
+        } else {
+            self.fg_luminance()
+        };
+        let tip = if self.tool == Tool::Pencil {
+            BrushTip::new(self.tip.size, 1.0)
+        } else {
+            self.tip
+        };
+        let (w, h) = (self.doc.width, self.doc.height);
+        if let Some(ch) = self.doc.alphas.get_mut(a) {
+            brush::stamp_channel(
+                &mut ch.data,
+                w,
+                h,
+                center.0,
+                center.1,
+                &tip,
+                value,
+                self.opacity,
+            );
+        }
+        self.touch();
+    }
+
+    /// Pen tool click: grab a handle/anchor if near one, close the
+    /// current subpath if the first anchor is clicked, otherwise add
+    /// an anchor (drag turns it into a smooth point).
+    fn pen_down(&mut self, x: f32, y: f32, dp: (f32, f32)) {
+        self.ensure_pen_target();
+        let canvas = self.canvas_rect(self.win_size.0, self.win_size.1);
+        let to_scr = |p: (f32, f32)| {
+            let s = self.viewport.doc_to_screen(p);
+            (canvas.x as f32 + s.0, canvas.y as f32 + s.1)
+        };
+        if let Some((_, path)) = self.active_path_clone() {
+            // handles of the current anchor first
+            if let Some((si, ai)) = self.pen_anchor {
+                if let Some(a) = path.subpaths.get(si).and_then(|sub| sub.anchors.get(ai)) {
+                    if !a.is_corner() {
+                        for (part, cp) in [(1u8, a.in_ctrl), (2u8, a.out_ctrl)] {
+                            let sp = to_scr(cp);
+                            if (x - sp.0).abs() < 5.0 && (y - sp.1).abs() < 5.0 {
+                                self.pen_hit = Some((si, ai, part));
+                                self.drag = DragMode::PenDrag;
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+            // any anchor
+            for (si, sub) in path.subpaths.iter().enumerate() {
+                for (ai, a) in sub.anchors.iter().enumerate() {
+                    let sp = to_scr(a.point);
+                    if (x - sp.0).abs() < 5.0 && (y - sp.1).abs() < 5.0 {
+                        self.pen_hit = Some((si, ai, 0));
+                        self.pen_anchor = Some((si, ai));
+                        self.drag = DragMode::PenDrag;
+                        return;
+                    }
+                }
+            }
+            // close: click the first anchor of the current open subpath
+            if let Some(li) = path.subpaths.iter().rposition(|sub| !sub.closed) {
+                let sub = &path.subpaths[li];
+                if sub.anchors.len() >= 2 {
+                    let sp = to_scr(sub.anchors[0].point);
+                    if (x - sp.0).abs() < 6.0 && (y - sp.1).abs() < 6.0 {
+                        if let Some(p) = self.target_path_mut() {
+                            p.subpaths[li].closed = true;
+                        }
+                        self.status = "Path closed".into();
+                        self.touch();
+                        return;
+                    }
+                }
+            }
+        }
+        // add an anchor to the current open subpath (or a fresh one)
+        if let Some(p) = self.target_path_mut() {
+            let si = match p.subpaths.iter().rposition(|sub| !sub.closed) {
+                Some(i) => i,
+                None => {
+                    p.subpaths.push(Subpath {
+                        anchors: Vec::new(),
+                        closed: false,
+                    });
+                    p.subpaths.len() - 1
+                }
+            };
+            p.subpaths[si].anchors.push(Anchor::corner(dp.0, dp.1));
+            let ai = p.subpaths[si].anchors.len() - 1;
+            self.pen_hit = Some((si, ai, 0));
+            self.pen_anchor = Some((si, ai));
+        }
+        self.drag = DragMode::PenNew;
+        self.touch();
+    }
+
+    fn pen_move(&mut self, dp: (f32, f32)) {
+        let Some((si, ai, part)) = self.pen_hit else {
+            return;
+        };
+        let drag = self.drag;
+        if let Some(p) = self.target_path_mut() {
+            let Some(a) = p
+                .subpaths
+                .get_mut(si)
+                .and_then(|sub| sub.anchors.get_mut(ai))
+            else {
+                return;
+            };
+            match drag {
+                DragMode::PenNew => {
+                    let pt = a.point;
+                    if (dp.0 - pt.0).abs() > 0.5 || (dp.1 - pt.1).abs() > 0.5 {
+                        a.out_ctrl = dp;
+                        a.in_ctrl = (2.0 * pt.0 - dp.0, 2.0 * pt.1 - dp.1);
+                    }
+                }
+                DragMode::PenDrag => match part {
+                    0 => {
+                        let d = (dp.0 - a.point.0, dp.1 - a.point.1);
+                        a.point = dp;
+                        a.in_ctrl = (a.in_ctrl.0 + d.0, a.in_ctrl.1 + d.1);
+                        a.out_ctrl = (a.out_ctrl.0 + d.0, a.out_ctrl.1 + d.1);
+                    }
+                    1 => {
+                        a.in_ctrl = dp;
+                        if !a.is_corner() {
+                            let v = (a.point.0 - dp.0, a.point.1 - dp.1);
+                            let len = ((a.out_ctrl.0 - a.point.0).powi(2)
+                                + (a.out_ctrl.1 - a.point.1).powi(2))
+                            .sqrt();
+                            let vl = (v.0.powi(2) + v.1.powi(2)).sqrt().max(0.001);
+                            a.out_ctrl = (a.point.0 + v.0 / vl * len, a.point.1 + v.1 / vl * len);
+                        }
+                    }
+                    _ => {
+                        a.out_ctrl = dp;
+                        if !a.is_corner() {
+                            let v = (a.point.0 - dp.0, a.point.1 - dp.1);
+                            let len = ((a.in_ctrl.0 - a.point.0).powi(2)
+                                + (a.in_ctrl.1 - a.point.1).powi(2))
+                            .sqrt();
+                            let vl = (v.0.powi(2) + v.1.powi(2)).sqrt().max(0.001);
+                            a.in_ctrl = (a.point.0 + v.0 / vl * len, a.point.1 + v.1 / vl * len);
+                        }
+                    }
+                },
+                _ => {}
+            }
+        }
     }
 
     fn begin_stroke(&mut self, dp: (f32, f32)) {
@@ -2922,6 +3984,9 @@ impl App {
             DragMode::Pan => {
                 self.viewport.pan_by((x - prev.0, y - prev.1));
             }
+            DragMode::PenNew | DragMode::PenDrag => {
+                self.pen_move(dp);
+            }
             DragMode::SelectRect | DragMode::GradientLine => {
                 self.drag_cur_doc = dp;
             }
@@ -2942,6 +4007,17 @@ impl App {
                 self.doc_version += 1;
             }
             DragMode::Paint => {
+                if self.alpha_cmd.is_some() {
+                    let last = self.alpha_last;
+                    let spacing = (self.tip.size * 0.25).max(1.0);
+                    for c in brush::stroke_centers(&[last, dp], spacing) {
+                        if c != last {
+                            self.alpha_stamp(c);
+                        }
+                    }
+                    self.alpha_last = dp;
+                    return;
+                }
                 // capture tiles BEFORE stamping this segment
                 self.capture_segment_tiles(dp);
                 let last = self.stroke.as_ref().unwrap().last_point;
@@ -2989,8 +4065,18 @@ impl App {
             d.curve_drag = None;
         }
         match self.drag {
+            DragMode::PenNew | DragMode::PenDrag => {
+                self.drag = DragMode::None;
+                self.pen_hit = None;
+            }
             DragMode::Paint => {
-                if let Some(mut s) = self.stroke.take() {
+                if let Some(mut cmd) = self.alpha_cmd.take() {
+                    cmd.finish(&self.doc);
+                    self.hist.push(Box::new(cmd));
+                    self.last_label = Some("Paint on channel".into());
+                    self.status = "Paint on channel".into();
+                    self.touch();
+                } else if let Some(mut s) = self.stroke.take() {
                     let layer = self.doc.active_layer;
                     for t in &s.tiles_seen {
                         s.cmd.capture_after(&self.doc, layer, *t);
@@ -3176,6 +4262,7 @@ impl App {
                     self.open_submenu = None;
                 } else if self.show_palette {
                     self.show_palette = false;
+                    self.fit_view(self.win_size.0, self.win_size.1);
                 } else {
                     self.sel = None;
                 }
@@ -3183,6 +4270,8 @@ impl App {
             SpecialKey::Enter => {
                 if self.dialog.is_some() {
                     self.dialog_ok();
+                } else if self.tool == Tool::Pen {
+                    self.status = "Path finished".into();
                 }
             }
             SpecialKey::Backspace => {
@@ -3193,8 +4282,29 @@ impl App {
                         popped = true;
                     }
                 }
-                if !popped && self.dialog.is_none() && self.sel.is_some() {
-                    self.clear_selection();
+                if !popped && self.dialog.is_none() {
+                    if self.tool == Tool::Pen {
+                        // delete the last anchor of the current subpath
+                        let mut removed = false;
+                        if let Some(pth) = self.target_path_mut() {
+                            if let Some(sub) = pth
+                                .subpaths
+                                .iter_mut()
+                                .rev()
+                                .find(|sub| !sub.anchors.is_empty())
+                            {
+                                sub.anchors.pop();
+                                removed = true;
+                            }
+                        }
+                        if removed {
+                            self.pen_anchor = None;
+                            self.status = "Anchor deleted".into();
+                            self.touch();
+                        }
+                    } else if self.sel.is_some() {
+                        self.clear_selection();
+                    }
                 }
             }
         }
@@ -3487,6 +4597,10 @@ fn run_shot(args: &[String]) -> i32 {
     let mut menu: Option<usize> = None;
     let mut dialog_name: Option<String> = None;
     let mut size = (1280u32, 800u32);
+    let mut demo2 = false;
+    let mut tab: Option<String> = None;
+    let mut cmyk = false;
+    let mut view: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -3500,6 +4614,16 @@ fn run_shot(args: &[String]) -> i32 {
             }
             "--dialog" => {
                 dialog_name = args.get(i + 1).cloned();
+                i += 1;
+            }
+            "--demo2" => demo2 = true,
+            "--cmyk" => cmyk = true,
+            "--tab" => {
+                tab = args.get(i + 1).cloned();
+                i += 1;
+            }
+            "--view" => {
+                view = args.get(i + 1).cloned();
                 i += 1;
             }
             "--size" => {
@@ -3521,6 +4645,67 @@ fn run_shot(args: &[String]) -> i32 {
     let mut app = App::new(demo_document(), None);
     app.win_size = size;
     app.fit_view(size.0, size.1);
+    if demo2 {
+        // Phase 2 demo state: a product ellipse, its pen path, a saved
+        // selection channel, the dock open.
+        let mut doc = Document::new(640, 400);
+        doc.layers[0].fill_rect(0, 0, 640, 400, Pixel16::from_rgba8(120, 130, 140, 255));
+        let sel = Selection::ellipse(640, 400, 170, 90, 300, 220);
+        brush::fill_selection(&mut doc, 0, &sel, Pixel16::from_rgba8(215, 40, 30, 255));
+        let k = 0.552_284_8f32;
+        let (cx, cy, rx, ry) = (320.0f32, 200.0f32, 150.0f32, 110.0f32);
+        let mut path = BezPath::new("");
+        path.subpaths.push(Subpath {
+            closed: true,
+            anchors: vec![
+                Anchor::smooth(
+                    (cx + rx, cy),
+                    (cx + rx, cy - k * ry),
+                    (cx + rx, cy + k * ry),
+                ),
+                Anchor::smooth(
+                    (cx, cy + ry),
+                    (cx + k * rx, cy + ry),
+                    (cx - k * rx, cy + ry),
+                ),
+                Anchor::smooth(
+                    (cx - rx, cy),
+                    (cx - rx, cy + k * ry),
+                    (cx - rx, cy - k * ry),
+                ),
+                Anchor::smooth(
+                    (cx, cy - ry),
+                    (cx - k * rx, cy - ry),
+                    (cx + k * rx, cy - ry),
+                ),
+            ],
+        });
+        doc.work_path = Some(path);
+        doc.save_selection_as_channel(&sel);
+        if cmyk {
+            pictodesk_core::mode::convert_mode(&mut doc, ColorMode::Cmyk);
+        }
+        app.doc = doc;
+        app.doc_version += 1;
+        app.tool = Tool::Pen;
+        app.active_path = Some(PathRef::Work);
+        app.pen_anchor = Some((0, 0));
+        app.show_cp = true;
+        app.cp_tab = if tab.as_deref() == Some("paths") {
+            1
+        } else {
+            0
+        };
+        match view.as_deref() {
+            Some("alpha") => {
+                app.channel_view = ChannelView::Alpha(0);
+                app.paint_target = PaintTarget::Alpha(0);
+            }
+            Some("channel") => app.channel_view = ChannelView::Channel(0),
+            _ => {}
+        }
+        app.fit_view(size.0, size.1);
+    }
     if let Some(m) = menu {
         app.open_menu = Some(m);
         app.hover_item = Some((m, 0));

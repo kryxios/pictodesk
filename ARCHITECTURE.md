@@ -105,3 +105,39 @@ palettes, modal dialogs with live preview (revert-from-snapshot,
 re-apply, commit on OK), a file-open panel, drag-and-drop, and the
 1.0-authentic single level of Undo (`History::set_limit(Some(1))` —
 the engine itself is unlimited; later phases raise the cap).
+
+## Phase 2 additions (v0.2.0)
+
+- `path.rs` — Bézier paths: anchors with in/out direction points,
+  subpaths (open/closed), adaptive flattening, even-odd fill to a
+  selection, stroke point generation, and a crack-following boundary
+  trace that turns a selection back into a path.
+- Document model grows: a color mode (RGB / CMYK / Grayscale), alpha
+  channels (an 8-bit buffer each; a channel may carry a spot color),
+  saved paths, a work path, and a clipping-path index. `.pdesk` is
+  now v3 — the v2 envelope carries an extension block; v1/v2 files
+  load with defaults.
+- `mode.rs` + `color.rs` — mode conversion. CMYK is a soft proof:
+  pixels stay 16-bit RGB internally; conversion applies the
+  RGB->CMYK->RGB round trip (gamut clip) to every layer, channel
+  views derive CMYK components per pixel, and export writes real
+  separations.
+- `io.rs` — 16-bit sources import bit-exact (ICC conversion still
+  applies to 8-bit sources), and a hand-rolled CMYK TIFF writer:
+  Photometric 5, one strip, plus tag 34377 carrying the clipping
+  path as an image resource block when one is set. CMYK-mode
+  documents saved as `.tif` route here automatically.
+- `selection.rs` — Grow (boundary flood by color tolerance) and
+  Similar (global color-range match).
+- `brush.rs` — channel painting: tip stamps and flood fill that work
+  on a raw channel buffer, for painting alpha/spot channels directly.
+
+The shell gains the Pen tool (click = corner anchor, drag = smooth
+anchor with mirrored handles, click the first anchor to close,
+Backspace deletes the last anchor) and a right-hand dock of tabbed
+palettes: a Channels/Paths group (channel viewing and paint targets,
+path fill/stroke/convert/save/clip operations), Brushes, Histogram,
+and Color. The dock resizes the canvas; rulers stop at the dock edge.
+Painting with an alpha channel targeted routes brush, pencil,
+eraser, bucket, fill, and clear into that channel's buffer, undoable
+as a whole-document command.
