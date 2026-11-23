@@ -123,16 +123,24 @@ the engine itself is unlimited; later phases raise the cap).
   Transform (scale / rotate / skew about the painted-bounds
   center, bilinear, mode-aware sampling; off-canvas content is
   kept because layers are unbounded tile maps).
-- `psd.rs` — PSD import v1: 8-bit RGB / CMYK / Grayscale, raw and
-  PackBits channel data, layer records (stored top-first in the
-  file) with names, bounds (kept as layer offsets), opacity,
-  visibility, and the classic blend keys. Everything skipped —
-  groups, type/effects layers, unknown blend keys, ZIP channels —
-  is reported in a `PsdReport`, never silently dropped. A file
-  with no layer data imports its merged composite instead.
+- `psd.rs` — PSD / PSB import: 1/8/16-bit Bitmap / Grayscale /
+  Indexed / RGB / CMYK / Multichannel, raw, PackBits and ZIP
+  (plain and delta-predicted) channel data, layer records (stored
+  top-first in the file) with names, bounds (kept as layer
+  offsets), opacity, visibility, classic blend keys, and layer
+  masks (baked into transparency and preserved as alpha
+  channels). Everything that cannot come across — groups as
+  structure, type/effects layers, unknown blend keys — is
+  reported in a `PsdReport`, never silently dropped. A file with
+  no layer data imports its merged composite instead.
 - The shell gains a Layer menu (with a Blend Mode submenu),
   a third dock tab — Layers, beside Channels and Paths — with
-  thumbnails rendered from `Document::render_layer_pixel`, and
+  thumbnails rendered from `Document::render_layer_pixel`, a
+  scrolling panel that keeps the active layer visible, an
+  on-canvas Free Transform (bounding box with handles, live
+  preview re-derived from the pre-transform document each mouse
+  move), autosave to the core's atomic recovery file every 20 s
+  with recovery offered on launch, and
   linked-layer dragging in the Move tool (one multi-layer
   `MoveLayerCommand`).
 

@@ -3,7 +3,7 @@
 An open-source desktop photo and image editor — local files, no cloud,
 no account, no subscription. Built feature by feature, in the open.
 
-**Status: v0.3.0 — Phase 3 complete: layers. First public alpha.**
+**Status: v0.3.1 — Phase 3 complete: layers, with the v0.3.0 reduced forms finished. First public alpha.**
 The UI follows the classic early-90s editor design: a File / Edit /
 Image / Mode / Filter / Select / Window menu bar, a compact
 two-column toolbox, modal dialogs with live preview, docked tabbed
@@ -16,8 +16,8 @@ What exists today:
   pipeline, blend modes and compositing, a command history (undo/redo),
   real ICC profile support (load any `.icc`/`.icm`, profile-to-profile
   conversion, via the pure-Rust moxcms engine), and the `.pdesk` file
-  format — v2, DEFLATE-compressed, with atomic autosave/recovery
-  (v1 files still load).
+  format — v3, DEFLATE-compressed, with atomic autosave/recovery
+  (v1/v2 files still load).
 - Phase 1 editing, all selection-aware and undoable: Open/Save PNG,
   JPEG, TIFF, BMP (embedded ICC profiles honored on import);
   selections (Rectangular/Elliptical Marquee, Lasso, Magic Wand,
@@ -45,6 +45,22 @@ What exists today:
   Similar; 16-bit files now import bit-exact; CMYK documents save
   as true CMYK TIFFs with the clipping path embedded. The
   `.pdesk` format is now v3 (v1/v2 files still load).
+- Phase 3: layers — a Layer menu and a Layers panel with live
+  thumbnails: new / duplicate / delete / reorder layers, opacity,
+  12 blend modes, linking (linked layers move and transform
+  together), Merge Down / Merge Visible / Flatten. Free Transform
+  (Ctrl+T) works on the canvas: drag the bounding box to move,
+  handles to scale, outside to rotate, Ctrl+drag to skew, with a
+  live preview — Enter applies, Esc cancels. PSD and PSB files
+  import completely: 1/8/16-bit, Bitmap / Grayscale / Indexed /
+  RGB / CMYK / Multichannel, raw, PackBits and ZIP channel data,
+  layer masks (baked into transparency and kept as alpha
+  channels); anything that cannot come across (groups as
+  structure, type/effects layers) is reported, never silently
+  dropped. The Layers panel scrolls (mouse wheel, footer buttons)
+  and always keeps the active layer visible. The app autosaves a
+  recovery copy of unsaved work every 20 seconds and offers it
+  back after a crash.
 - A desktop shell (`apps/pictodesk-app`): the classic 1990-era workbench
   — platinum menu bar and toolbox, rulers, docked tabbed palettes
   (Channels/Paths, Brushes, Histogram, Color), modal dialogs with

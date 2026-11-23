@@ -157,23 +157,19 @@ pub fn translate_layer(doc: &mut Document, layer: usize, dx: i32, dy: i32) {
 /// the center of the layer's painted bounds, bilinear sampling.
 /// `skew_x_deg` shears x by tan(angle) * (y - cy). Content that
 /// lands outside the canvas is kept (layers are unbounded).
-pub fn transform_layer(
-    doc: &mut Document,
-    layer: usize,
-    scale_x: f32,
-    scale_y: f32,
-    rotate_deg: f32,
-    skew_x_deg: f32,
-) {
-    let src = doc.layers[layer].clone();
-    // Painted bounds (document coords).
+fn grow_bounds(b: &mut Option<(i32, i32, i32, i32)>, x: i32, y: i32) {
+    *b = Some(match *b {
+        None => (x, y, x + 1, y + 1),
+        Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x + 1), y1.max(y + 1)),
+    });
+}
+
+/// The painted bounds of one layer in document coordinates
+/// (ink pixels plus, for CMYK, pixels with alpha-plane coverage).
+pub fn layer_painted_bounds(layer: &crate::layer::Layer) -> Option<(i32, i32, i32, i32)> {
+    let src = layer;
     let mut bounds: Option<(i32, i32, i32, i32)> = None;
-    let grow = |b: &mut Option<(i32, i32, i32, i32)>, x: i32, y: i32| {
-        *b = Some(match *b {
-            None => (x, y, x + 1, y + 1),
-            Some((x0, y0, x1, y1)) => (x0.min(x), y0.min(y), x1.max(x + 1), y1.max(y + 1)),
-        });
-    };
+    let grow = grow_bounds;
     for (coord, tile) in &src.tiles {
         for ly in 0..256i32 {
             for lx in 0..256i32 {
@@ -200,7 +196,19 @@ pub fn transform_layer(
             }
         }
     }
-    let Some((bx0, by0, bx1, by1)) = bounds else {
+    bounds
+}
+
+pub fn transform_layer(
+    doc: &mut Document,
+    layer: usize,
+    scale_x: f32,
+    scale_y: f32,
+    rotate_deg: f32,
+    skew_x_deg: f32,
+) {
+    let src = doc.layers[layer].clone();
+    let Some((bx0, by0, bx1, by1)) = layer_painted_bounds(&src) else {
         return;
     };
     let (cx, cy) = ((bx0 + bx1) as f32 / 2.0, (by0 + by1) as f32 / 2.0);
@@ -222,7 +230,7 @@ pub fn transform_layer(
     for (px, py) in [(bx0, by0), (bx1, by0), (bx0, by1), (bx1, by1)] {
         let fx = a * px as f32 + b * py as f32 + tx;
         let fy = c * px as f32 + d * py as f32 + ty;
-        grow(&mut db, fx.floor() as i32, fy.floor() as i32);
+        grow_bounds(&mut db, fx.floor() as i32, fy.floor() as i32);
     }
     let (dx0, dy0, dx1, dy1) = db.unwrap();
     let cmyk = doc.mode == crate::document::ColorMode::Cmyk;

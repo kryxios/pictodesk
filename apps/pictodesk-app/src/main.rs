@@ -127,6 +127,34 @@ const TOOLS: [Tool; 18] = [
 pub const DOCK_W: i32 = 216;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
+enum FtDrag {
+    None,
+    Move,
+    Scale(usize),
+    Rotate,
+    Skew,
+}
+
+/// An in-progress Free Transform: the document is re-derived from
+/// `origin` on every mouse move, so drags never accumulate error.
+/// Enter commits (one undo step), Esc cancels.
+struct FtState {
+    origin: Document,
+    targets: Vec<usize>,
+    bounds: (f32, f32, f32, f32), // active layer's painted bounds
+    sx: f32,
+    sy: f32,
+    rot: f32,
+    skew: f32,
+    dx: f32,
+    dy: f32,
+    drag: FtDrag,
+    drag_start_doc: (f32, f32),
+    start: (f32, f32, f32, f32, f32, f32), // params at drag start
+    start_angle: f32,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum PanelKind {
     Cp,
     Brushes,
@@ -273,7 +301,6 @@ enum DialogKind {
     SavePath,
     NewLayer,
     LayerOptions,
-    FreeTransform,
 }
 
 impl DialogKind {
@@ -300,7 +327,6 @@ impl DialogKind {
             DialogKind::SavePath => "Save Path",
             DialogKind::NewLayer => "New Layer",
             DialogKind::LayerOptions => "Layer Options",
-            DialogKind::FreeTransform => "Free Transform",
         }
     }
     /// Pixel dialogs preview live through a tile-snapshot command.
@@ -365,7 +391,6 @@ impl Dialog {
             DialogKind::LayerOptions => {
                 vec![doc.layers[doc.active_layer].opacity * 100.0]
             }
-            DialogKind::FreeTransform => vec![100.0, 100.0, 0.0, 0.0],
             DialogKind::Fill => vec![100.0],
             DialogKind::SaveAs => vec![],
         };
@@ -426,12 +451,6 @@ impl Dialog {
             | DialogKind::SavePath
             | DialogKind::NewLayer => vec![],
             DialogKind::LayerOptions => vec![("Opacity", 0.0, 100.0)],
-            DialogKind::FreeTransform => vec![
-                ("Scale X %", 10.0, 400.0),
-                ("Scale Y %", 10.0, 400.0),
-                ("Rotate", -180.0, 180.0),
-                ("Skew X", -60.0, 60.0),
-            ],
             DialogKind::GrowSel | DialogKind::SimilarSel => vec![("Tolerance", 0.0, 255.0)],
         }
     }
@@ -547,6 +566,14 @@ struct App {
     move_orig_offset: (i32, i32),
     /// Original offsets of linked layers during a Move drag.
     move_linked: Vec<(usize, (i32, i32))>,
+    /// Layers panel scroll: display rows hidden above the window.
+    layers_scroll: usize,
+    ft: Option<FtState>,
+    /// Autosave bookkeeping: when the last recovery write happened
+    /// and which doc_version it captured.
+    autosave_at: std::time::Instant,
+    autosaved_version: u64,
+    recovery_file: Option<std::path::PathBuf>,
     space_down: bool,
     alt_down: bool,
     ctrl_down: bool,
@@ -614,6 +641,11 @@ impl App {
             stroke: None,
             move_orig_offset: (0, 0),
             move_linked: Vec::new(),
+            layers_scroll: 0,
+            ft: None,
+            autosave_at: std::time::Instant::now(),
+            autosaved_version: 0,
+            recovery_file: None,
             space_down: false,
             alt_down: false,
             ctrl_down: false,
@@ -951,6 +983,232 @@ impl App {
         self.touch();
     }
 
+    fn begin_free_transform(&mut self) {
+        if self.ft.is_some() {
+            self.ft_commit();
+            return;
+        }
+        let a = self.doc.active_layer;
+        let Some(b) = pictodesk_core::transform::layer_painted_bounds(&self.doc.layers[a]) else {
+            self.status = "Free Transform: the active layer is empty".into();
+            return;
+        };
+        let targets: Vec<usize> = self
+            .doc
+            .layers
+            .iter()
+            .enumerate()
+            .filter(|(i, l)| *i == a || l.linked)
+            .map(|(i, _)| i)
+            .collect();
+        self.ft = Some(FtState {
+            origin: self.doc.clone(),
+            targets,
+            bounds: (b.0 as f32, b.1 as f32, b.2 as f32, b.3 as f32),
+            sx: 1.0,
+            sy: 1.0,
+            rot: 0.0,
+            skew: 0.0,
+            dx: 0.0,
+            dy: 0.0,
+            drag: FtDrag::None,
+            drag_start_doc: (0.0, 0.0),
+            start: (1.0, 1.0, 0.0, 0.0, 0.0, 0.0),
+            start_angle: 0.0,
+        });
+        self.status =
+            "Free Transform: drag handles to scale, inside to move, outside to rotate, Ctrl+drag to skew — Enter applies, Esc cancels"
+                .into();
+    }
+
+    /// Re-derive the document from the FT origin + current params.
+    fn ft_apply(&mut self) {
+        let Some(ft) = &self.ft else { return };
+        let (sx, sy, rot, skew, dx, dy) = (ft.sx, ft.sy, ft.rot, ft.skew, ft.dx, ft.dy);
+        let targets = ft.targets.clone();
+        let identity = (sx - 1.0).abs() < 1e-6
+            && (sy - 1.0).abs() < 1e-6
+            && rot.abs() < 1e-6
+            && skew.abs() < 1e-6;
+        self.doc = ft.origin.clone();
+        for t in &targets {
+            if identity {
+                let o = self.doc.layers[*t].offset;
+                self.doc.layers[*t].offset = (o.0 + dx.round() as i32, o.1 + dy.round() as i32);
+            } else {
+                pictodesk_core::transform::transform_layer(&mut self.doc, *t, sx, sy, rot, skew);
+                self.doc.layers[*t].offset = (dx.round() as i32, dy.round() as i32);
+            }
+        }
+        self.status = format!(
+            "Free Transform — W: {}%  H: {}%  Angle: {:.1}°  Skew: {:.1}°",
+            (sx * 100.0).round() as i32,
+            (sy * 100.0).round() as i32,
+            rot,
+            skew
+        );
+        self.touch();
+    }
+
+    fn ft_commit(&mut self) {
+        if let Some(ft) = self.ft.take() {
+            if ft.origin != self.doc {
+                let mut cmd = DocumentCommand::begin("Free Transform", &ft.origin);
+                cmd.finish(&self.doc);
+                self.hist.push(Box::new(cmd));
+                self.last_label = Some("Free Transform".into());
+            }
+            self.status = "Free Transform applied".into();
+            self.touch();
+        }
+    }
+
+    fn ft_cancel(&mut self) {
+        if let Some(ft) = self.ft.take() {
+            self.doc = ft.origin;
+            self.status = "Free Transform cancelled".into();
+            self.touch();
+        }
+    }
+
+    /// Map a document point through the current FT params (matches
+    /// the core transform: scale, then skew, then rotate, about the
+    /// bounds center, then translate).
+    fn ft_point(ft: &FtState, p: (f32, f32)) -> (f32, f32) {
+        let cx = (ft.bounds.0 + ft.bounds.2) / 2.0;
+        let cy = (ft.bounds.1 + ft.bounds.3) / 2.0;
+        let rel = (p.0 - cx, p.1 - cy);
+        let mut v = (rel.0 * ft.sx, rel.1 * ft.sy);
+        v.0 += ft.skew.to_radians().tan() * v.1;
+        let th = ft.rot.to_radians();
+        let (sn, cs) = (th.sin(), th.cos());
+        let r = (v.0 * cs - v.1 * sn, v.0 * sn + v.1 * cs);
+        (r.0 + cx + ft.dx, r.1 + cy + ft.dy)
+    }
+
+    /// The 8 handle positions (doc coords): corners then edge
+    /// midpoints, in the transformed frame.
+    fn ft_handles(ft: &FtState) -> [(f32, f32); 8] {
+        let (x0, y0, x1, y1) = ft.bounds;
+        let (cx, cy) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+        let raw = [
+            (x0, y0),
+            (x1, y0),
+            (x1, y1),
+            (x0, y1),
+            (cx, y0),
+            (x1, cy),
+            (cx, y1),
+            (x0, cy),
+        ];
+        raw.map(|p| Self::ft_point(ft, p))
+    }
+
+    /// Begin an FT drag if the canvas click hits the transform box.
+    fn ft_mouse_down(&mut self, dp: (f32, f32), sx: f32, sy: f32) -> bool {
+        let Some(ft) = &self.ft else { return false };
+        let canvas = self.canvas_rect(self.win_size.0, self.win_size.1);
+        let handles = Self::ft_handles(ft);
+        let mut drag = FtDrag::None;
+        for (i, h) in handles.iter().enumerate() {
+            let s = self.viewport.doc_to_screen(*h);
+            let (hx, hy) = (canvas.x as f32 + s.0, canvas.y as f32 + s.1);
+            if (sx - hx).abs() <= 7.0 && (sy - hy).abs() <= 7.0 {
+                drag = if self.ctrl_down || self.super_down {
+                    FtDrag::Skew
+                } else {
+                    FtDrag::Scale(i)
+                };
+                break;
+            }
+        }
+        if drag == FtDrag::None {
+            // Inside the (axis-aligned bound of the) box: move.
+            // Just outside it: rotate.
+            let mut bb = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+            for h in &handles {
+                bb.0 = bb.0.min(h.0);
+                bb.1 = bb.1.min(h.1);
+                bb.2 = bb.2.max(h.0);
+                bb.3 = bb.3.max(h.1);
+            }
+            if dp.0 >= bb.0 && dp.0 <= bb.2 && dp.1 >= bb.1 && dp.1 <= bb.3 {
+                drag = FtDrag::Move;
+            } else {
+                let pad = 24.0 / self.viewport.scale.max(0.01);
+                if dp.0 >= bb.0 - pad && dp.0 <= bb.2 + pad && dp.1 >= bb.1 - pad && dp.1 <= bb.3 + pad
+                {
+                    drag = FtDrag::Rotate;
+                }
+            }
+        }
+        if drag == FtDrag::None {
+            return false;
+        }
+        let ft = self.ft.as_mut().unwrap();
+        ft.drag = drag;
+        ft.drag_start_doc = dp;
+        ft.start = (ft.sx, ft.sy, ft.rot, ft.skew, ft.dx, ft.dy);
+        let cx = (ft.bounds.0 + ft.bounds.2) / 2.0 + ft.dx;
+        let cy = (ft.bounds.1 + ft.bounds.3) / 2.0 + ft.dy;
+        ft.start_angle = (dp.1 - cy).atan2(dp.0 - cx);
+        true
+    }
+
+    fn ft_mouse_move(&mut self, dp: (f32, f32)) {
+        let Some(ft) = &mut self.ft else { return };
+        if ft.drag == FtDrag::None {
+            return;
+        }
+        let (sx0, sy0, rot0, skew0, dx0, dy0) = ft.start;
+        let (x0, y0, x1, y1) = ft.bounds;
+        let (bw, bh) = (x1 - x0, y1 - y0);
+        let center = ((x0 + x1) / 2.0 + dx0, (y0 + y1) / 2.0 + dy0);
+        match ft.drag {
+            FtDrag::Move => {
+                ft.dx = dx0 + (dp.0 - ft.drag_start_doc.0);
+                ft.dy = dy0 + (dp.1 - ft.drag_start_doc.1);
+            }
+            FtDrag::Rotate => {
+                let ang = (dp.1 - center.1).atan2(dp.0 - center.0);
+                let mut deg = rot0 + (ang - ft.start_angle).to_degrees();
+                while deg > 180.0 {
+                    deg -= 360.0;
+                }
+                while deg < -180.0 {
+                    deg += 360.0;
+                }
+                ft.rot = deg;
+            }
+            FtDrag::Scale(i) => {
+                let hx = [-bw / 2.0, bw / 2.0, bw / 2.0, -bw / 2.0, 0.0, bw / 2.0, 0.0, -bw / 2.0][i];
+                let hy = [-bh / 2.0, -bh / 2.0, bh / 2.0, bh / 2.0, -bh / 2.0, 0.0, bh / 2.0, 0.0][i];
+                let th = rot0.to_radians();
+                let (sn, cs) = (th.sin(), th.cos());
+                let rel = (dp.0 - center.0, dp.1 - center.1);
+                let mu = rel.0 * cs + rel.1 * sn;
+                let mv = -rel.0 * sn + rel.1 * cs;
+                if hx != 0.0 {
+                    ft.sx = (mu / hx).clamp(0.05, 20.0);
+                }
+                if hy != 0.0 {
+                    ft.sy = (mv / hy).clamp(0.05, 20.0);
+                }
+                let _ = (sx0, sy0);
+            }
+            FtDrag::Skew => {
+                let th = rot0.to_radians();
+                let (sn, cs) = (th.sin(), th.cos());
+                let d = (dp.0 - ft.drag_start_doc.0, dp.1 - ft.drag_start_doc.1);
+                let du = d.0 * cs + d.1 * sn;
+                let shear = skew0.to_radians().tan() + du / bh.max(1.0);
+                ft.skew = shear.atan().to_degrees().clamp(-80.0, 80.0);
+            }
+            FtDrag::None => {}
+        }
+        self.ft_apply();
+    }
+
     /// Begin a pen/path edit gesture: snapshot the document so the
     /// whole gesture becomes a single undo step on commit.
     fn begin_path_edit(&mut self) {
@@ -970,6 +1228,47 @@ impl App {
                 self.last_label = Some(label.to_string());
             }
         }
+    }
+
+    /// Where this document's crash-recovery file lives.
+    fn recovery_target(&self) -> std::path::PathBuf {
+        match &self.file_path {
+            Some(p) => format::recovery_path_for(p),
+            None => std::env::temp_dir().join("pictodesk-untitled.pdesk.recovery"),
+        }
+    }
+
+    /// Periodic autosave: when the document has unsaved changes,
+    /// write a recovery copy (atomically) at most every 20 s.
+    pub fn autosave_tick(&mut self) {
+        if !self.dirty || self.doc_version == self.autosaved_version {
+            return;
+        }
+        if self.autosave_at.elapsed().as_secs() < 20 {
+            return;
+        }
+        let target = self.recovery_target();
+        if format::save_atomic(&self.doc, &target).is_ok() {
+            self.autosaved_version = self.doc_version;
+            self.autosave_at = std::time::Instant::now();
+            self.recovery_file = Some(target);
+        }
+    }
+
+    /// The document is safely stored (or replaced): any recovery
+    /// copy is now stale.
+    fn clear_recovery(&mut self) {
+        let target = self.recovery_target();
+        if target.exists() {
+            let _ = std::fs::remove_file(&target);
+        }
+        if let Some(old) = self.recovery_file.take() {
+            if old != target && old.exists() {
+                let _ = std::fs::remove_file(old);
+            }
+        }
+        self.autosaved_version = self.doc_version;
+        self.autosave_at = std::time::Instant::now();
     }
 
     fn open_path(&mut self, path: &Path) {
@@ -1018,6 +1317,11 @@ impl App {
                 self.file_path = Some(path.to_path_buf());
                 self.dirty = false;
                 self.doc_version += 1;
+                if let Some(old) = self.recovery_file.take() {
+                    let _ = std::fs::remove_file(old);
+                }
+                self.autosaved_version = self.doc_version;
+                self.autosave_at = std::time::Instant::now();
                 self.fit_view(self.win_size.0, self.win_size.1);
                 self.status = psd_note.unwrap_or_else(|| format!("Opened {}", path.display()));
             }
@@ -1039,6 +1343,7 @@ impl App {
             Ok(()) => {
                 self.file_path = Some(path.to_path_buf());
                 self.dirty = false;
+                self.clear_recovery();
                 self.status = format!("Saved {}", path.display());
                 true
             }
@@ -1296,7 +1601,7 @@ impl App {
                 self.dialog = Some(d);
             }
             Action::FreeTransform => {
-                self.dialog = Some(Dialog::new(DialogKind::FreeTransform, &self.doc));
+                self.begin_free_transform();
             }
             Action::DuplicateLayer => {
                 let a = self.doc.active_layer;
@@ -1746,24 +2051,6 @@ impl App {
                     doc.layers[a].opacity = opacity;
                 });
                 self.status = "Layer options set".into();
-            }
-            DialogKind::FreeTransform => {
-                let (sx, sy, rot, skew) =
-                    (d.vals[0] / 100.0, d.vals[1] / 100.0, d.vals[2], d.vals[3]);
-                let targets: Vec<usize> = self
-                    .doc
-                    .layers
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, l)| *i == self.doc.active_layer || l.linked)
-                    .map(|(i, _)| i)
-                    .collect();
-                self.structural("Free Transform", |doc| {
-                    for t in &targets {
-                        pictodesk_core::transform::transform_layer(doc, *t, sx, sy, rot, skew);
-                    }
-                });
-                self.status = "Transformed".into();
             }
             DialogKind::SavePath if self.doc.work_path.is_some() => {
                 self.begin_path_edit();
@@ -2257,6 +2544,31 @@ impl App {
             }
             _ => {}
         }
+        // Free Transform box: outline + 8 handles.
+        if let Some(ft) = &self.ft {
+            let handles = Self::ft_handles(ft);
+            let to_scr = |p: (f32, f32)| {
+                let s = self.viewport.doc_to_screen(p);
+                (c.x + s.0 as i32, c.y + s.1 as i32)
+            };
+            let corners = [
+                to_scr(handles[0]),
+                to_scr(handles[1]),
+                to_scr(handles[2]),
+                to_scr(handles[3]),
+            ];
+            for i in 0..4 {
+                let a = corners[i];
+                let b = corners[(i + 1) % 4];
+                f.line(a.0, a.1, b.0, b.1, ui::WHITE);
+            }
+            for h in &handles {
+                let hs = to_scr(*h);
+                let r = Rect::new(hs.0 - 3, hs.1 - 3, 7, 7);
+                f.fill_rect(r, ui::WHITE);
+                f.outline_rect(r, ui::BLACK);
+            }
+        }
         // path overlay: the active path (work or selected saved path)
         if let Some((_, path)) = self.active_path_clone() {
             let to_scr = |p: (f32, f32)| {
@@ -2641,8 +2953,16 @@ impl App {
             ui::BLACK,
         );
         let n = self.doc.layers.len();
-        for row in 0..n.min(8) {
-            let li = n - 1 - row;
+        // Keep the active layer inside the visible window.
+        let active_row = n - 1 - a;
+        if active_row < self.layers_scroll {
+            self.layers_scroll = active_row;
+        }
+        if active_row >= self.layers_scroll + 8 {
+            self.layers_scroll = active_row - 7;
+        }
+        for row in 0..(n - self.layers_scroll).min(8) {
+            let li = n - 1 - (self.layers_scroll + row);
             let rr = Self::layer_row_rect(r, row);
             let (visible, linked, name) = {
                 let l = &self.doc.layers[li];
@@ -2672,11 +2992,16 @@ impl App {
             }
         }
         let labels = ["New", "Dup", "Del"];
-        let bw = (r.w - 8) / 3;
+        let bw = (r.w - 8 - 42) / 3;
         for (i, label) in labels.iter().enumerate() {
             let br = Rect::new(r.x + 4 + i as i32 * bw, r.bottom() - 19, bw - 2, 16);
             Self::draw_small_button(f, br, label, true);
         }
+        // Scroll buttons (enabled only when there's more stack).
+        let up = Rect::new(r.right() - 40, r.bottom() - 19, 18, 16);
+        let dn = Rect::new(r.right() - 20, r.bottom() - 19, 18, 16);
+        Self::draw_small_button(f, up, "^", self.layers_scroll > 0);
+        Self::draw_small_button(f, dn, "v", self.layers_scroll + 8 < n);
     }
 
     /// A layer thumbnail: the layer alone over a checkerboard.
@@ -2718,8 +3043,8 @@ impl App {
             return true;
         }
         let n = self.doc.layers.len();
-        for row in 0..n.min(8) {
-            let li = n - 1 - row;
+        for row in 0..(n - self.layers_scroll).min(8) {
+            let li = n - 1 - (self.layers_scroll + row);
             let rr = Self::layer_row_rect(r, row);
             if !rr.contains(mx, my) {
                 continue;
@@ -2744,7 +3069,19 @@ impl App {
             self.touch();
             return true;
         }
-        let bw = (r.w - 8) / 3;
+        if self.layers_scroll > 0
+            && Rect::new(r.right() - 40, r.bottom() - 19, 18, 16).contains(mx, my)
+        {
+            self.layers_scroll -= 1;
+            return true;
+        }
+        if self.layers_scroll + 8 < self.doc.layers.len()
+            && Rect::new(r.right() - 20, r.bottom() - 19, 18, 16).contains(mx, my)
+        {
+            self.layers_scroll += 1;
+            return true;
+        }
+        let bw = (r.w - 8 - 42) / 3;
         for i in 0..3 {
             let br = Rect::new(r.x + 4 + i * bw, r.bottom() - 19, bw - 2, 16);
             if br.contains(mx, my) {
@@ -3745,6 +4082,9 @@ impl App {
         if mx < ui::TOOLBAR_W {
             for (i, t) in TOOLS.iter().enumerate() {
                 if Self::tool_rect(i).contains(mx, my) {
+                    if self.ft.is_some() {
+                        self.ft_commit();
+                    }
                     self.tool = *t;
                     self.status = format!("Tool: {}", t.name());
                     return;
@@ -3769,6 +4109,9 @@ impl App {
         let dp = self.to_doc(x, y);
         self.drag_start_doc = dp;
         self.drag_cur_doc = dp;
+        if self.ft.is_some() && self.ft_mouse_down(dp, x, y) {
+            return;
+        }
         if self.space_down {
             self.drag = DragMode::Pan;
             return;
@@ -4296,6 +4639,11 @@ impl App {
         let (mx, my) = (x as i32, y as i32);
         let prev = self.cursor;
         self.cursor = (x, y);
+        if self.ft.is_some() {
+            let dp = self.to_doc(x, y);
+            self.ft_mouse_move(dp);
+            return;
+        }
         // dialog drags
         if self.dialog.is_some() {
             let layout = self.dialog_layout().unwrap();
@@ -4494,6 +4842,9 @@ impl App {
 
     pub fn mouse_up(&mut self, _x: f32, _y: f32) {
         self.mouse_down = false;
+        if let Some(ft) = &mut self.ft {
+            ft.drag = FtDrag::None;
+        }
         if let Some(d) = &mut self.dialog {
             d.slider_drag = None;
             d.curve_drag = None;
@@ -4613,6 +4964,20 @@ impl App {
     }
 
     pub fn scroll(&mut self, delta: f32) {
+        if self.cp_tab == 0 {
+            if let Some(r) = self.group_rect(PanelKind::Cp) {
+                let (mx, my) = (self.cursor.0 as i32, self.cursor.1 as i32);
+                if r.contains(mx, my) {
+                    let n = self.doc.layers.len();
+                    if delta > 0.0 {
+                        self.layers_scroll = self.layers_scroll.saturating_sub(1);
+                    } else if self.layers_scroll + 8 < n {
+                        self.layers_scroll += 1;
+                    }
+                    return;
+                }
+            }
+        }
         let canvas = self.canvas_rect(self.win_size.0, self.win_size.1);
         let (mx, my) = (self.cursor.0 as i32, self.cursor.1 as i32);
         if canvas.contains(mx, my) {
@@ -4699,7 +5064,9 @@ impl App {
     pub fn key_special(&mut self, key: SpecialKey) {
         match key {
             SpecialKey::Escape => {
-                if self.dialog.is_some() {
+                if self.ft.is_some() {
+                    self.ft_cancel();
+                } else if self.dialog.is_some() {
                     self.dialog_cancel();
                 } else if self.file_panel.is_some() {
                     self.file_panel = None;
@@ -4714,7 +5081,9 @@ impl App {
                 }
             }
             SpecialKey::Enter => {
-                if self.dialog.is_some() {
+                if self.ft.is_some() {
+                    self.ft_commit();
+                } else if self.dialog.is_some() {
                     self.dialog_ok();
                 } else if self.tool == Tool::Pen {
                     self.status = "Path finished".into();
@@ -5049,6 +5418,8 @@ fn run_shot(args: &[String]) -> i32 {
     let mut demo3 = false;
     let mut tab: Option<String> = None;
     let mut cmyk = false;
+    let mut ft = false;
+    let mut many_layers = false;
     let mut view: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
@@ -5068,6 +5439,8 @@ fn run_shot(args: &[String]) -> i32 {
             "--demo2" => demo2 = true,
             "--demo3" => demo3 = true,
             "--cmyk" => cmyk = true,
+            "--ft" => ft = true,
+            "--manylayers" => many_layers = true,
             "--tab" => {
                 tab = args.get(i + 1).cloned();
                 i += 1;
@@ -5219,6 +5592,29 @@ fn run_shot(args: &[String]) -> i32 {
         app.open_dialog(kind);
     }
     let mut frame = Frame::new(size.0, size.1);
+    if ft {
+        // Free Transform shot: transform the Sun layer, box visible.
+        app.doc.active_layer = 2;
+        app.begin_free_transform();
+        if let Some(f) = &mut app.ft {
+            f.sx = 1.5;
+            f.sy = 0.8;
+            f.rot = 18.0;
+        }
+        app.ft_apply();
+    }
+    if many_layers {
+        // Duplicate the stack up to 12 layers and select the bottom
+        // one, so the Layers panel has to scroll it into view.
+        while app.doc.layers.len() < 12 {
+            let top = app.doc.layers.len() - 1;
+            app.doc.duplicate_layer(top);
+            let n = app.doc.layers.len();
+            app.doc.layers[n - 1].name = format!("Copy {}", n - 4);
+        }
+        app.doc.active_layer = 0;
+        app.doc_version += 1;
+    }
     app.draw(&mut frame);
 
     let instance = wgpu::Instance::default();
@@ -5577,6 +5973,7 @@ impl ApplicationHandler for Runner {
     }
 
     fn about_to_wait(&mut self, _el: &ActiveEventLoop) {
+        self.app.autosave_tick();
         // Marching ants animation tick.
         if self.last_ants.elapsed().as_millis() > 160 {
             self.last_ants = std::time::Instant::now();
@@ -5592,8 +5989,39 @@ impl ApplicationHandler for Runner {
 
 fn run_window(path: Option<PathBuf>) {
     let mut app = App::new(demo_document(), None);
+    let mtime = |p: &std::path::Path| {
+        std::fs::metadata(p)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+    };
     if let Some(p) = path {
-        app.open_path(&p);
+        let rec = format::recovery_path_for(&p);
+        if rec.exists() && (!p.exists() || mtime(&rec) > mtime(&p)) {
+            match format::load(&rec) {
+                Ok(doc) => {
+                    app.doc = doc;
+                    app.file_path = Some(p);
+                    app.dirty = true;
+                    app.doc_version += 1;
+                    app.recovery_file = Some(rec);
+                    app.status = "Recovered autosaved work — Save to keep it".into();
+                }
+                Err(_) => app.open_path(&p),
+            }
+        } else {
+            app.open_path(&p);
+        }
+    } else {
+        let rec = std::env::temp_dir().join("pictodesk-untitled.pdesk.recovery");
+        if rec.exists() {
+            if let Ok(doc) = format::load(&rec) {
+                app.doc = doc;
+                app.dirty = true;
+                app.doc_version += 1;
+                app.recovery_file = Some(rec);
+                app.status = "Recovered unsaved work — Save to keep it".into();
+            }
+        }
     }
     let event_loop = EventLoop::new().expect("event loop");
     let mut runner = Runner {
