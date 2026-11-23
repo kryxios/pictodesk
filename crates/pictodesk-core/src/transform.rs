@@ -21,17 +21,36 @@ fn rebuild_layer(
     out.opacity = layer.opacity;
     out.visible = layer.visible;
     out.blend_mode = layer.blend_mode;
-    for (coord, tile) in &layer.tiles {
+    let has_alpha = !layer.cmyk_alpha.is_empty();
+    let mut coords: Vec<_> = layer.tiles.keys().copied().collect();
+    if has_alpha {
+        for c in layer.cmyk_alpha.keys() {
+            if !coords.contains(c) {
+                coords.push(*c);
+            }
+        }
+    }
+    for coord in coords {
         for ly in 0..256i32 {
             for lx in 0..256i32 {
-                let p = tile.get(lx as u32, ly as u32);
-                if p == Pixel16::TRANSPARENT {
-                    continue;
-                }
                 let (dx, dy) = (
                     coord.0 * 256 + lx + layer.offset.0,
                     coord.1 * 256 + ly + layer.offset.1,
                 );
+                let p = layer.get_pixel(dx, dy);
+                let a = if has_alpha {
+                    layer.get_alpha(dx, dy)
+                } else {
+                    0
+                };
+                // A pixel is present if it has color/ink or, in CMYK
+                // mode, any alpha (white-ink pixels have zero inks).
+                if p == Pixel16::TRANSPARENT && a == 0 {
+                    continue;
+                }
+                if !has_alpha && p == Pixel16::TRANSPARENT {
+                    continue;
+                }
                 let (nx, ny) = map(dx, dy);
                 if let Some((cw, ch)) = clip {
                     if nx < 0 || ny < 0 || nx >= cw as i32 || ny >= ch as i32 {
@@ -39,6 +58,9 @@ fn rebuild_layer(
                     }
                 }
                 out.set_pixel(nx, ny, p);
+                if has_alpha {
+                    out.set_alpha(nx, ny, a);
+                }
             }
         }
     }
@@ -130,12 +152,50 @@ pub fn resize_image(doc: &mut Document, new_w: u32, new_h: u32) {
     let (ow, oh) = (doc.width, doc.height);
     let sx = ow as f32 / new_w as f32;
     let sy = oh as f32 / new_h as f32;
+    let cmyk = doc.mode == crate::document::ColorMode::Cmyk;
     for li in 0..doc.layers.len() {
         let src = doc.layers[li].clone();
         let mut out = Layer::new(src.name.clone());
         out.opacity = src.opacity;
         out.visible = src.visible;
         out.blend_mode = src.blend_mode;
+        if cmyk {
+            // Bilinear over the five CMYK values (inks + alpha).
+            for yy in 0..new_h as i32 {
+                for xx in 0..new_w as i32 {
+                    let fx = (xx as f32 + 0.5) * sx - 0.5;
+                    let fy = (yy as f32 + 0.5) * sy - 0.5;
+                    let (x0, y0) = (fx.floor() as i32, fy.floor() as i32);
+                    let (tx, ty) = (fx - x0 as f32, fy - y0 as f32);
+                    let smp = |x: i32, y: i32| -> [f32; 5] {
+                        let vx = x.clamp(0, ow as i32 - 1);
+                        let vy = y.clamp(0, oh as i32 - 1);
+                        let p = src.get_pixel(vx, vy).to_f32s();
+                        let a = src.get_alpha(vx, vy) as f32 / 65535.0;
+                        [p.0, p.1, p.2, p.3, a]
+                    };
+                    let (sa, sb, sc, sd) = (
+                        smp(x0, y0),
+                        smp(x0 + 1, y0),
+                        smp(x0, y0 + 1),
+                        smp(x0 + 1, y0 + 1),
+                    );
+                    let mut v = [0.0f32; 5];
+                    for c in 0..5 {
+                        let top = sa[c] + (sb[c] - sa[c]) * tx;
+                        let bot = sc[c] + (sd[c] - sc[c]) * tx;
+                        v[c] = top + (bot - top) * ty;
+                    }
+                    if v[4] > 0.0 {
+                        let e = |q: f32| (q.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
+                        out.set_pixel(xx, yy, Pixel16::from_f32s(v[0], v[1], v[2], v[3]));
+                        out.set_alpha(xx, yy, e(v[4]));
+                    }
+                }
+            }
+            doc.layers[li] = out;
+            continue;
+        }
         for yy in 0..new_h as i32 {
             for xx in 0..new_w as i32 {
                 let fx = (xx as f32 + 0.5) * sx - 0.5;

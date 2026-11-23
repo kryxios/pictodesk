@@ -2,16 +2,17 @@
 //! (index 0 = bottom). Rendering composites layers bottom-up through
 //! the blend/composite core into an 8-bit buffer for display/export.
 
-use crate::blend::composite_over;
-use crate::color::WorkingSpace;
+use crate::blend::{composite_over, composite_over_inks};
+use crate::color::{cmyk_to_rgb, WorkingSpace};
 use crate::layer::Layer;
 use crate::pixel::Pixel16;
 
-/// The document's color mode — the classic Mode menu. Pixel
-/// storage stays 16-bit RGB internally; CMYK mode means the stored
-/// values are the CMYK-round-tripped (gamut-clipped) ones, channels
-/// are presented and exported as CMYK, and the screen shows the
-/// printable result (a built-in soft proof).
+/// The document's color mode — the classic Mode menu. In CMYK mode
+/// the layers store real CMYK ink values (in the tile pixels' four
+/// slots) plus a per-layer alpha plane; rendering composites in ink
+/// space and converts to RGB for the screen, and CMYK TIFF export
+/// writes the stored inks. Grayscale documents store desaturated
+/// RGB.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColorMode {
     Rgb,
@@ -94,8 +95,29 @@ impl Document {
         self.active_layer
     }
 
+    /// One pixel of `layer` as CMYK + alpha, each 0..=65535: the ink
+    /// values from the tile slots and alpha from the layer's alpha
+    /// plane. Meaningful when `mode == ColorMode::Cmyk`.
+    pub fn get_cmyk(&self, layer: usize, x: i32, y: i32) -> (u16, u16, u16, u16, u16) {
+        let l = &self.layers[layer];
+        let p = l.get_pixel(x, y);
+        (p.r, p.g, p.b, p.a, l.get_alpha(x, y))
+    }
+
+    pub fn set_cmyk(&mut self, layer: usize, x: i32, y: i32, v: (u16, u16, u16, u16, u16)) {
+        let l = &mut self.layers[layer];
+        l.set_pixel(x, y, Pixel16::new(v.0, v.1, v.2, v.3));
+        l.set_alpha(x, y, v.4);
+    }
+
     /// Flattened pixel at (x, y): all visible layers composited.
+    /// CMYK documents composite in ink space and convert to RGB.
     pub fn render_pixel(&self, x: i32, y: i32) -> Pixel16 {
+        if self.mode == ColorMode::Cmyk {
+            let (ink, a) = self.composite_inks(x, y);
+            let (r, g, b) = cmyk_to_rgb(ink[0], ink[1], ink[2], ink[3]);
+            return Pixel16::from_f32s(r, g, b, a);
+        }
         let mut acc = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
         for layer in &self.layers {
             if !layer.visible {
@@ -105,6 +127,35 @@ impl Document {
             acc = composite_over(acc, p, layer.blend_mode, layer.opacity);
         }
         Pixel16::from_f32s(acc.0, acc.1, acc.2, acc.3)
+    }
+
+    /// Composite all visible layers at (x, y) in ink space; returns
+    /// (c, m, y, k) in 0.0..=1.0 and the composited alpha.
+    pub fn composite_inks(&self, x: i32, y: i32) -> ([f32; 4], f32) {
+        let mut acc = ([0.0f32; 4], 0.0f32);
+        for layer in &self.layers {
+            if !layer.visible {
+                continue;
+            }
+            let p = layer.get_pixel(x, y).to_f32s();
+            let a = layer.get_alpha(x, y) as f32 / 65535.0;
+            acc = composite_over_inks(
+                acc,
+                ([p.0, p.1, p.2, p.3], a),
+                layer.blend_mode,
+                layer.opacity,
+            );
+        }
+        acc
+    }
+
+    /// The flattened CMYK pixel as it would print: layers composited
+    /// in ink space, with any remaining transparency laid over white
+    /// paper (no ink). Each component 0..=65535.
+    pub fn render_cmyk_pixel(&self, x: i32, y: i32) -> (u16, u16, u16, u16) {
+        let (ink, a) = self.composite_inks(x, y);
+        let e = |v: f32| (v.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
+        (e(ink[0] * a), e(ink[1] * a), e(ink[2] * a), e(ink[3] * a))
     }
 
     /// Render a rectangle to packed RGBA8 (row-major, w*h*4 bytes).

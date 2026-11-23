@@ -318,18 +318,36 @@ fn photoshop_path_resource(path: &crate::path::Path, doc_w: u32, doc_h: u32) -> 
 /// print workflows expect.
 pub fn export_tiff_cmyk(doc: &Document) -> Vec<u8> {
     let (w, h) = (doc.width, doc.height);
-    let rgba = doc.render_full_rgba8();
-    let mut pixels: Vec<u8> = Vec::with_capacity((w * h * 4) as usize);
-    for px in rgba.as_chunks::<4>().0 {
-        let (c, m, y, k) = crate::color::rgb_to_cmyk(
-            px[0] as f32 / 255.0,
-            px[1] as f32 / 255.0,
-            px[2] as f32 / 255.0,
-        );
-        pixels.push((c * 255.0).round() as u8);
-        pixels.push((m * 255.0).round() as u8);
-        pixels.push((y * 255.0).round() as u8);
-        pixels.push((k * 255.0).round() as u8);
+    // Spot channels print as their own plates: in a Separation TIFF
+    // they ride as extra ink samples, named via InkNames.
+    let spots: Vec<&crate::document::AlphaChannel> = doc
+        .alphas
+        .iter()
+        .filter(|c| c.spot_color.is_some())
+        .collect();
+    let spp = 4 + spots.len();
+    let mut pixels: Vec<u8> = Vec::with_capacity((w * h) as usize * spp);
+    for yy in 0..h as i32 {
+        for xx in 0..w as i32 {
+            let (c, m, y, k) = doc.render_cmyk_pixel(xx, yy);
+            let d = |v: u16| ((v as u32 + 128) / 257) as u8;
+            pixels.push(d(c));
+            pixels.push(d(m));
+            pixels.push(d(y));
+            pixels.push(d(k));
+            for ch in &spots {
+                pixels.push(ch.value(w, xx, yy));
+            }
+        }
+    }
+    let mut ink_names: Vec<u8> = Vec::new();
+    for n in ["Cyan", "Magenta", "Yellow", "Black"] {
+        ink_names.extend_from_slice(n.as_bytes());
+        ink_names.push(0);
+    }
+    for ch in &spots {
+        ink_names.extend_from_slice(ch.name.as_bytes());
+        ink_names.push(0);
     }
     let irb = doc
         .clipping_path
@@ -337,11 +355,12 @@ pub fn export_tiff_cmyk(doc: &Document) -> Vec<u8> {
         .map(|p| photoshop_path_resource(p, w, h));
 
     // Layout: header (8) | IFD | external data (bits-per-sample,
-    // strip pixels, IRB). Entries sorted by tag, as TIFF requires.
-    let n_entries: u16 = if irb.is_some() { 11 } else { 10 };
+    // ink names, strip pixels, IRB). Entries sorted by tag.
+    let n_entries: u16 = if irb.is_some() { 14 } else { 13 };
     let ifd_size = 2 + n_entries as u32 * 12 + 4;
     let bits_off = 8 + ifd_size;
-    let strip_off = bits_off + 8;
+    let names_off = bits_off + spp as u32 * 2;
+    let strip_off = names_off + ink_names.len() as u32;
     let irb_off = strip_off + pixels.len() as u32;
 
     let mut out: Vec<u8> = Vec::new();
@@ -359,21 +378,25 @@ pub fn export_tiff_cmyk(doc: &Document) -> Vec<u8> {
     };
     entry(256, 4, 1, w, &mut out); // ImageWidth (LONG)
     entry(257, 4, 1, h, &mut out); // ImageLength
-    entry(258, 3, 4, bits_off, &mut out); // BitsPerSample -> offset
+    entry(258, 3, spp as u32, bits_off, &mut out); // BitsPerSample -> offset
     entry(259, 3, 1, 1, &mut out); // Compression = none
-    entry(262, 3, 1, 5, &mut out); // Photometric = CMYK separations
+    entry(262, 3, 1, 5, &mut out); // Photometric = Separation
     entry(273, 4, 1, strip_off, &mut out); // StripOffsets
-    entry(277, 3, 1, 4, &mut out); // SamplesPerPixel
+    entry(277, 3, 1, spp as u32, &mut out); // SamplesPerPixel
     entry(278, 4, 1, h, &mut out); // RowsPerStrip
     entry(279, 4, 1, pixels.len() as u32, &mut out); // StripByteCounts
     entry(284, 3, 1, 1, &mut out); // PlanarConfig = chunky
+    entry(332, 3, 1, 1, &mut out); // InkSet = CMYK
+    entry(333, 2, ink_names.len() as u32, names_off, &mut out); // InkNames
+    entry(334, 3, 1, spp as u32, &mut out); // NumberOfInks
     if let Some(irb) = &irb {
         entry(34377, 1, irb.len() as u32, irb_off, &mut out); // Photoshop IRB
     }
     u32le(0, &mut out); // no next IFD
-    for _ in 0..4 {
-        u16le(8, &mut out); // BitsPerSample values 8,8,8,8
+    for _ in 0..spp {
+        u16le(8, &mut out); // BitsPerSample: 8 per ink
     }
+    out.extend_from_slice(&ink_names);
     out.extend_from_slice(&pixels);
     if let Some(irb) = &irb {
         out.extend_from_slice(irb);

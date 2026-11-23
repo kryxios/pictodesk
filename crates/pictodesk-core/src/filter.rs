@@ -3,7 +3,7 @@
 //! layer region first (no feedback smearing), then write back
 //! blended by the selection mask.
 
-use crate::document::Document;
+use crate::document::{ColorMode, Document};
 use crate::pixel::Pixel16;
 use crate::selection::Selection;
 
@@ -130,10 +130,130 @@ fn blur_region(src: &Region, sigma: f32) -> Region {
     }
 }
 
+// ---- CMYK path: filters run on a 5-channel ink region (c, m, y, k, a).
+
+struct InkRegion {
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    px: Vec<[f32; 5]>,
+}
+
+fn read_ink_region(doc: &Document, layer: usize, rect: (i32, i32, u32, u32)) -> InkRegion {
+    let (x, y, w, h) = rect;
+    let mut px = Vec::with_capacity((w * h) as usize);
+    for yy in 0..h as i32 {
+        for xx in 0..w as i32 {
+            let (c, m, y2, k, a) = doc.get_cmyk(layer, x + xx, y + yy);
+            let f = |v: u16| v as f32 / 65535.0;
+            px.push([f(c), f(m), f(y2), f(k), f(a)]);
+        }
+    }
+    InkRegion { x, y, w, h, px }
+}
+
+impl InkRegion {
+    fn at(&self, x: i32, y: i32) -> [f32; 5] {
+        let cx = x.clamp(0, self.w as i32 - 1) as u32;
+        let cy = y.clamp(0, self.h as i32 - 1) as u32;
+        self.px[(cy * self.w + cx) as usize]
+    }
+}
+
+fn write_ink_region(doc: &mut Document, layer: usize, region: &InkRegion, sel: Option<&Selection>) {
+    for yy in 0..region.h as i32 {
+        for xx in 0..region.w as i32 {
+            let (dx, dy) = (region.x + xx, region.y + yy);
+            let strength = match sel {
+                None => 255,
+                Some(s) => s.value(dx, dy),
+            };
+            if strength == 0 {
+                continue;
+            }
+            let out = region.px[(yy as u32 * region.w + xx as u32) as usize];
+            let e = |v: f32| (v.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
+            if strength == 255 {
+                doc.set_cmyk(
+                    layer,
+                    dx,
+                    dy,
+                    (e(out[0]), e(out[1]), e(out[2]), e(out[3]), e(out[4])),
+                );
+            } else {
+                let orig = doc.get_cmyk(layer, dx, dy);
+                let t = strength as f32 / 255.0;
+                let l = |a: u16, b: f32| -> u16 {
+                    let af = a as f32 / 65535.0;
+                    e(af + (b - af) * t)
+                };
+                doc.set_cmyk(
+                    layer,
+                    dx,
+                    dy,
+                    (
+                        l(orig.0, out[0]),
+                        l(orig.1, out[1]),
+                        l(orig.2, out[2]),
+                        l(orig.3, out[3]),
+                        l(orig.4, out[4]),
+                    ),
+                );
+            }
+        }
+    }
+}
+
+fn blur_ink_region(src: &InkRegion, sigma: f32) -> InkRegion {
+    let kernel = gaussian_kernel(sigma);
+    let half = (kernel.len() / 2) as i32;
+    let (w, h) = (src.w as i32, src.h as i32);
+    let mut tmp = vec![[0.0f32; 5]; src.px.len()];
+    let mut out = vec![[0.0f32; 5]; src.px.len()];
+    for yy in 0..h {
+        for xx in 0..w {
+            let mut acc = [0.0f32; 5];
+            for (ki, &kv) in kernel.iter().enumerate() {
+                let p = src.at(xx + ki as i32 - half, yy);
+                for c in 0..5 {
+                    acc[c] += p[c] * kv;
+                }
+            }
+            tmp[(yy * w + xx) as usize] = acc;
+        }
+    }
+    for yy in 0..h {
+        for xx in 0..w {
+            let mut acc = [0.0f32; 5];
+            for (ki, &kv) in kernel.iter().enumerate() {
+                let p = tmp[((yy + ki as i32 - half).clamp(0, h - 1) * w + xx) as usize];
+                for c in 0..5 {
+                    acc[c] += p[c] * kv;
+                }
+            }
+            out[(yy * w + xx) as usize] = acc;
+        }
+    }
+    InkRegion {
+        x: src.x,
+        y: src.y,
+        w: src.w,
+        h: src.h,
+        px: out,
+    }
+}
+
 /// Filter > Blur > Gaussian Blur. `radius` is the classic radius:
 /// roughly the blur's standard deviation in pixels.
 pub fn gaussian_blur(doc: &mut Document, layer: usize, sel: Option<&Selection>, radius: f32) {
     if radius <= 0.0 {
+        return;
+    }
+    if doc.mode == ColorMode::Cmyk {
+        let src = read_ink_region(doc, layer, work_rect(doc, sel));
+        let blurred = blur_ink_region(&src, radius.max(0.1));
+        write_ink_region(doc, layer, &blurred, sel);
         return;
     }
     let src = read_region(doc, layer, work_rect(doc, sel));
@@ -143,6 +263,40 @@ pub fn gaussian_blur(doc: &mut Document, layer: usize, sel: Option<&Selection>, 
 
 /// Filter > Sharpen > Sharpen: the classic 3x3 kernel.
 pub fn sharpen(doc: &mut Document, layer: usize, sel: Option<&Selection>) {
+    if doc.mode == ColorMode::Cmyk {
+        let src = read_ink_region(doc, layer, work_rect(doc, sel));
+        let mut out = src.px.clone();
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let c = src.at(xx, yy);
+                let mut acc = [c[0] * 5.0, c[1] * 5.0, c[2] * 5.0, c[3] * 5.0];
+                for (nx, ny) in [(xx - 1, yy), (xx + 1, yy), (xx, yy - 1), (xx, yy + 1)] {
+                    let p = src.at(nx, ny);
+                    for i in 0..4 {
+                        acc[i] -= p[i];
+                    }
+                }
+                let o = &mut out[(yy as u32 * src.w + xx as u32) as usize];
+                o[0] = acc[0];
+                o[1] = acc[1];
+                o[2] = acc[2];
+                o[3] = acc[3];
+            }
+        }
+        write_ink_region(
+            doc,
+            layer,
+            &InkRegion {
+                x: src.x,
+                y: src.y,
+                w: src.w,
+                h: src.h,
+                px: out,
+            },
+            sel,
+        );
+        return;
+    }
     let src = read_region(doc, layer, work_rect(doc, sel));
     let mut out = src.px.clone();
     for yy in 0..src.h as i32 {
@@ -185,6 +339,37 @@ pub fn unsharp_mask(
     radius: f32,
     threshold: u8,
 ) {
+    if doc.mode == ColorMode::Cmyk {
+        let src = read_ink_region(doc, layer, work_rect(doc, sel));
+        let blurred = blur_ink_region(&src, radius.max(0.1));
+        let thr = threshold as f32 / 255.0;
+        let mut out = src.px.clone();
+        for (i, o) in out.iter_mut().enumerate() {
+            let sv = src.px[i];
+            let bv = blurred.px[i];
+            for c in 0..4 {
+                let d = sv[c] - bv[c];
+                o[c] = if d.abs() < thr {
+                    sv[c]
+                } else {
+                    sv[c] + d * amount
+                };
+            }
+        }
+        write_ink_region(
+            doc,
+            layer,
+            &InkRegion {
+                x: src.x,
+                y: src.y,
+                w: src.w,
+                h: src.h,
+                px: out,
+            },
+            sel,
+        );
+        return;
+    }
     let src = read_region(doc, layer, work_rect(doc, sel));
     let blurred = blur_region(&src, radius.max(0.1));
     let thr = threshold as f32 / 255.0;
@@ -238,6 +423,35 @@ pub fn add_noise(
     seed: u64,
 ) {
     let rect = work_rect(doc, sel);
+    if doc.mode == ColorMode::Cmyk {
+        let src = read_ink_region(doc, layer, rect);
+        let mut out = src.px.clone();
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let i = (yy as u32 * src.w + xx as u32) as usize;
+                if src.px[i][4] <= 0.0 {
+                    continue;
+                }
+                for (c, oc) in out[i].iter_mut().take(4).enumerate() {
+                    *oc = src.px[i][c]
+                        + (hash_unit(seed, rect.0 + xx, rect.1 + yy, c as u64) - 0.5) * amount;
+                }
+            }
+        }
+        write_ink_region(
+            doc,
+            layer,
+            &InkRegion {
+                x: rect.0,
+                y: rect.1,
+                w: rect.2,
+                h: rect.3,
+                px: out,
+            },
+            sel,
+        );
+        return;
+    }
     let src = read_region(doc, layer, rect);
     let mut out = src.px.clone();
     for yy in 0..src.h as i32 {

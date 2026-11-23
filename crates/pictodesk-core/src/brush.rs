@@ -8,7 +8,11 @@
 //! default) and return their bounding box so the caller can wrap
 //! the stroke in a tile-snapshot history command.
 
-use crate::document::Document;
+use crate::color::rgb_to_cmyk;
+
+/// A CMYK pixel sample: (c, m, y, k, alpha), each 0..=65535.
+type CmykSample = (u16, u16, u16, u16, u16);
+use crate::document::{ColorMode, Document};
 use crate::pixel::Pixel16;
 use crate::selection::Selection;
 
@@ -63,8 +67,16 @@ fn sel_strength(sel: Option<&Selection>, x: i32, y: i32) -> f32 {
 }
 
 /// Source-over composite of `color` onto the layer pixel at strength.
+/// In a CMYK document the (RGB) color is converted to inks and
+/// deposited in ink space via over_ink.
 fn over_pixel(doc: &mut Document, layer: usize, x: i32, y: i32, color: Pixel16, strength: f32) {
     if strength <= 0.0 {
+        return;
+    }
+    if doc.mode == ColorMode::Cmyk {
+        let (r, g, b, a) = color.to_f32s();
+        let (ic, im, iy, ik) = rgb_to_cmyk(r, g, b);
+        over_ink(doc, layer, x, y, (ic, im, iy, ik), a, strength);
         return;
     }
     let dst = doc.layers[layer].get_pixel(x, y).to_f32s();
@@ -86,6 +98,46 @@ fn over_pixel(doc: &mut Document, layer: usize, x: i32, y: i32, color: Pixel16, 
             comp(src.1, dst.1),
             comp(src.2, dst.2),
             out_a,
+        ),
+    );
+}
+
+/// Deposit ink over a CMYK pixel: Porter-Duff over in ink space,
+/// alpha tracked on the layer's alpha plane. `ink` components and
+/// `src_a` are 0.0..=1.0.
+fn over_ink(
+    doc: &mut Document,
+    layer: usize,
+    x: i32,
+    y: i32,
+    ink: (f32, f32, f32, f32),
+    src_a: f32,
+    strength: f32,
+) {
+    let sa = src_a * strength;
+    if sa <= 0.0 {
+        return;
+    }
+    let (dc, dm, dy, dk, da16) = doc.get_cmyk(layer, x, y);
+    let da = da16 as f32 / 65535.0;
+    let out_a = sa + da * (1.0 - sa);
+    if out_a <= 0.0 {
+        return;
+    }
+    let comp = |sc: f32, dcv: u16| -> u16 {
+        let d = dcv as f32 / 65535.0;
+        (((sc * sa + d * da * (1.0 - sa)) / out_a).clamp(0.0, 1.0) * 65535.0 + 0.5) as u16
+    };
+    doc.set_cmyk(
+        layer,
+        x,
+        y,
+        (
+            comp(ink.0, dc),
+            comp(ink.1, dm),
+            comp(ink.2, dy),
+            comp(ink.3, dk),
+            (out_a * 65535.0 + 0.5) as u16,
         ),
     );
 }
@@ -140,6 +192,25 @@ pub fn stamp_eraser(
     opacity: f32,
 ) -> (i32, i32, i32, i32) {
     let (x0, y0, x1, y1) = tip.bbox(cx, cy);
+    if doc.mode == ColorMode::Cmyk {
+        // Erasing a CMYK pixel reduces its alpha-plane alpha.
+        for yy in y0..y1 {
+            for xx in x0..x1 {
+                let d = ((xx as f32 + 0.5 - cx).powi(2) + (yy as f32 + 0.5 - cy).powi(2)).sqrt();
+                let s = tip.falloff(d) * opacity * sel_strength(sel, xx, yy);
+                if s <= 0.0 {
+                    continue;
+                }
+                let a = doc.layers[layer].get_alpha(xx, yy);
+                if a == 0 {
+                    continue;
+                }
+                let na = (a as f32 * (1.0 - s) + 0.5) as u16;
+                doc.layers[layer].set_alpha(xx, yy, na);
+            }
+        }
+        return (x0, y0, x1, y1);
+    }
     for yy in y0..y1 {
         for xx in x0..x1 {
             let d = ((xx as f32 + 0.5 - cx).powi(2) + (yy as f32 + 0.5 - cy).powi(2)).sqrt();
@@ -175,6 +246,34 @@ pub fn stamp_clone(
     // Snapshot the source area first so a stamp never reads its own writes.
     let (x0, y0, x1, y1) = tip.bbox(cx, cy);
     let (dx, dy) = (src_c.0 - cx, src_c.1 - cy);
+    if doc.mode == ColorMode::Cmyk {
+        let mut ink_samples: Vec<(i32, i32, CmykSample)> = Vec::new();
+        for yy in y0..y1 {
+            for xx in x0..x1 {
+                let sx = (xx as f32 + dx).round() as i32;
+                let sy = (yy as f32 + dy).round() as i32;
+                ink_samples.push((xx, yy, doc.get_cmyk(layer, sx, sy)));
+            }
+        }
+        for (xx, yy, sp) in ink_samples {
+            if sp.4 == 0 {
+                continue;
+            }
+            let d = ((xx as f32 + 0.5 - cx).powi(2) + (yy as f32 + 0.5 - cy).powi(2)).sqrt();
+            let st = tip.falloff(d) * opacity * sel_strength(sel, xx, yy);
+            let f = |v: u16| v as f32 / 65535.0;
+            over_ink(
+                doc,
+                layer,
+                xx,
+                yy,
+                (f(sp.0), f(sp.1), f(sp.2), f(sp.3)),
+                f(sp.4),
+                st,
+            );
+        }
+        return (x0, y0, x1, y1);
+    }
     let mut samples: Vec<(i32, i32, Pixel16)> = Vec::new();
     for yy in y0..y1 {
         for xx in x0..x1 {
@@ -206,6 +305,48 @@ pub fn stamp_blur(
     strength: f32,
 ) -> (i32, i32, i32, i32) {
     let (x0, y0, x1, y1) = tip.bbox(cx, cy);
+    if doc.mode == ColorMode::Cmyk {
+        let mut ink_writes: Vec<(i32, i32, CmykSample)> = Vec::new();
+        for yy in y0..y1 {
+            for xx in x0..x1 {
+                let d = ((xx as f32 + 0.5 - cx).powi(2) + (yy as f32 + 0.5 - cy).powi(2)).sqrt();
+                let s = tip.falloff(d) * strength * sel_strength(sel, xx, yy);
+                if s <= 0.0 {
+                    continue;
+                }
+                let mut acc = [0.0f32; 4];
+                for oy in -1..=1 {
+                    for ox in -1..=1 {
+                        let p = doc.get_cmyk(layer, xx + ox, yy + oy);
+                        acc[0] += p.0 as f32 / 65535.0;
+                        acc[1] += p.1 as f32 / 65535.0;
+                        acc[2] += p.2 as f32 / 65535.0;
+                        acc[3] += p.3 as f32 / 65535.0;
+                    }
+                }
+                let cur = doc.get_cmyk(layer, xx, yy);
+                let mix = |c: u16, a: f32| -> u16 {
+                    let cf = c as f32 / 65535.0;
+                    ((cf + (a / 9.0 - cf) * s).clamp(0.0, 1.0) * 65535.0 + 0.5) as u16
+                };
+                ink_writes.push((
+                    xx,
+                    yy,
+                    (
+                        mix(cur.0, acc[0]),
+                        mix(cur.1, acc[1]),
+                        mix(cur.2, acc[2]),
+                        mix(cur.3, acc[3]),
+                        cur.4,
+                    ),
+                ));
+            }
+        }
+        for (x, y, v) in ink_writes {
+            doc.set_cmyk(layer, x, y, v);
+        }
+        return (x0, y0, x1, y1);
+    }
     let mut writes: Vec<(i32, i32, Pixel16)> = Vec::new();
     for yy in y0..y1 {
         for xx in x0..x1 {
@@ -258,6 +399,48 @@ pub fn stamp_sharpen(
     strength: f32,
 ) -> (i32, i32, i32, i32) {
     let (x0, y0, x1, y1) = tip.bbox(cx, cy);
+    if doc.mode == ColorMode::Cmyk {
+        let mut ink_writes: Vec<(i32, i32, CmykSample)> = Vec::new();
+        for yy in y0..y1 {
+            for xx in x0..x1 {
+                let d = ((xx as f32 + 0.5 - cx).powi(2) + (yy as f32 + 0.5 - cy).powi(2)).sqrt();
+                let s = tip.falloff(d) * strength * sel_strength(sel, xx, yy);
+                if s <= 0.0 {
+                    continue;
+                }
+                let mut acc = [0.0f32; 4];
+                for oy in -1..=1 {
+                    for ox in -1..=1 {
+                        let p = doc.get_cmyk(layer, xx + ox, yy + oy);
+                        acc[0] += p.0 as f32 / 65535.0;
+                        acc[1] += p.1 as f32 / 65535.0;
+                        acc[2] += p.2 as f32 / 65535.0;
+                        acc[3] += p.3 as f32 / 65535.0;
+                    }
+                }
+                let cur = doc.get_cmyk(layer, xx, yy);
+                let push = |c: u16, a: f32| -> u16 {
+                    let cf = c as f32 / 65535.0;
+                    ((cf + (cf - a / 9.0) * s).clamp(0.0, 1.0) * 65535.0 + 0.5) as u16
+                };
+                ink_writes.push((
+                    xx,
+                    yy,
+                    (
+                        push(cur.0, acc[0]),
+                        push(cur.1, acc[1]),
+                        push(cur.2, acc[2]),
+                        push(cur.3, acc[3]),
+                        cur.4,
+                    ),
+                ));
+            }
+        }
+        for (x, y, v) in ink_writes {
+            doc.set_cmyk(layer, x, y, v);
+        }
+        return (x0, y0, x1, y1);
+    }
     let mut writes: Vec<(i32, i32, Pixel16)> = Vec::new();
     for yy in y0..y1 {
         for xx in x0..x1 {
@@ -309,6 +492,23 @@ pub fn stamp_smudge(
     tip: &BrushTip,
     strength: f32,
 ) -> (i32, i32, i32, i32) {
+    if doc.mode == ColorMode::Cmyk {
+        // The carry's slots hold ink values (see sample_average).
+        let (x0, y0, x1, y1) = tip.bbox(cx, cy);
+        let ink = {
+            let f = carry.to_f32s();
+            (f.0, f.1, f.2, f.3)
+        };
+        for yy in y0..y1 {
+            for xx in x0..x1 {
+                let d = ((xx as f32 + 0.5 - cx).powi(2) + (yy as f32 + 0.5 - cy).powi(2)).sqrt();
+                let s =
+                    tip.falloff(d) * strength.clamp(0.0, 1.0) * 0.85 * sel_strength(sel, xx, yy);
+                over_ink(doc, layer, xx, yy, ink, 1.0, s);
+            }
+        }
+        return (x0, y0, x1, y1);
+    }
     stamp_brush(
         doc,
         layer,
@@ -324,6 +524,23 @@ pub fn stamp_smudge(
 /// Sample the average color under a point (for Smudge pickup and the
 /// Eyedropper's averaged mode).
 pub fn sample_average(doc: &Document, layer: usize, cx: i32, cy: i32, radius: i32) -> Pixel16 {
+    if doc.mode == ColorMode::Cmyk {
+        // Average ink values; the returned pixel's slots hold
+        // (c, m, y, k) — the Smudge carry convention in CMYK mode.
+        let mut acc = [0.0f32; 4];
+        let mut n = 0.0f32;
+        for yy in cy - radius..=cy + radius {
+            for xx in cx - radius..=cx + radius {
+                let p = doc.get_cmyk(layer, xx, yy);
+                acc[0] += p.0 as f32 / 65535.0;
+                acc[1] += p.1 as f32 / 65535.0;
+                acc[2] += p.2 as f32 / 65535.0;
+                acc[3] += p.3 as f32 / 65535.0;
+                n += 1.0;
+            }
+        }
+        return Pixel16::from_f32s(acc[0] / n, acc[1] / n, acc[2] / n, acc[3] / n);
+    }
     let mut acc = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
     let mut n = 0.0f32;
     for yy in cy - radius..=cy + radius {

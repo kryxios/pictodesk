@@ -498,6 +498,9 @@ struct App {
     pen_hit: Option<(usize, usize, u8)>, // subpath, anchor, part (0 point, 1 in, 2 out)
     pen_anchor: Option<(usize, usize)>,
     alpha_cmd: Option<DocumentCommand>,
+    /// Doc snapshot taken when a pen/path edit begins; committed as
+    /// one undo step when the gesture ends (path edits are undoable).
+    path_before: Option<Document>,
     alpha_last: (f32, f32),
     file_panel: Option<Vec<PathBuf>>,
     // interaction
@@ -564,6 +567,7 @@ impl App {
             pen_hit: None,
             pen_anchor: None,
             alpha_cmd: None,
+            path_before: None,
             alpha_last: (0.0, 0.0),
             file_panel: None,
             cursor: (0.0, 0.0),
@@ -882,6 +886,27 @@ impl App {
         self.last_label = Some(label.to_string());
         self.status = label.to_string();
         self.touch();
+    }
+
+    /// Begin a pen/path edit gesture: snapshot the document so the
+    /// whole gesture becomes a single undo step on commit.
+    fn begin_path_edit(&mut self) {
+        if self.path_before.is_none() {
+            self.path_before = Some(self.doc.clone());
+        }
+    }
+
+    /// Finish a pen/path edit gesture: if the document changed,
+    /// push the snapshot pair as one history command.
+    fn commit_path_edit(&mut self, label: &str) {
+        if let Some(before) = self.path_before.take() {
+            if before != self.doc {
+                let mut cmd = DocumentCommand::begin(label, &before);
+                cmd.finish(&self.doc);
+                self.hist.push(Box::new(cmd));
+                self.last_label = Some(label.to_string());
+            }
+        }
     }
 
     fn open_path(&mut self, path: &Path) {
@@ -1525,19 +1550,20 @@ impl App {
                     self.status = format!("{label} (tolerance {tol})");
                 }
             }
-            DialogKind::SavePath => {
-                if let Some(mut wp) = self.doc.work_path.take() {
-                    let name = d.text.trim().to_string();
-                    wp.name = if name.is_empty() {
-                        format!("Path {}", self.doc.paths.len() + 1)
-                    } else {
-                        name
-                    };
-                    self.doc.paths.push(wp);
-                    self.active_path = Some(PathRef::Saved(self.doc.paths.len() - 1));
-                    self.status = format!("Saved path '{}'", self.doc.paths.last().unwrap().name);
-                    self.touch();
-                }
+            DialogKind::SavePath if self.doc.work_path.is_some() => {
+                self.begin_path_edit();
+                let mut wp = self.doc.work_path.take().unwrap();
+                let name = d.text.trim().to_string();
+                wp.name = if name.is_empty() {
+                    format!("Path {}", self.doc.paths.len() + 1)
+                } else {
+                    name
+                };
+                self.doc.paths.push(wp);
+                self.active_path = Some(PathRef::Saved(self.doc.paths.len() - 1));
+                self.commit_path_edit("Save Path");
+                self.status = format!("Saved path '{}'", self.doc.paths.last().unwrap().name);
+                self.touch();
             }
             _ => {}
         }
@@ -1852,12 +1878,11 @@ impl App {
                         (0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32) as u8
                     }
                     ColorMode::Cmyk => {
-                        let (c, m, y, k) = pictodesk_core::color::rgb_to_cmyk(
-                            r as f32 / 255.0,
-                            g as f32 / 255.0,
-                            b as f32 / 255.0,
-                        );
-                        (255.0 - [c, m, y, k][ci.min(3)] * 255.0) as u8
+                        // The stored inks themselves (the document
+                        // holds real CMYK values now).
+                        let (c, m, y, k) = self.doc.render_cmyk_pixel(dx, dy);
+                        let d = |v: u16| ((v as u32 + 128) / 257) as u8;
+                        255 - [d(c), d(m), d(y), d(k)][ci.min(3)]
                     }
                 };
                 (v, v, v)
@@ -2368,41 +2393,45 @@ impl App {
             }
             2 => {
                 let n = self.doc.alphas.len() + 1;
-                self.doc.alphas.push(AlphaChannel::new(
-                    format!("Alpha {n}"),
-                    self.doc.width,
-                    self.doc.height,
-                ));
+                let (w, h) = (self.doc.width, self.doc.height);
+                self.structural("New Channel", |d| {
+                    d.alphas.push(AlphaChannel::new(format!("Alpha {n}"), w, h));
+                });
                 let idx = self.doc.alphas.len() - 1;
                 self.channel_view = ChannelView::Alpha(idx);
                 self.paint_target = PaintTarget::Alpha(idx);
                 self.status = format!("New channel: Alpha {n}");
-                self.touch();
             }
             3 => {
                 if let ChannelView::Alpha(a) = self.channel_view {
                     if a < self.doc.alphas.len() {
-                        let name = self.doc.alphas.remove(a).name;
+                        let name = self.doc.alphas[a].name.clone();
+                        self.structural("Delete Channel", |d| {
+                            d.alphas.remove(a);
+                        });
                         if self.paint_target == PaintTarget::Alpha(a) {
                             self.paint_target = PaintTarget::Image;
                         }
                         self.channel_view = ChannelView::Composite;
                         self.status = format!("Deleted {name}");
-                        self.touch();
                     }
                 }
             }
             4 => {
                 if let ChannelView::Alpha(a) = self.channel_view {
-                    if let Some(ch) = self.doc.alphas.get_mut(a) {
-                        ch.spot_color = if ch.spot_color.is_some() {
+                    if a < self.doc.alphas.len() {
+                        let new_spot = if self.doc.alphas[a].spot_color.is_some() {
                             None
                         } else {
                             let (r, g, b, _) = self.fg.to_rgba8();
                             Some((r, g, b))
                         };
+                        self.structural("Toggle Spot Channel", |d| {
+                            if let Some(ch) = d.alphas.get_mut(a) {
+                                ch.spot_color = new_spot;
+                            }
+                        });
                         self.status = "Spot channel toggled".into();
-                        self.touch();
                     }
                 }
             }
@@ -2449,10 +2478,11 @@ impl App {
             if let Some(sel) = &self.sel {
                 let mut p = pictodesk_core::path::selection_to_path(sel);
                 p.name = String::new();
-                self.doc.work_path = Some(p);
+                self.structural("Make Work Path", |d| {
+                    d.work_path = Some(p);
+                });
                 self.active_path = Some(PathRef::Work);
                 self.status = "Made work path from selection".into();
-                self.touch();
             } else {
                 self.status = "Make Path needs a selection".into();
             }
@@ -2582,40 +2612,49 @@ impl App {
             }
             5 => {
                 if let PathRef::Saved(idx) = pref {
-                    self.doc.clipping_path = if self.doc.clipping_path == Some(idx) {
+                    let new_val = if self.doc.clipping_path == Some(idx) {
                         None
                     } else {
                         Some(idx)
                     };
+                    let label = if new_val.is_some() {
+                        "Set Clipping Path"
+                    } else {
+                        "Clear Clipping Path"
+                    };
+                    self.structural(label, |d| {
+                        d.clipping_path = new_val;
+                    });
                     self.status = if self.doc.clipping_path == Some(idx) {
                         "Clipping path set (exports with CMYK TIFF)"
                     } else {
                         "Clipping path cleared"
                     }
                     .into();
-                    self.touch();
                 } else {
                     self.status = "Save the path before making it a clipping path".into();
                 }
             }
             6 => match pref {
                 PathRef::Work => {
-                    self.doc.work_path = None;
+                    self.structural("Delete Path", |d| {
+                        d.work_path = None;
+                    });
                     self.active_path = None;
                     self.status = "Work path discarded".into();
-                    self.touch();
                 }
                 PathRef::Saved(idx) => {
                     if idx < self.doc.paths.len() {
-                        self.doc.paths.remove(idx);
-                        self.doc.clipping_path = match self.doc.clipping_path {
-                            Some(c) if c == idx => None,
-                            Some(c) if c > idx => Some(c - 1),
-                            other => other,
-                        };
+                        self.structural("Delete Path", |d| {
+                            d.paths.remove(idx);
+                            d.clipping_path = match d.clipping_path {
+                                Some(c) if c == idx => None,
+                                Some(c) if c > idx => Some(c - 1),
+                                other => other,
+                            };
+                        });
                         self.active_path = None;
                         self.status = "Path deleted".into();
-                        self.touch();
                     }
                 }
             },
@@ -3598,6 +3637,7 @@ impl App {
     /// current subpath if the first anchor is clicked, otherwise add
     /// an anchor (drag turns it into a smooth point).
     fn pen_down(&mut self, x: f32, y: f32, dp: (f32, f32)) {
+        self.begin_path_edit();
         self.ensure_pen_target();
         let canvas = self.canvas_rect(self.win_size.0, self.win_size.1);
         let to_scr = |p: (f32, f32)| {
@@ -3641,6 +3681,7 @@ impl App {
                         if let Some(p) = self.target_path_mut() {
                             p.subpaths[li].closed = true;
                         }
+                        self.commit_path_edit("Close Path");
                         self.status = "Path closed".into();
                         self.touch();
                         return;
@@ -4066,8 +4107,14 @@ impl App {
         }
         match self.drag {
             DragMode::PenNew | DragMode::PenDrag => {
+                let label = if self.drag == DragMode::PenNew {
+                    "Add Anchor"
+                } else {
+                    "Edit Path"
+                };
                 self.drag = DragMode::None;
                 self.pen_hit = None;
+                self.commit_path_edit(label);
             }
             DragMode::Paint => {
                 if let Some(mut cmd) = self.alpha_cmd.take() {
@@ -4285,6 +4332,7 @@ impl App {
                 if !popped && self.dialog.is_none() {
                     if self.tool == Tool::Pen {
                         // delete the last anchor of the current subpath
+                        self.begin_path_edit();
                         let mut removed = false;
                         if let Some(pth) = self.target_path_mut() {
                             if let Some(sub) = pth
@@ -4298,6 +4346,7 @@ impl App {
                             }
                         }
                         if removed {
+                            self.commit_path_edit("Delete Anchor");
                             self.pen_anchor = None;
                             self.status = "Anchor deleted".into();
                             self.touch();

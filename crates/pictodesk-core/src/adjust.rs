@@ -8,7 +8,8 @@
 //! color adjustment — fully transparent pixels are left untouched,
 //! and every adjustment preserves the pixel's alpha.
 
-use crate::document::Document;
+use crate::color::{cmyk_to_rgb, rgb_to_cmyk};
+use crate::document::{ColorMode, Document};
 use crate::pixel::Pixel16;
 use crate::selection::Selection;
 
@@ -52,6 +53,73 @@ pub fn map_layer_pixels(
     }
 }
 
+/// The CMYK counterpart of map_layer_pixels: apply `f` to the ink
+/// values of every painted (alpha > 0) pixel of `layer`, blended by
+/// the selection mask. Alpha is preserved.
+pub fn map_layer_inks(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    f: impl Fn([f32; 4]) -> [f32; 4],
+) {
+    let offset = doc.layers[layer].offset;
+    let mut coords: Vec<_> = doc.layers[layer].tiles.keys().copied().collect();
+    for c in doc.layers[layer].cmyk_alpha.keys() {
+        if !coords.contains(c) {
+            coords.push(*c);
+        }
+    }
+    for coord in coords {
+        for ly in 0..256i32 {
+            for lx in 0..256i32 {
+                let (dx, dy) = (coord.0 * 256 + lx + offset.0, coord.1 * 256 + ly + offset.1);
+                let (c, m, y, k, a) = doc.get_cmyk(layer, dx, dy);
+                if a == 0 {
+                    continue;
+                }
+                let strength = match sel {
+                    None => 255,
+                    Some(s) => s.value(dx, dy),
+                };
+                if strength == 0 {
+                    continue;
+                }
+                let ink = [
+                    c as f32 / 65535.0,
+                    m as f32 / 65535.0,
+                    y as f32 / 65535.0,
+                    k as f32 / 65535.0,
+                ];
+                let mut out = f(ink);
+                if strength != 255 {
+                    let t = strength as f32 / 255.0;
+                    for i in 0..4 {
+                        out[i] = ink[i] + (out[i] - ink[i]) * t;
+                    }
+                }
+                let e = |v: f32| (v.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
+                doc.set_cmyk(
+                    layer,
+                    dx,
+                    dy,
+                    (e(out[0]), e(out[1]), e(out[2]), e(out[3]), a),
+                );
+            }
+        }
+    }
+}
+
+/// Run an RGB-space adjustment math closure on a CMYK document:
+/// each pixel's inks convert to RGB, the math applies, and the
+/// result converts back to inks. (Editors do the same internally
+/// for the RGB-defined adjustments in CMYK mode.)
+fn via_rgb(ink: [f32; 4], f: impl Fn(f32, f32, f32) -> (f32, f32, f32)) -> [f32; 4] {
+    let (r, g, b) = cmyk_to_rgb(ink[0], ink[1], ink[2], ink[3]);
+    let (r, g, b) = f(r, g, b);
+    let (c, m, y, k) = rgb_to_cmyk(r, g, b);
+    [c, m, y, k]
+}
+
 fn blend_px(a: Pixel16, b: Pixel16, t: f32) -> Pixel16 {
     let l = |x: u16, y: u16| -> u16 { (x as f32 + (y as f32 - x as f32) * t + 0.5) as u16 };
     Pixel16::new(l(a.r, b.r), l(a.g, b.g), l(a.b, b.b), a.a)
@@ -75,6 +143,17 @@ pub fn brightness_contrast(
     let b = brightness.clamp(-150, 150) as f32 / 255.0;
     let c8 = contrast.clamp(-100, 100) as f32 * 2.55;
     let factor = (259.0 * (c8 + 255.0)) / (255.0 * (259.0 - c8));
+    if doc.mode == ColorMode::Cmyk {
+        map_layer_inks(doc, layer, sel, |ink| {
+            [
+                factor * (ink[0] + b - 0.5) + 0.5,
+                factor * (ink[1] + b - 0.5) + 0.5,
+                factor * (ink[2] + b - 0.5) + 0.5,
+                factor * (ink[3] + b - 0.5) + 0.5,
+            ]
+        });
+        return;
+    }
     map_layer_pixels(doc, layer, sel, |p| {
         map_rgb(p, |r, g, bl| {
             (
@@ -87,6 +166,12 @@ pub fn brightness_contrast(
 }
 
 pub fn invert(doc: &mut Document, layer: usize, sel: Option<&Selection>) {
+    if doc.mode == ColorMode::Cmyk {
+        map_layer_inks(doc, layer, sel, |ink| {
+            [1.0 - ink[0], 1.0 - ink[1], 1.0 - ink[2], 1.0 - ink[3]]
+        });
+        return;
+    }
     map_layer_pixels(doc, layer, sel, |p| {
         map_rgb(p, |r, g, b| (1.0 - r, 1.0 - g, 1.0 - b))
     });
@@ -95,12 +180,15 @@ pub fn invert(doc: &mut Document, layer: usize, sel: Option<&Selection>) {
 /// Image > Adjust > Desaturate — the classic method: gray = HSL
 /// lightness, (max + min) / 2 of the RGB channels.
 pub fn desaturate(doc: &mut Document, layer: usize, sel: Option<&Selection>) {
-    map_layer_pixels(doc, layer, sel, |p| {
-        map_rgb(p, |r, g, b| {
-            let l = (r.max(g).max(b) + r.min(g).min(b)) / 2.0;
-            (l, l, l)
-        })
-    });
+    let math = |r: f32, g: f32, b: f32| {
+        let l = (r.max(g).max(b) + r.min(g).min(b)) / 2.0;
+        (l, l, l)
+    };
+    if doc.mode == ColorMode::Cmyk {
+        map_layer_inks(doc, layer, sel, |ink| via_rgb(ink, math));
+        return;
+    }
+    map_layer_pixels(doc, layer, sel, |p| map_rgb(p, math));
 }
 
 fn rgb_to_hsl(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
@@ -163,22 +251,25 @@ pub fn hue_saturation(
     let hs = hue_deg.clamp(-180, 180) as f32 / 360.0;
     let ss = saturation.clamp(-100, 100) as f32 / 100.0;
     let ls = lightness.clamp(-100, 100) as f32 / 100.0;
-    map_layer_pixels(doc, layer, sel, |p| {
-        map_rgb(p, |r, g, b| {
-            let (h, s, l) = rgb_to_hsl(r, g, b);
-            let s2 = if ss >= 0.0 {
-                s + (1.0 - s) * ss
-            } else {
-                s * (1.0 + ss)
-            };
-            let l2 = if ls >= 0.0 {
-                l + (1.0 - l) * ls
-            } else {
-                l * (1.0 + ls)
-            };
-            hsl_to_rgb(h + hs, s2.clamp(0.0, 1.0), l2.clamp(0.0, 1.0))
-        })
-    });
+    let math = |r: f32, g: f32, b: f32| {
+        let (h, s, l) = rgb_to_hsl(r, g, b);
+        let s2 = if ss >= 0.0 {
+            s + (1.0 - s) * ss
+        } else {
+            s * (1.0 + ss)
+        };
+        let l2 = if ls >= 0.0 {
+            l + (1.0 - l) * ls
+        } else {
+            l * (1.0 + ls)
+        };
+        hsl_to_rgb(h + hs, s2.clamp(0.0, 1.0), l2.clamp(0.0, 1.0))
+    };
+    if doc.mode == ColorMode::Cmyk {
+        map_layer_inks(doc, layer, sel, |ink| via_rgb(ink, math));
+        return;
+    }
+    map_layer_pixels(doc, layer, sel, |p| map_rgb(p, math));
 }
 
 /// Image > Adjust > Color Balance. Each range is (cyan-red,
@@ -200,19 +291,22 @@ pub fn color_balance(
         )
     };
     let (sh, mi, hi) = (norm(shadows), norm(midtones), norm(highlights));
-    map_layer_pixels(doc, layer, sel, |p| {
-        map_rgb(p, |r, g, b| {
-            let lum = 0.299 * r + 0.587 * g + 0.114 * b;
-            let wsh = (1.0 - lum) * (1.0 - lum);
-            let whi = lum * lum;
-            let wmi = (1.0 - (2.0 * lum - 1.0).abs()).max(0.0);
-            (
-                r + 0.25 * (sh.0 * wsh + mi.0 * wmi + hi.0 * whi),
-                g + 0.25 * (sh.1 * wsh + mi.1 * wmi + hi.1 * whi),
-                b + 0.25 * (sh.2 * wsh + mi.2 * wmi + hi.2 * whi),
-            )
-        })
-    });
+    let math = |r: f32, g: f32, b: f32| {
+        let lum = 0.299 * r + 0.587 * g + 0.114 * b;
+        let wsh = (1.0 - lum) * (1.0 - lum);
+        let whi = lum * lum;
+        let wmi = (1.0 - (2.0 * lum - 1.0).abs()).max(0.0);
+        (
+            r + 0.25 * (sh.0 * wsh + mi.0 * wmi + hi.0 * whi),
+            g + 0.25 * (sh.1 * wsh + mi.1 * wmi + hi.1 * whi),
+            b + 0.25 * (sh.2 * wsh + mi.2 * wmi + hi.2 * whi),
+        )
+    };
+    if doc.mode == ColorMode::Cmyk {
+        map_layer_inks(doc, layer, sel, |ink| via_rgb(ink, math));
+        return;
+    }
+    map_layer_pixels(doc, layer, sel, |p| map_rgb(p, math));
 }
 
 /// A 0..=255 -> 0..=255 lookup table, the shared currency of Levels
@@ -234,6 +328,17 @@ pub fn apply_lut(doc: &mut Document, layer: usize, sel: Option<&Selection>, lut:
         let i = x.floor() as usize;
         lut_f[i] + (lut_f[i + 1] - lut_f[i]) * (x - i as f32)
     };
+    if doc.mode == ColorMode::Cmyk {
+        map_layer_inks(doc, layer, sel, |ink| {
+            [
+                sample(ink[0]),
+                sample(ink[1]),
+                sample(ink[2]),
+                sample(ink[3]),
+            ]
+        });
+        return;
+    }
     map_layer_pixels(doc, layer, sel, |p| {
         map_rgb(p, |r, g, b| (sample(r), sample(g), sample(b)))
     });
@@ -295,11 +400,15 @@ pub fn curves(doc: &mut Document, layer: usize, sel: Option<&Selection>, points:
 /// Image > Adjust > Posterize: reduce to `levels_count` tonal levels.
 pub fn posterize(doc: &mut Document, layer: usize, sel: Option<&Selection>, levels_count: u8) {
     let n = levels_count.clamp(2, 255) as f32;
+    let q = |v: f32| ((v * (n - 1.0)).round() / (n - 1.0)).clamp(0.0, 1.0);
+    if doc.mode == ColorMode::Cmyk {
+        map_layer_inks(doc, layer, sel, |ink| {
+            [q(ink[0]), q(ink[1]), q(ink[2]), q(ink[3])]
+        });
+        return;
+    }
     map_layer_pixels(doc, layer, sel, |p| {
-        map_rgb(p, |r, g, b| {
-            let q = |v: f32| ((v * (n - 1.0)).round() / (n - 1.0)).clamp(0.0, 1.0);
-            (q(r), q(g), q(b))
-        })
+        map_rgb(p, |r, g, b| (q(r), q(g), q(b)))
     });
 }
 
@@ -307,6 +416,20 @@ pub fn posterize(doc: &mut Document, layer: usize, sel: Option<&Selection>, leve
 /// becomes white, below becomes black. Alpha preserved.
 pub fn threshold(doc: &mut Document, layer: usize, sel: Option<&Selection>, level: u8) {
     let t = level as f32 / 255.0;
+    if doc.mode == ColorMode::Cmyk {
+        // Threshold on the proof's luminance; white is no ink,
+        // black is K only.
+        map_layer_inks(doc, layer, sel, |ink| {
+            let (r, g, b) = cmyk_to_rgb(ink[0], ink[1], ink[2], ink[3]);
+            let lum = 0.299 * r + 0.587 * g + 0.114 * b;
+            if lum >= t {
+                [0.0, 0.0, 0.0, 0.0]
+            } else {
+                [0.0, 0.0, 0.0, 1.0]
+            }
+        });
+        return;
+    }
     map_layer_pixels(doc, layer, sel, |p| {
         map_rgb(p, |r, g, b| {
             let lum = 0.299 * r + 0.587 * g + 0.114 * b;

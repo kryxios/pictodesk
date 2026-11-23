@@ -3,7 +3,7 @@
 An open-source desktop photo and image editor — local files, no cloud,
 no account, no subscription. Built feature by feature, in the open.
 
-**Status: v0.2.0 — Phase 2 complete: paths, channels, and CMYK.**
+**Status: v0.2.1 — Phase 2 complete: paths, channels, and real CMYK.**
 The UI follows the classic early-90s editor design: a File / Edit /
 Image / Mode / Filter / Select / Window menu bar, a compact
 two-column toolbox, modal dialogs with live preview, docked tabbed
@@ -36,12 +36,15 @@ What exists today:
   named paths, fill/stroke them, convert path <-> selection, and mark
   a clipping path; a Channels panel with per-channel viewing, alpha
   channels (saved selections) you can paint on directly, and basic
-  spot channels; real RGB / CMYK / Grayscale modes (CMYK is a
-  soft-proof: pixels stay 16-bit RGB internally and convert on
-  export); Select > Grow and Similar; 16-bit files now import
-  bit-exact; CMYK documents save as true CMYK TIFFs with the
-  clipping path embedded. The `.pdesk` format is now v3 (v1/v2
-  files still load).
+  spot channels; real RGB / CMYK / Grayscale modes — a CMYK
+  document stores actual ink values (plus a per-pixel alpha plane),
+  and painting, adjustments, and filters all work in ink space;
+  spot channels export as their own plates in a Separation TIFF;
+  selection-to-path uses real Bézier curve fitting, and pen/path
+  edits are undoable like everything else; Select > Grow and
+  Similar; 16-bit files now import bit-exact; CMYK documents save
+  as true CMYK TIFFs with the clipping path embedded. The
+  `.pdesk` format is now v3 (v1/v2 files still load).
 - A desktop shell (`apps/pictodesk-app`): the classic 1990-era workbench
   — platinum menu bar and toolbox, rulers, docked tabbed palettes
   (Channels/Paths, Brushes, Histogram, Color), modal dialogs with

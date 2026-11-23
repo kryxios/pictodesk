@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use crate::blend::BlendMode;
 use crate::pixel::Pixel16;
-use crate::tile::{split_coord, Tile, TileCoord};
+use crate::tile::{split_coord, Tile, TileCoord, TILE_PIXELS};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Layer {
@@ -20,6 +20,12 @@ pub struct Layer {
     /// Layer content offset in document pixels (Phase 0: always 0,0;
     /// the field exists so Phase 3 transforms don't change the format).
     pub offset: (i32, i32),
+    /// Per-pixel alpha for CMYK-mode layers, one sparse tile grid of
+    /// u16 alpha values (absent tile = fully opaque). CMYK pixels
+    /// need five values (C, M, Y, K + alpha); the four ink channels
+    /// live in `tiles` (in Pixel16's r/g/b/a slots) and alpha lives
+    /// here. Empty in RGB/Grayscale documents.
+    pub cmyk_alpha: HashMap<TileCoord, Vec<u16>>,
 }
 
 impl Layer {
@@ -31,6 +37,45 @@ impl Layer {
             visible: true,
             blend_mode: BlendMode::Normal,
             offset: (0, 0),
+            cmyk_alpha: HashMap::new(),
+        }
+    }
+
+    /// Alpha of a CMYK-mode pixel (65535 = opaque; the default where
+    /// no alpha tile exists).
+    pub fn get_alpha(&self, x: i32, y: i32) -> u16 {
+        let (coord, ox, oy) = split_coord(x - self.offset.0, y - self.offset.1);
+        match self.cmyk_alpha.get(&coord) {
+            Some(t) => t[(oy as usize) * 256 + ox as usize],
+            None => u16::MAX,
+        }
+    }
+
+    pub fn set_alpha(&mut self, x: i32, y: i32, v: u16) {
+        let (coord, ox, oy) = split_coord(x - self.offset.0, y - self.offset.1);
+        if v == u16::MAX && !self.cmyk_alpha.contains_key(&coord) {
+            return; // opaque is the default; don't allocate for it
+        }
+        let tile = self
+            .cmyk_alpha
+            .entry(coord)
+            .or_insert_with(|| vec![u16::MAX; TILE_PIXELS]);
+        tile[(oy as usize) * 256 + ox as usize] = v;
+    }
+
+    /// Snapshot one CMYK alpha tile (undo + serialization support).
+    pub fn snapshot_alpha_tile(&self, coord: TileCoord) -> Option<Vec<u16>> {
+        self.cmyk_alpha.get(&coord).cloned()
+    }
+
+    pub fn restore_alpha_tile(&mut self, coord: TileCoord, tile: Option<Vec<u16>>) {
+        match tile {
+            Some(t) => {
+                self.cmyk_alpha.insert(coord, t);
+            }
+            None => {
+                self.cmyk_alpha.remove(&coord);
+            }
         }
     }
 

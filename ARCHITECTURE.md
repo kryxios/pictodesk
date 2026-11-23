@@ -117,16 +117,22 @@ the engine itself is unlimited; later phases raise the cap).
   saved paths, a work path, and a clipping-path index. `.pdesk` is
   now v3 — the v2 envelope carries an extension block; v1/v2 files
   load with defaults.
-- `mode.rs` + `color.rs` — mode conversion. CMYK is a soft proof:
-  pixels stay 16-bit RGB internally; conversion applies the
-  RGB->CMYK->RGB round trip (gamut clip) to every layer, channel
-  views derive CMYK components per pixel, and export writes real
-  separations.
+- `mode.rs` + `color.rs` — mode conversion. Since v0.2.1 a CMYK
+  document stores real ink values: the four tile slots hold C, M,
+  Y, K and a sparse per-layer alpha plane (`Layer::cmyk_alpha`)
+  holds coverage. Rendering composites in ink space and converts
+  to RGB for display; painting, adjustments, filters, and
+  transforms all have ink-space paths, and tile-snapshot undo
+  captures the alpha tiles alongside the ink tiles. The `.pdesk`
+  extension block appends the alpha planes (older v3 files load
+  with empty planes).
 - `io.rs` — 16-bit sources import bit-exact (ICC conversion still
-  applies to 8-bit sources), and a hand-rolled CMYK TIFF writer:
-  Photometric 5, one strip, plus tag 34377 carrying the clipping
-  path as an image resource block when one is set. CMYK-mode
-  documents saved as `.tif` route here automatically.
+  applies to 8-bit sources), and a hand-rolled Separation TIFF
+  writer: Photometric 5, InkSet/InkNames/NumberOfInks tags, spot
+  channels as extra ink samples (their own plates), one strip,
+  plus tag 34377 carrying the clipping path as an image resource
+  block when one is set. CMYK-mode documents saved as `.tif`
+  route here automatically.
 - `selection.rs` — Grow (boundary flood by color tolerance) and
   Similar (global color-range match).
 - `brush.rs` — channel painting: tip stamps and flood fill that work

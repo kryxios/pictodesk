@@ -111,6 +111,37 @@ pub fn composite_over(
     (chan(mr, br, sr), chan(mg, bg, sg), chan(mb, bb, sb), out_a)
 }
 
+/// Composite a CMYK source pixel over a backdrop in ink space.
+/// Inks are (c, m, y, k) in 0.0..=1.0 with a separate straight alpha
+/// — the five-value CMYK pixel. Blend modes apply per ink channel;
+/// the coverage math is Porter-Duff "over", same as composite_over.
+pub fn composite_over_inks(
+    backdrop: ([f32; 4], f32),
+    source: ([f32; 4], f32),
+    mode: BlendMode,
+    opacity: f32,
+) -> ([f32; 4], f32) {
+    let (b, ba) = backdrop;
+    let (s, sa0) = source;
+    let sa = sa0 * opacity.clamp(0.0, 1.0);
+    if sa <= 0.0 {
+        return backdrop;
+    }
+    if ba <= 0.0 {
+        return (s, sa);
+    }
+    let out_a = sa + ba * (1.0 - sa);
+    if out_a <= 0.0 {
+        return ([0.0; 4], 0.0);
+    }
+    let mut out = [0.0f32; 4];
+    for i in 0..4 {
+        let m = mode.blend_channel(b[i], s[i]);
+        out[i] = (sa * (1.0 - ba) * s[i] + sa * ba * m + (1.0 - sa) * ba * b[i]) / out_a;
+    }
+    (out, out_a)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

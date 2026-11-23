@@ -22,6 +22,10 @@ pub struct TileChange {
     pub coord: TileCoord,
     pub before: Option<Tile>,
     pub after: Option<Tile>,
+    /// CMYK-mode alpha plane tile at the same coord (None in RGB docs
+    /// and where no alpha tile exists).
+    pub before_alpha: Option<Vec<u16>>,
+    pub after_alpha: Option<Vec<u16>>,
 }
 
 /// A command made of tile changes — the workhorse for brush strokes,
@@ -54,6 +58,8 @@ impl TileEditCommand {
             coord,
             before: doc.layers[layer].snapshot_tile(coord),
             after: None,
+            before_alpha: doc.layers[layer].snapshot_alpha_tile(coord),
+            after_alpha: None,
         });
     }
 
@@ -61,18 +67,22 @@ impl TileEditCommand {
     /// matching capture_before entry.
     pub fn capture_after(&mut self, doc: &Document, layer: usize, coord: TileCoord) {
         let after = doc.layers[layer].snapshot_tile(coord);
+        let after_alpha = doc.layers[layer].snapshot_alpha_tile(coord);
         if let Some(c) = self
             .changes
             .iter_mut()
             .find(|c| c.layer == layer && c.coord == coord)
         {
             c.after = after;
+            c.after_alpha = after_alpha;
         } else {
             self.changes.push(TileChange {
                 layer,
                 coord,
                 before: None,
                 after,
+                before_alpha: None,
+                after_alpha,
             });
         }
     }
@@ -86,12 +96,14 @@ impl Command for TileEditCommand {
     fn apply(&mut self, doc: &mut Document) {
         for c in &self.changes {
             doc.layers[c.layer].restore_tile(c.coord, c.after.clone());
+            doc.layers[c.layer].restore_alpha_tile(c.coord, c.after_alpha.clone());
         }
     }
 
     fn revert(&mut self, doc: &mut Document) {
         for c in self.changes.iter().rev() {
             doc.layers[c.layer].restore_tile(c.coord, c.before.clone());
+            doc.layers[c.layer].restore_alpha_tile(c.coord, c.before_alpha.clone());
         }
     }
 }

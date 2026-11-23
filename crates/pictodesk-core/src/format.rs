@@ -233,6 +233,22 @@ fn serialize_ext(w: &mut Writer, doc: &Document) {
         }
         None => w.u8(0),
     }
+    // CMYK alpha planes (v0.2.1 addition, appended last so files
+    // written before it still parse: the reader treats the section
+    // as optional trailing data). Per layer: tile count, then per
+    // tile (coord, TILE_PIXELS x u16).
+    for layer in &doc.layers {
+        w.u32(layer.cmyk_alpha.len() as u32);
+        let mut coords: Vec<_> = layer.cmyk_alpha.keys().copied().collect();
+        coords.sort();
+        for coord in coords {
+            w.i32(coord.0);
+            w.i32(coord.1);
+            for v in &layer.cmyk_alpha[&coord] {
+                w.u16(*v);
+            }
+        }
+    }
 }
 
 /// The current (v3) serialization: header + DEFLATE-compressed
@@ -374,6 +390,21 @@ fn parse_ext(payload: &[u8], doc: &mut Document) -> Result<(), FormatError> {
     }
     if r.u8()? != 0 {
         doc.work_path = Some(read_path(&mut r)?);
+    }
+    // Optional trailing section: CMYK alpha planes. Files written
+    // before v0.2.1 end exactly here.
+    if r.pos < payload.len() {
+        for layer in &mut doc.layers {
+            let count = r.u32()?;
+            for _ in 0..count {
+                let coord = (r.i32()?, r.i32()?);
+                let mut data = vec![0u16; TILE_PIXELS];
+                for v in &mut data {
+                    *v = r.u16()?;
+                }
+                layer.cmyk_alpha.insert(coord, data);
+            }
+        }
     }
     Ok(())
 }
