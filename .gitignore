@@ -1,0 +1,6 @@
+/target
+phase0-demo/
+*.pdesk
+*.pdesk.recovery
+*.pdesk.tmp
+shot.ppm

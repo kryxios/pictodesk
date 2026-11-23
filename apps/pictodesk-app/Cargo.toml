@@ -1,0 +1,13 @@
+[package]
+name = "pictodesk-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PictoDesk desktop shell: a wgpu window over pictodesk-core. Pan, zoom, and the engine's flattened render on a GPU texture."
+
+[dependencies]
+pictodesk-core = { path = "../../crates/pictodesk-core" }
+wgpu = "0.20"
+winit = "0.30"
+pollster = "0.3"
+bytemuck = { version = "1", features = ["derive"] }

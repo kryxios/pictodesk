@@ -1,0 +1,19 @@
+# PictoDesk CI — the Muse GitHub App cannot create files under
+# .github/workflows, so this ships as text. To activate, from your own
+# checkout run:
+#   mkdir -p .github/workflows
+#   cp docs/build.workflow.yml.txt .github/workflows/build.yml
+#   git add .github/workflows/build.yml && git commit -m "Activate CI" && git push
+name: build
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --check
+      - run: cargo clippy -- -D warnings
+      - run: cargo test

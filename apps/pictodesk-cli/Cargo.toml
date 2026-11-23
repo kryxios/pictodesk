@@ -1,0 +1,9 @@
+[package]
+name = "pictodesk-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Headless harness for pictodesk-core: runs the Phase 0 exit-criteria demo."
+
+[dependencies]
+pictodesk-core = { path = "../../crates/pictodesk-core" }
