@@ -580,6 +580,71 @@ pub fn photo_filter(
 }
 
 /// Image > Adjust > Posterize: reduce to `levels_count` tonal levels.
+/// Image > Adjust > Equalize: redistribute each channel's values
+/// so its histogram spans the full range evenly (darkest present
+/// value -> 0, brightest -> 255, cumulative in between). The
+/// histogram is gathered over the affected region (selection
+/// strength >= half).
+pub fn equalize(doc: &mut Document, layer: usize, sel: Option<&Selection>) {
+    let mut hist = [[0u32; 256]; 3];
+    let mut total: u32 = 0;
+    {
+        let l = &doc.layers[layer];
+        let offset = l.offset;
+        for coord in l.tiles.keys() {
+            let tile = &l.tiles[coord];
+            for ly in 0..256i32 {
+                for lx in 0..256i32 {
+                    let p = tile.get(lx as u32, ly as u32);
+                    if p.a == 0 {
+                        continue;
+                    }
+                    let (dx, dy) = (coord.0 * 256 + lx + offset.0, coord.1 * 256 + ly + offset.1);
+                    let s = sel.map(|s| s.value(dx, dy)).unwrap_or(255);
+                    if s < 128 {
+                        continue;
+                    }
+                    let (r, g, b, _) = p.to_rgba8();
+                    hist[0][r as usize] += 1;
+                    hist[1][g as usize] += 1;
+                    hist[2][b as usize] += 1;
+                    total += 1;
+                }
+            }
+        }
+    }
+    if total == 0 {
+        return;
+    }
+    let mut luts = [[0u8; 256]; 3];
+    for (c, lut) in luts.iter_mut().enumerate() {
+        let mut cdf = [0u32; 256];
+        let mut run = 0u32;
+        for i in 0..256 {
+            run += hist[c][i];
+            cdf[i] = run;
+        }
+        let cdf_min = cdf.iter().copied().find(|&v| v > 0).unwrap_or(0);
+        let denom = (total - cdf_min).max(1) as f32;
+        for i in 0..256 {
+            lut[i] = if cdf[i] <= cdf_min {
+                0
+            } else {
+                (((cdf[i] - cdf_min) as f32 / denom) * 255.0 + 0.5) as u8
+            };
+        }
+    }
+    map_layer_pixels(doc, layer, sel, |p| {
+        let (r, g, b, a) = p.to_rgba8();
+        Pixel16::from_rgba8(
+            luts[0][r as usize],
+            luts[1][g as usize],
+            luts[2][b as usize],
+            a,
+        )
+    });
+}
+
 pub fn posterize(doc: &mut Document, layer: usize, sel: Option<&Selection>, levels_count: u8) {
     let n = levels_count.clamp(2, 255) as f32;
     let q = |v: f32| ((v * (n - 1.0)).round() / (n - 1.0)).clamp(0.0, 1.0);

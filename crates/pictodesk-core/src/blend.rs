@@ -18,18 +18,28 @@ pub enum BlendMode {
     Saturation,
     Color,
     Luminosity,
+    Dissolve,
+    HardLight,
+    ColorDodge,
+    ColorBurn,
+    Exclusion,
 }
 
-/// All modes in menu order.
-pub const ALL_BLEND_MODES: [BlendMode; 12] = [
+/// All modes in menu order (the classic palette order).
+pub const ALL_BLEND_MODES: [BlendMode; 17] = [
     BlendMode::Normal,
+    BlendMode::Dissolve,
     BlendMode::Multiply,
-    BlendMode::Screen,
-    BlendMode::Overlay,
-    BlendMode::SoftLight,
     BlendMode::Darken,
     BlendMode::Lighten,
+    BlendMode::Screen,
+    BlendMode::ColorDodge,
+    BlendMode::ColorBurn,
+    BlendMode::Overlay,
+    BlendMode::SoftLight,
+    BlendMode::HardLight,
     BlendMode::Difference,
+    BlendMode::Exclusion,
     BlendMode::Hue,
     BlendMode::Saturation,
     BlendMode::Color,
@@ -51,6 +61,11 @@ impl BlendMode {
             BlendMode::Saturation => 9,
             BlendMode::Color => 10,
             BlendMode::Luminosity => 11,
+            BlendMode::Dissolve => 12,
+            BlendMode::HardLight => 13,
+            BlendMode::ColorDodge => 14,
+            BlendMode::ColorBurn => 15,
+            BlendMode::Exclusion => 16,
         }
     }
 
@@ -68,6 +83,11 @@ impl BlendMode {
             BlendMode::Saturation => "Saturation",
             BlendMode::Color => "Color",
             BlendMode::Luminosity => "Luminosity",
+            BlendMode::Dissolve => "Dissolve",
+            BlendMode::HardLight => "Hard Light",
+            BlendMode::ColorDodge => "Color Dodge",
+            BlendMode::ColorBurn => "Color Burn",
+            BlendMode::Exclusion => "Exclusion",
         }
     }
 
@@ -94,6 +114,11 @@ impl BlendMode {
             9 => BlendMode::Saturation,
             10 => BlendMode::Color,
             11 => BlendMode::Luminosity,
+            12 => BlendMode::Dissolve,
+            13 => BlendMode::HardLight,
+            14 => BlendMode::ColorDodge,
+            15 => BlendMode::ColorBurn,
+            16 => BlendMode::Exclusion,
             _ => return None,
         })
     }
@@ -126,10 +151,49 @@ impl BlendMode {
             BlendMode::Darken => b.min(s),
             BlendMode::Lighten => b.max(s),
             BlendMode::Difference => (b - s).abs(),
+            BlendMode::HardLight => {
+                if s < 0.5 {
+                    2.0 * b * s
+                } else {
+                    1.0 - 2.0 * (1.0 - b) * (1.0 - s)
+                }
+            }
+            BlendMode::ColorDodge => {
+                if s >= 1.0 {
+                    1.0
+                } else {
+                    (b / (1.0 - s)).min(1.0)
+                }
+            }
+            BlendMode::ColorBurn => {
+                if s <= 0.0 {
+                    0.0
+                } else {
+                    1.0 - ((1.0 - b) / s).min(1.0)
+                }
+            }
+            BlendMode::Exclusion => b + s - 2.0 * b * s,
+            // Dissolve is not a channel formula: the compositor
+            // gates the whole pixel on a deterministic hash (see
+            // Document::render_pixel). Fall back to Normal here.
+            BlendMode::Dissolve => s,
             // Component modes never reach blend_channel (see blend_rgb).
             BlendMode::Hue | BlendMode::Saturation | BlendMode::Color | BlendMode::Luminosity => s,
         }
     }
+}
+
+/// Deterministic 0.0..1.0 hash for Dissolve: stable per pixel and
+/// per layer, so renders (and checksums) don't shimmer between
+/// frames. `seed` is the layer index.
+pub fn dissolve_hash(x: i32, y: i32, seed: u32) -> f32 {
+    let mut h = (x as u32).wrapping_mul(0x9E37_79B1)
+        ^ (y as u32).wrapping_mul(0x85EB_CA77)
+        ^ seed.wrapping_mul(0x27D4_EB2F);
+    h ^= h >> 15;
+    h = h.wrapping_mul(0x2C1B_3C6D);
+    h ^= h >> 12;
+    (h % 100_000) as f32 / 100_000.0
 }
 
 // ---- Component blend modes (the classic PDF/SVG formulation) ----
@@ -348,9 +412,30 @@ mod tests {
 
     #[test]
     fn ids_round_trip() {
-        for id in 0..=11u8 {
+        for id in 0..=16u8 {
             assert_eq!(BlendMode::from_id(id).unwrap().to_id(), id);
         }
         assert!(BlendMode::from_id(99).is_none());
+    }
+
+    #[test]
+    fn phase45_mode_math() {
+        // Hard Light with a mid-gray source is identity, like Overlay.
+        assert!(close(BlendMode::HardLight.blend_channel(0.3, 0.5), 0.3));
+        assert!(close(BlendMode::HardLight.blend_channel(0.7, 0.5), 0.7));
+        // Color Dodge blows out to white as the source nears white.
+        assert!(close(BlendMode::ColorDodge.blend_channel(0.2, 1.0), 1.0));
+        assert!(close(BlendMode::ColorDodge.blend_channel(0.25, 0.5), 0.5));
+        // Color Burn with a black source is black.
+        assert!(close(BlendMode::ColorBurn.blend_channel(0.8, 0.0), 0.0));
+        assert!(close(BlendMode::ColorBurn.blend_channel(0.5, 0.5), 0.0));
+        // Exclusion: black source is identity, white inverts.
+        assert!(close(BlendMode::Exclusion.blend_channel(0.3, 0.0), 0.3));
+        assert!(close(BlendMode::Exclusion.blend_channel(0.3, 1.0), 0.7));
+        // Dissolve hash is stable and in range.
+        let h = dissolve_hash(17, 42, 3);
+        assert!((0.0..1.0).contains(&h));
+        assert_eq!(h, dissolve_hash(17, 42, 3));
+        assert_ne!(h, dissolve_hash(18, 42, 3));
     }
 }

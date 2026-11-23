@@ -709,11 +709,134 @@ pub fn gradient(
     }
 }
 
+/// Which toning tool a stamp belongs to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ToneKind {
+    Dodge,
+    Burn,
+    Sponge,
+}
+
+/// The tonal range a dodge/burn stamp leans on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ToneRange {
+    Shadows,
+    Midtones,
+    Highlights,
+}
+
+impl ToneRange {
+    /// Weight 0.0..=1.0 for a pixel of the given luminance: the
+    /// stamp acts strongest inside its range and fades out of it.
+    fn weight(self, lum: f32) -> f32 {
+        match self {
+            ToneRange::Shadows => (1.0 - lum) * (1.0 - lum),
+            ToneRange::Midtones => 1.0 - (2.0 * lum - 1.0) * (2.0 * lum - 1.0),
+            ToneRange::Highlights => lum * lum,
+        }
+    }
+}
+
+/// One Dodge / Burn / Sponge stamp. Dodge lightens multiplicatively
+/// toward white, Burn darkens toward black, Sponge pushes color
+/// away from (saturate) or toward (desaturate) its own gray.
+/// `exposure` is 0.0..=1.0 per stamp; repeated stamps build, as
+/// with the classic tools. Works in RGB space; CMYK documents
+/// round-trip each pixel through RGB, alpha untouched.
 #[allow(clippy::too_many_arguments)]
-/// Stamp the brush tip into a raw channel buffer (alpha/spot)
+pub fn stamp_tone(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    cx: f32,
+    cy: f32,
+    tip: &BrushTip,
+    kind: ToneKind,
+    range: ToneRange,
+    exposure: f32,
+    saturate: bool,
+    opacity: f32,
+) -> (i32, i32, i32, i32) {
+    let (x0, y0, x1, y1) = tip.bbox(cx, cy);
+    let cmyk = doc.mode == ColorMode::Cmyk;
+    let mut writes: Vec<(i32, i32, Pixel16)> = Vec::new();
+    let mut ink_writes: Vec<(i32, i32, CmykSample)> = Vec::new();
+    for yy in y0..y1 {
+        for xx in x0..x1 {
+            let d = ((xx as f32 + 0.5 - cx).powi(2) + (yy as f32 + 0.5 - cy).powi(2)).sqrt();
+            let cov = tip.falloff(d) * opacity * sel_strength(sel, xx, yy);
+            if cov <= 0.0 {
+                continue;
+            }
+            let (mut r, mut g, mut b, alpha) = if cmyk {
+                let (c, m, y2, k, a) = doc.get_cmyk(layer, xx, yy);
+                if a == 0 {
+                    continue;
+                }
+                let f = |v: u16| v as f32 / 65535.0;
+                let (r, g, b) = crate::color::cmyk_to_rgb(f(c), f(m), f(y2), f(k));
+                (r, g, b, a)
+            } else {
+                let p = doc.layers[layer].get_pixel(xx, yy);
+                if p.a == 0 {
+                    continue;
+                }
+                let (r, g, b, _) = p.to_f32s();
+                (r, g, b, p.a)
+            };
+            let lum = 0.3 * r + 0.59 * g + 0.11 * b;
+            let s = cov * exposure * range.weight(lum);
+            match kind {
+                ToneKind::Dodge => {
+                    r = 1.0 - (1.0 - r) * (1.0 - s);
+                    g = 1.0 - (1.0 - g) * (1.0 - s);
+                    b = 1.0 - (1.0 - b) * (1.0 - s);
+                }
+                ToneKind::Burn => {
+                    r *= 1.0 - s;
+                    g *= 1.0 - s;
+                    b *= 1.0 - s;
+                }
+                ToneKind::Sponge => {
+                    let push = |v: f32| {
+                        if saturate {
+                            lum + (v - lum) * (1.0 + cov * exposure)
+                        } else {
+                            v + (lum - v) * cov * exposure
+                        }
+                    };
+                    r = push(r);
+                    g = push(g);
+                    b = push(b);
+                }
+            }
+            if cmyk {
+                let (c, m, y2, k) = crate::color::rgb_to_cmyk(
+                    r.clamp(0.0, 1.0),
+                    g.clamp(0.0, 1.0),
+                    b.clamp(0.0, 1.0),
+                );
+                let e = |v: f32| (v.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
+                ink_writes.push((xx, yy, (e(c), e(m), e(y2), e(k), alpha)));
+            } else {
+                writes.push((xx, yy, Pixel16::from_f32s(r, g, b, alpha as f32 / 65535.0)));
+            }
+        }
+    }
+    for (x, y, p) in writes {
+        doc.layers[layer].set_pixel(x, y, p);
+    }
+    for (x, y, v) in ink_writes {
+        doc.set_cmyk(layer, x, y, v);
+    }
+    (x0, y0, x1, y1)
+}
+
+/// Stamp the brush tip into a raw channel buffer (alpha/spot
 /// channels): pixels move toward `value` by tip coverage x opacity.
 /// This is how painting works when a channel, not the image, is the
 /// paint target.
+#[allow(clippy::too_many_arguments)]
 pub fn stamp_channel(
     data: &mut [u8],
     width: u32,

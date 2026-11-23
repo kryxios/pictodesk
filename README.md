@@ -3,7 +3,7 @@
 An open-source desktop photo and image editor — local files, no cloud,
 no account, no subscription. Built feature by feature, in the open.
 
-**Status: v0.4.0 — Phase 4 complete: non-destructive editing — adjustment layers, layer masks, actions, navigator, guides. First public alpha.**
+**Status: v0.4.5 — Phase 4 plus the gap pass: the full classic blend-mode set, Dodge/Burn/Sponge, Color Range and selection Modify, Equalize, twelve more filters, Copy Merged / Paste Into. First public alpha.**
 The UI follows the classic early-90s editor design: a File / Edit /
 Image / Mode / Filter / Select / Window menu bar, a compact
 two-column toolbox, modal dialogs with live preview, docked tabbed
@@ -81,6 +81,22 @@ What exists today:
   of the rulers, a grid, and snapping; and right-click context
   menus. Masks, adjustment settings, and guides all save in the
   `.pdk` file.
+- Phase 4.5 (gap pass): the blend-mode set completes to the full
+  classic 17 (Dissolve — a stable per-pixel hash gate in the
+  compositor — Hard Light, Color Dodge, Color Burn, Exclusion);
+  the Dodge, Burn, and Sponge toning tools (range and exposure
+  live in the Brushes palette, O cycles them); Select > Color
+  Range (samples the foreground color, graduated fuzziness) and
+  Select > Modify (Border, Smooth, Expand, Contract, via a
+  chamfer distance transform of the mask); Image > Adjust >
+  Equalize; twelve more filters in the classic grouped Filter
+  menu — Motion and Radial Blur, Despeckle, Median, Mosaic,
+  Clouds (deterministic fractal noise between the foreground
+  and background colors), Emboss, Find Edges, Solarize, High
+  Pass, Offset, and a Custom 5x5 kernel editor; Edit > Copy
+  Merged and Paste Into; and Bring to Front / Send to Back
+  completing Layer > Arrange. Every new filter records and
+  replays in Actions like the rest.
 - A desktop shell (`apps/pictodesk-app`): the classic 1990-era workbench
   — platinum menu bar and toolbox, rulers, docked tabbed palettes
   (Channels/Paths, Brushes, Histogram, Color), modal dialogs with

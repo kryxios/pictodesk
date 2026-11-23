@@ -142,6 +142,27 @@ the engine itself is unlimited; later phases raise the cap).
   palette shows a thumbnail with the visible-area rectangle and
   click/drag panning. Right-click context menus cover the canvas
   and the Layers panel rows.
+
+## Phase 4.5 additions (v0.4.5)
+
+- `blend.rs` grows to the full classic 17 modes. Dissolve is not
+  a channel formula: `Document::render_pixel` / `composite_inks`
+  gate the whole pixel on `dissolve_hash(x, y, layer_index)` vs
+  its final alpha, so renders are stable and checksummable.
+- `selection.rs`: Modify operations run on a two-pass chamfer
+  distance transform of the thresholded mask (Expand/Contract;
+  Border = expand(a) minus contract(b); Smooth = feather +
+  re-threshold). `color_range` builds a graduated selection from
+  the composite by RGB distance to a sample color.
+- `filter.rs`: twelve filters share one RGB-region pipeline
+  (`rgb_filter_rect`); CMYK documents round-trip the region
+  through RGB, the same route Photo Filter takes. Clouds is
+  deterministic value-noise fBm between two colors; Custom is a
+  5x5 convolution with scale/offset. `brush::stamp_tone` powers
+  Dodge/Burn/Sponge with range weighting by pixel luminance.
+- Dialogs now apply their default values as the opening preview
+  (`open_dialog` refreshes once), so OK commits an untouched
+  dialog instead of silently doing nothing.
 - Actions: the shell records steps (adjustments, filters,
   geometry, layer operations) into named actions, replays them
   as one undoable step, and batch-processes a folder — each

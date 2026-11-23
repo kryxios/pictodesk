@@ -445,7 +445,7 @@ impl Document {
             return Pixel16::from_f32s(r, g, b, a);
         }
         let mut acc = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
-        for layer in &self.layers {
+        for (li, layer) in self.layers.iter().enumerate() {
             if !layer.visible {
                 continue;
             }
@@ -465,7 +465,21 @@ impl Document {
             }
             let mut p = layer.get_pixel(x, y).to_f32s();
             p.3 *= Self::mask_factor(layer, x, y);
-            acc = composite_over(acc, p, layer.blend_mode, layer.opacity);
+            let mut mode = layer.blend_mode;
+            let mut opacity = layer.opacity;
+            if mode == crate::blend::BlendMode::Dissolve {
+                // Dissolve: the pixel lands whole or not at all,
+                // with probability = its final alpha, decided by a
+                // stable per-pixel hash (no frame-to-frame shimmer).
+                let prob = opacity * p.3;
+                if prob <= 0.0 || crate::blend::dissolve_hash(x, y, li as u32) >= prob {
+                    continue;
+                }
+                p.3 = 1.0;
+                opacity = 1.0;
+                mode = crate::blend::BlendMode::Normal;
+            }
+            acc = composite_over(acc, p, mode, opacity);
         }
         Pixel16::from_f32s(acc.0, acc.1, acc.2, acc.3)
     }
@@ -474,7 +488,7 @@ impl Document {
     /// (c, m, y, k) in 0.0..=1.0 and the composited alpha.
     pub fn composite_inks(&self, x: i32, y: i32) -> ([f32; 4], f32) {
         let mut acc = ([0.0f32; 4], 0.0f32);
-        for layer in &self.layers {
+        for (li, layer) in self.layers.iter().enumerate() {
             if !layer.visible {
                 continue;
             }
@@ -494,13 +508,19 @@ impl Document {
                 continue;
             }
             let p = layer.get_pixel(x, y).to_f32s();
-            let a = layer.get_alpha(x, y) as f32 / 65535.0 * Self::mask_factor(layer, x, y);
-            acc = composite_over_inks(
-                acc,
-                ([p.0, p.1, p.2, p.3], a),
-                layer.blend_mode,
-                layer.opacity,
-            );
+            let mut a = layer.get_alpha(x, y) as f32 / 65535.0 * Self::mask_factor(layer, x, y);
+            let mut mode = layer.blend_mode;
+            let mut opacity = layer.opacity;
+            if mode == crate::blend::BlendMode::Dissolve {
+                let prob = opacity * a;
+                if prob <= 0.0 || crate::blend::dissolve_hash(x, y, li as u32) >= prob {
+                    continue;
+                }
+                a = 1.0;
+                opacity = 1.0;
+                mode = crate::blend::BlendMode::Normal;
+            }
+            acc = composite_over_inks(acc, ([p.0, p.1, p.2, p.3], a), mode, opacity);
         }
         acc
     }

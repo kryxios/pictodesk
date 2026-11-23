@@ -58,6 +58,9 @@ enum Tool {
     Blur,
     Sharpen,
     Smudge,
+    Dodge,
+    Burn,
+    Sponge,
 }
 
 impl Tool {
@@ -81,6 +84,9 @@ impl Tool {
             Tool::Blur => "Blur",
             Tool::Sharpen => "Sharpen",
             Tool::Smudge => "Smudge",
+            Tool::Dodge => "Dodge",
+            Tool::Burn => "Burn",
+            Tool::Sponge => "Sponge",
         }
     }
     fn key(&self) -> char {
@@ -100,12 +106,13 @@ impl Tool {
             Tool::Bucket => 'k',
             Tool::Gradient => 'g',
             Tool::Blur | Tool::Sharpen | Tool::Smudge => 'r',
+            Tool::Dodge | Tool::Burn | Tool::Sponge => 'o',
         }
     }
 }
 
 /// Toolbox order, two columns, classic grouping.
-const TOOLS: [Tool; 18] = [
+const TOOLS: [Tool; 21] = [
     Tool::Move,
     Tool::MarqueeRect,
     Tool::MarqueeEllipse,
@@ -122,6 +129,9 @@ const TOOLS: [Tool; 18] = [
     Tool::Blur,
     Tool::Sharpen,
     Tool::Smudge,
+    Tool::Dodge,
+    Tool::Burn,
+    Tool::Sponge,
     Tool::Hand,
     Tool::Zoom,
 ];
@@ -200,12 +210,32 @@ enum Action {
     FilterSharpen,
     FilterUnsharp,
     FilterNoise,
+    FilterMotion,
+    FilterRadial,
+    FilterDespeckle,
+    FilterMedian,
+    FilterEmboss,
+    FilterFindEdges,
+    FilterSolarize,
+    FilterClouds,
+    FilterMosaic,
+    FilterHighPass,
+    FilterOffset,
+    FilterCustom,
+    AdjustEqualize,
+    CopyMerged,
+    PasteInto,
     SelectAll,
     SelectNone,
     SelectInverse,
     FeatherDialog,
     SelectGrow,
     SelectSimilar,
+    SelectColorRange,
+    ModifyExpand,
+    ModifyContract,
+    ModifySmooth,
+    ModifyBorder,
     SaveSelection,
     LoadSelection(usize),
     ToggleHistogram,
@@ -219,6 +249,8 @@ enum Action {
     BlendMode(usize),
     BringForward,
     SendBackward,
+    LayerToFront,
+    LayerToBack,
     FreeTransform,
     MergeDown,
     MergeVisible,
@@ -330,6 +362,16 @@ enum DialogKind {
     PhotoFilter,
     FeatherMask,
     Batch,
+    MotionBlur,
+    RadialBlur,
+    MedianFilter,
+    Emboss,
+    Mosaic,
+    HighPass,
+    OffsetFilter,
+    CustomFilter,
+    ColorRange,
+    ModifySel,
 }
 
 impl DialogKind {
@@ -360,6 +402,16 @@ impl DialogKind {
             DialogKind::PhotoFilter => "Photo Filter",
             DialogKind::FeatherMask => "Feather Mask",
             DialogKind::Batch => "Batch Process",
+            DialogKind::MotionBlur => "Motion Blur",
+            DialogKind::RadialBlur => "Radial Blur",
+            DialogKind::MedianFilter => "Median",
+            DialogKind::Emboss => "Emboss",
+            DialogKind::Mosaic => "Mosaic",
+            DialogKind::HighPass => "High Pass",
+            DialogKind::OffsetFilter => "Offset",
+            DialogKind::CustomFilter => "Custom Filter",
+            DialogKind::ColorRange => "Color Range",
+            DialogKind::ModifySel => "Modify Selection",
         }
     }
     /// Pixel dialogs preview live through a tile-snapshot command.
@@ -377,6 +429,14 @@ impl DialogKind {
                 | DialogKind::Unsharp
                 | DialogKind::AddNoise
                 | DialogKind::PhotoFilter
+                | DialogKind::MotionBlur
+                | DialogKind::RadialBlur
+                | DialogKind::MedianFilter
+                | DialogKind::Emboss
+                | DialogKind::Mosaic
+                | DialogKind::HighPass
+                | DialogKind::OffsetFilter
+                | DialogKind::CustomFilter
         )
     }
 }
@@ -408,6 +468,15 @@ struct Dialog {
     /// Document state before an adjustment-layer dialog opened, so
     /// Cancel can restore it and OK can record one undo step.
     adj_snapshot: Option<Document>,
+    /// Modify Selection operation: 0 Expand, 1 Contract, 2 Smooth,
+    /// 3 Border.
+    modify_op: u8,
+    /// Custom Filter 5x5 kernel (row-major), the cell being edited,
+    /// and its scale / offset.
+    kernel: [i32; 25],
+    kernel_sel: usize,
+    kernel_scale: i32,
+    kernel_offset: i32,
 }
 
 impl Dialog {
@@ -439,6 +508,16 @@ impl Dialog {
             DialogKind::PhotoFilter => vec![25.0],
             DialogKind::FeatherMask => vec![5.0],
             DialogKind::Batch => vec![],
+            DialogKind::MotionBlur => vec![0.0, 10.0],
+            DialogKind::RadialBlur => vec![20.0],
+            DialogKind::MedianFilter => vec![1.0],
+            DialogKind::Emboss => vec![100.0],
+            DialogKind::Mosaic => vec![8.0],
+            DialogKind::HighPass => vec![10.0],
+            DialogKind::OffsetFilter => vec![0.0, 0.0],
+            DialogKind::CustomFilter => vec![],
+            DialogKind::ColorRange => vec![40.0],
+            DialogKind::ModifySel => vec![1.0],
         };
         Dialog {
             kind,
@@ -455,6 +534,15 @@ impl Dialog {
             photo_color: (255, 178, 84),
             adj_layer: None,
             adj_snapshot: None,
+            modify_op: 0,
+            kernel: {
+                let mut k = [0i32; 25];
+                k[12] = 1; // identity until the user says otherwise
+                k
+            },
+            kernel_sel: 12,
+            kernel_scale: 1,
+            kernel_offset: 0,
         }
     }
 
@@ -505,6 +593,28 @@ impl Dialog {
             | DialogKind::NewLayer => vec![],
             DialogKind::LayerOptions => vec![("Opacity", 0.0, 100.0)],
             DialogKind::GrowSel | DialogKind::SimilarSel => vec![("Tolerance", 0.0, 255.0)],
+            DialogKind::MotionBlur => {
+                vec![("Angle", 0.0, 360.0), ("Distance", 1.0, 999.0)]
+            }
+            DialogKind::RadialBlur => vec![("Amount", 1.0, 100.0)],
+            DialogKind::MedianFilter => vec![("Radius", 1.0, 10.0)],
+            DialogKind::Emboss => vec![("Amount", 0.0, 200.0)],
+            DialogKind::Mosaic => vec![("Cell Size", 2.0, 100.0)],
+            DialogKind::HighPass => vec![("Radius", 0.1, 250.0)],
+            DialogKind::OffsetFilter => {
+                vec![("Horizontal", -999.0, 999.0), ("Vertical", -999.0, 999.0)]
+            }
+            DialogKind::CustomFilter => vec![],
+            DialogKind::ColorRange => vec![("Fuzziness", 0.0, 200.0)],
+            DialogKind::ModifySel => {
+                let label = match self.modify_op {
+                    0 => "Expand By",
+                    1 => "Contract By",
+                    2 => "Smooth By",
+                    _ => "Border Width",
+                };
+                vec![(label, 1.0, 200.0)]
+            }
         }
     }
 
@@ -513,6 +623,7 @@ impl Dialog {
         match self.kind {
             DialogKind::Levels if i == 2 => format!("{v:.2}"),
             DialogKind::GaussianBlur => format!("{v:.1}"),
+            DialogKind::HighPass => format!("{v:.1}"),
             DialogKind::Unsharp if i <= 1 => format!("{v:.2}"),
             DialogKind::AddNoise => format!("{:.0}%", v * 100.0),
             _ => format!("{}", v.round() as i32),
@@ -605,6 +716,20 @@ enum RecordedStep {
     FlipV,
     Flatten,
     CropToSelection,
+    Equalize,
+    Sharpen,
+    MotionBlur(f32, f32),
+    RadialBlur(f32),
+    Median(u32),
+    Despeckle,
+    Emboss(f32),
+    FindEdges,
+    Solarize,
+    Clouds(Pixel16, Pixel16),
+    Mosaic(u32),
+    HighPass(f32),
+    OffsetPx(i32, i32),
+    CustomKernel([i32; 25], i32, i32),
 }
 
 impl RecordedStep {
@@ -628,6 +753,20 @@ impl RecordedStep {
             RecordedStep::FlipV => "Flip Vertical".into(),
             RecordedStep::Flatten => "Flatten Image".into(),
             RecordedStep::CropToSelection => "Crop".into(),
+            RecordedStep::Equalize => "Equalize".into(),
+            RecordedStep::Sharpen => "Sharpen".into(),
+            RecordedStep::MotionBlur(..) => "Motion Blur".into(),
+            RecordedStep::RadialBlur(_) => "Radial Blur".into(),
+            RecordedStep::Median(_) => "Median".into(),
+            RecordedStep::Despeckle => "Despeckle".into(),
+            RecordedStep::Emboss(_) => "Emboss".into(),
+            RecordedStep::FindEdges => "Find Edges".into(),
+            RecordedStep::Solarize => "Solarize".into(),
+            RecordedStep::Clouds(..) => "Clouds".into(),
+            RecordedStep::Mosaic(_) => "Mosaic".into(),
+            RecordedStep::HighPass(_) => "High Pass".into(),
+            RecordedStep::OffsetPx(..) => "Offset".into(),
+            RecordedStep::CustomKernel(..) => "Custom Filter".into(),
         }
     }
 }
@@ -705,6 +844,23 @@ fn apply_step(doc: &mut Document, step: &RecordedStep, sel: Option<&Selection>) 
                 transform::crop(doc, x, y, w, h);
             }
         }
+        RecordedStep::Equalize => adjust::equalize(doc, layer, sel),
+        RecordedStep::Sharpen => filter::sharpen(doc, layer, sel),
+        RecordedStep::MotionBlur(a, d) => filter::motion_blur(doc, layer, sel, *a, *d),
+        RecordedStep::RadialBlur(a) => filter::radial_blur(doc, layer, sel, *a),
+        RecordedStep::Median(r) => filter::median(doc, layer, sel, *r),
+        RecordedStep::Despeckle => filter::despeckle(doc, layer, sel),
+        RecordedStep::Emboss(a) => filter::emboss(doc, layer, sel, *a),
+        RecordedStep::FindEdges => filter::find_edges(doc, layer, sel),
+        RecordedStep::Solarize => filter::solarize(doc, layer, sel),
+        RecordedStep::Clouds(fg, bg) => filter::clouds(doc, layer, sel, *fg, *bg, 12345),
+        RecordedStep::Mosaic(c) => filter::mosaic(doc, layer, sel, *c),
+        RecordedStep::HighPass(r) => filter::high_pass(doc, layer, sel, *r),
+        RecordedStep::OffsetPx(dx, dy) => filter::offset_filter(doc, layer, sel, *dx, *dy),
+        RecordedStep::CustomKernel(k, s, o) => {
+            let kf: [f32; 25] = k.map(|x| x as f32);
+            filter::custom_filter(doc, layer, sel, kf, *s as f32, *o as f32 / 255.0)
+        }
     }
 }
 
@@ -723,6 +879,10 @@ struct App {
     bg: Pixel16,
     tip: BrushTip,
     opacity: f32,
+    /// Dodge/Burn range and per-stamp exposure; Sponge mode.
+    tone_range: brush::ToneRange,
+    tone_exposure: f32,
+    sponge_saturate: bool,
     clone_src: Option<(f32, f32)>,
     viewport: Viewport,
     file_path: Option<PathBuf>,
@@ -815,6 +975,9 @@ impl App {
             bg: Pixel16::from_rgba8(255, 255, 255, 255),
             tip: BrushTip::new(13.0, 0.7),
             opacity: 1.0,
+            tone_range: brush::ToneRange::Midtones,
+            tone_exposure: 0.5,
+            sponge_saturate: true,
             clone_src: None,
             viewport: Viewport {
                 scale: 1.0,
@@ -950,7 +1113,12 @@ impl App {
             place(PanelKind::Cp, h, &mut out, &mut y);
         }
         if self.show_brushes {
-            place(PanelKind::Brushes, 84, &mut out, &mut y);
+            let brushes_h = if matches!(self.tool, Tool::Dodge | Tool::Burn | Tool::Sponge) {
+                108
+            } else {
+                84
+            };
+            place(PanelKind::Brushes, brushes_h, &mut out, &mut y);
         }
         if self.show_histogram {
             place(PanelKind::Histogram, 132, &mut out, &mut y);
@@ -1038,10 +1206,19 @@ impl App {
                     MenuItem::new(undo_label, Action::UndoToggle)
                         .off_if(!can_undo)
                         .key("Z"),
-                    MenuItem::new("Cut", Action::Cut).off_if(!has_sel),
-                    MenuItem::new("Copy", Action::Copy).off_if(!has_sel),
+                    MenuItem::new("Cut", Action::Cut).off_if(!has_sel).key("X"),
+                    MenuItem::new("Copy", Action::Copy)
+                        .off_if(!has_sel)
+                        .key("C"),
+                    MenuItem::new("Copy Merged", Action::CopyMerged)
+                        .off_if(!has_sel)
+                        .key("Shift+C"),
                     MenuItem::new("Paste", Action::Paste)
-                        .off_if(CLIPBOARD.with(|c| c.borrow().is_none())),
+                        .off_if(CLIPBOARD.with(|c| c.borrow().is_none()))
+                        .key("V"),
+                    MenuItem::new("Paste Into", Action::PasteInto)
+                        .off_if(CLIPBOARD.with(|c| c.borrow().is_none()) || !has_sel)
+                        .key("Shift+V"),
                     MenuItem::new("Clear", Action::Clear).off_if(!has_sel),
                     MenuItem::new("Fill...", Action::FillDialog),
                 ],
@@ -1068,6 +1245,7 @@ impl App {
                         MenuItem::new("Levels...", Action::AdjustDialog("levels")),
                         MenuItem::new("Curves...", Action::AdjustDialog("curves")),
                         MenuItem::new("Invert", Action::AdjustDialog("invert")).key("I"),
+                        MenuItem::new("Equalize", Action::AdjustEqualize),
                         MenuItem::new("Desaturate", Action::AdjustDialog("desat")),
                         MenuItem::new("Posterize...", Action::AdjustDialog("posterize")),
                         MenuItem::new("Threshold...", Action::AdjustDialog("threshold")),
@@ -1121,8 +1299,10 @@ impl App {
                             .off_if(!has_mask),
                         MenuItem::new("Feather Mask...", Action::FeatherMask).off_if(!has_mask),
                         MenuItem::new("Blend Mode", Action::None).sub(blend_items),
+                        MenuItem::new("Bring to Front", Action::LayerToFront).key("Shift+]"),
                         MenuItem::new("Bring Forward", Action::BringForward).key("]"),
                         MenuItem::new("Send Backward", Action::SendBackward).key("["),
+                        MenuItem::new("Send to Back", Action::LayerToBack).key("Shift+["),
                         MenuItem::new("Free Transform...", Action::FreeTransform).key("T"),
                         MenuItem::new("Merge Down", Action::MergeDown)
                             .key("E")
@@ -1146,10 +1326,34 @@ impl App {
             Menu {
                 title: "Filter",
                 items: vec![
-                    MenuItem::new("Gaussian Blur...", Action::FilterGaussian),
-                    MenuItem::new("Sharpen", Action::FilterSharpen),
-                    MenuItem::new("Unsharp Mask...", Action::FilterUnsharp),
-                    MenuItem::new("Add Noise...", Action::FilterNoise),
+                    MenuItem::new("Blur", Action::None).sub(vec![
+                        MenuItem::new("Gaussian Blur...", Action::FilterGaussian),
+                        MenuItem::new("Motion Blur...", Action::FilterMotion),
+                        MenuItem::new("Radial Blur...", Action::FilterRadial),
+                    ]),
+                    MenuItem::new("Noise", Action::None).sub(vec![
+                        MenuItem::new("Add Noise...", Action::FilterNoise),
+                        MenuItem::new("Despeckle", Action::FilterDespeckle),
+                        MenuItem::new("Median...", Action::FilterMedian),
+                    ]),
+                    MenuItem::new("Pixelate", Action::None)
+                        .sub(vec![MenuItem::new("Mosaic...", Action::FilterMosaic)]),
+                    MenuItem::new("Render", Action::None)
+                        .sub(vec![MenuItem::new("Clouds", Action::FilterClouds)]),
+                    MenuItem::new("Sharpen", Action::None).sub(vec![
+                        MenuItem::new("Sharpen", Action::FilterSharpen),
+                        MenuItem::new("Unsharp Mask...", Action::FilterUnsharp),
+                    ]),
+                    MenuItem::new("Stylize", Action::None).sub(vec![
+                        MenuItem::new("Emboss...", Action::FilterEmboss),
+                        MenuItem::new("Find Edges", Action::FilterFindEdges),
+                        MenuItem::new("Solarize", Action::FilterSolarize),
+                    ]),
+                    MenuItem::new("Other", Action::None).sub(vec![
+                        MenuItem::new("Custom...", Action::FilterCustom),
+                        MenuItem::new("High Pass...", Action::FilterHighPass),
+                        MenuItem::new("Offset...", Action::FilterOffset),
+                    ]),
                 ],
             },
             Menu {
@@ -1159,7 +1363,16 @@ impl App {
                         MenuItem::new("All", Action::SelectAll).key("A"),
                         MenuItem::new("None", Action::SelectNone).key("D"),
                         MenuItem::new("Inverse", Action::SelectInverse).off_if(!has_sel),
+                        MenuItem::new("Color Range...", Action::SelectColorRange),
                         MenuItem::new("Feather...", Action::FeatherDialog).off_if(!has_sel),
+                        MenuItem::new("Modify", Action::None)
+                            .off_if(!has_sel)
+                            .sub(vec![
+                                MenuItem::new("Border...", Action::ModifyBorder),
+                                MenuItem::new("Smooth...", Action::ModifySmooth),
+                                MenuItem::new("Expand...", Action::ModifyExpand),
+                                MenuItem::new("Contract...", Action::ModifyContract),
+                            ]),
                         MenuItem::new("Grow...", Action::SelectGrow).off_if(!has_sel),
                         MenuItem::new("Similar...", Action::SelectSimilar).off_if(!has_sel),
                         MenuItem::new("Save Selection", Action::SaveSelection).off_if(!has_sel),
@@ -1259,6 +1472,34 @@ impl App {
         self.last_label = Some(label.to_string());
         self.status = label.to_string();
         self.touch();
+    }
+
+    /// Run a no-dialog filter or adjustment as one undoable tile
+    /// edit, and record it as an Action step.
+    fn apply_filter_now(
+        &mut self,
+        label: &str,
+        step: RecordedStep,
+        f: impl FnOnce(&mut Document, usize, Option<&Selection>),
+    ) {
+        let layer = self.doc.active_layer;
+        let tiles = self.sel_tiles();
+        let sel = self.sel.clone();
+        run_tile_edit(&mut self.doc, &mut self.hist, label, layer, &tiles, |d| {
+            f(d, layer, sel.as_ref());
+        });
+        self.record_step(step);
+        self.last_label = Some(label.into());
+        self.status = label.into();
+        self.touch();
+    }
+
+    /// Open the Modify Selection dialog for one operation
+    /// (0 Expand, 1 Contract, 2 Smooth, 3 Border).
+    fn open_modify_dialog(&mut self, op: u8) {
+        let mut d = Dialog::new(DialogKind::ModifySel, &self.doc);
+        d.modify_op = op;
+        self.dialog = Some(d);
     }
 
     /// If an Actions recording is running, append a step to it.
@@ -2029,6 +2270,80 @@ impl App {
                     self.touch();
                 }
             }
+            Action::CopyMerged => {
+                // Like Copy, but the block comes from the flattened
+                // composite of every visible layer.
+                let (x, y, w, h) = self.sel.as_ref().and_then(|s| s.bounds()).unwrap_or((
+                    0,
+                    0,
+                    self.doc.width,
+                    self.doc.height,
+                ));
+                let mut block = Vec::with_capacity((w * h) as usize);
+                for yy in 0..h as i32 {
+                    for xx in 0..w as i32 {
+                        block.push(self.doc.render_pixel(x + xx, y + yy));
+                    }
+                }
+                CLIPBOARD.with(|c| *c.borrow_mut() = Some((block, w, h)));
+                self.status = "Copied Merged".into();
+            }
+            Action::PasteInto => {
+                // Paste the clipboard into the selection: the block
+                // lands at the selection's origin and only shows
+                // where the selection is active (feathered edges
+                // blend by the mask value).
+                let clip = CLIPBOARD.with(|c| c.borrow().clone());
+                if let (Some((block, w, h)), Some(sel)) = (clip, self.sel.clone()) {
+                    if let Some((ox, oy, _, _)) = sel.bounds() {
+                        let tiles = Selection::tiles_in_rect(ox, oy, w, h);
+                        run_tile_edit(
+                            &mut self.doc,
+                            &mut self.hist,
+                            "Paste Into",
+                            layer,
+                            &tiles,
+                            |d| {
+                                for yy in 0..h as i32 {
+                                    for xx in 0..w as i32 {
+                                        let p = block[(yy as u32 * w + xx as u32) as usize];
+                                        if p.a == 0 {
+                                            continue;
+                                        }
+                                        let (dx, dy) = (ox + xx, oy + yy);
+                                        let strength = sel.value(dx, dy);
+                                        if strength == 0 {
+                                            continue;
+                                        }
+                                        if strength == 255 {
+                                            d.layers[layer].set_pixel(dx, dy, p);
+                                        } else {
+                                            let orig = d.layers[layer].get_pixel(dx, dy);
+                                            let t = strength as f32 / 255.0;
+                                            let l = |a: u16, b: u16| {
+                                                (a as f32 + (b as f32 - a as f32) * t + 0.5) as u16
+                                            };
+                                            d.layers[layer].set_pixel(
+                                                dx,
+                                                dy,
+                                                Pixel16::new(
+                                                    l(orig.r, p.r),
+                                                    l(orig.g, p.g),
+                                                    l(orig.b, p.b),
+                                                    l(orig.a, p.a),
+                                                ),
+                                            );
+                                        }
+                                    }
+                                }
+                            },
+                        );
+                        self.last_label = Some("Paste Into".into());
+                        self.status = "Pasted Into".into();
+                        self.touch();
+                    }
+                }
+            }
             Action::Clear => {
                 self.clear_selection();
             }
@@ -2211,6 +2526,23 @@ impl App {
                 if a > 0 {
                     self.structural("Send Backward", |d| {
                         d.move_layer(a, a - 1);
+                    });
+                }
+            }
+            Action::LayerToFront => {
+                let a = self.doc.active_layer;
+                let top = self.doc.layers.len() - 1;
+                if a < top {
+                    self.structural("Bring to Front", |d| {
+                        d.move_layer(a, top);
+                    });
+                }
+            }
+            Action::LayerToBack => {
+                let a = self.doc.active_layer;
+                if a > 0 {
+                    self.structural("Send to Back", |d| {
+                        d.move_layer(a, 0);
                     });
                 }
             }
@@ -2430,10 +2762,50 @@ impl App {
                         filter::sharpen(d, layer, sel.as_ref());
                     },
                 );
+                self.record_step(RecordedStep::Sharpen);
                 self.last_label = Some("Sharpen".into());
                 self.status = "Sharpen".into();
                 self.touch();
             }
+            Action::FilterMotion => self.open_dialog(DialogKind::MotionBlur),
+            Action::FilterRadial => self.open_dialog(DialogKind::RadialBlur),
+            Action::FilterMedian => self.open_dialog(DialogKind::MedianFilter),
+            Action::FilterEmboss => self.open_dialog(DialogKind::Emboss),
+            Action::FilterMosaic => self.open_dialog(DialogKind::Mosaic),
+            Action::FilterHighPass => self.open_dialog(DialogKind::HighPass),
+            Action::FilterOffset => self.open_dialog(DialogKind::OffsetFilter),
+            Action::FilterCustom => self.open_dialog(DialogKind::CustomFilter),
+            Action::FilterDespeckle => {
+                self.apply_filter_now("Despeckle", RecordedStep::Despeckle, |d, l, s| {
+                    filter::despeckle(d, l, s)
+                });
+            }
+            Action::FilterFindEdges => {
+                self.apply_filter_now("Find Edges", RecordedStep::FindEdges, |d, l, s| {
+                    filter::find_edges(d, l, s)
+                });
+            }
+            Action::FilterSolarize => {
+                self.apply_filter_now("Solarize", RecordedStep::Solarize, |d, l, s| {
+                    filter::solarize(d, l, s)
+                });
+            }
+            Action::FilterClouds => {
+                let (fg, bg) = (self.fg, self.bg);
+                self.apply_filter_now("Clouds", RecordedStep::Clouds(fg, bg), move |d, l, s| {
+                    filter::clouds(d, l, s, fg, bg, 12345)
+                });
+            }
+            Action::AdjustEqualize => {
+                self.apply_filter_now("Equalize", RecordedStep::Equalize, |d, l, s| {
+                    adjust::equalize(d, l, s)
+                });
+            }
+            Action::SelectColorRange => self.open_dialog(DialogKind::ColorRange),
+            Action::ModifyExpand => self.open_modify_dialog(0),
+            Action::ModifyContract => self.open_modify_dialog(1),
+            Action::ModifySmooth => self.open_modify_dialog(2),
+            Action::ModifyBorder => self.open_modify_dialog(3),
             Action::SelectAll => {
                 self.sel = Some(Selection::all(self.doc.width, self.doc.height));
                 self.status = "Select All".into();
@@ -2549,6 +2921,10 @@ impl App {
             d.preview = Some(cmd);
         }
         self.dialog = Some(d);
+        // Apply the default values as the first preview, so OK
+        // commits them even if the user never touches a slider
+        // (before this, OK on an untouched dialog was a no-op).
+        self.dialog_refresh_preview();
     }
 
     /// Re-run the dialog's effect from the snapshot (live preview).
@@ -2574,6 +2950,9 @@ impl App {
         let v = &self.dialog.as_ref().unwrap().vals.clone();
         let kind = self.dialog.as_ref().unwrap().kind.clone();
         let pts = self.dialog.as_ref().unwrap().curve_points.clone();
+        let kern = self.dialog.as_ref().unwrap().kernel;
+        let kscale = self.dialog.as_ref().unwrap().kernel_scale;
+        let koffset = self.dialog.as_ref().unwrap().kernel_offset;
         match kind {
             DialogKind::BrightnessContrast => {
                 adjust::brightness_contrast(&mut self.doc, layer, s, v[0] as i32, v[1] as i32)
@@ -2618,6 +2997,26 @@ impl App {
             DialogKind::PhotoFilter => {
                 let c = self.dialog.as_ref().unwrap().photo_color;
                 adjust::photo_filter(&mut self.doc, layer, s, c, v[0] as u8)
+            }
+            DialogKind::MotionBlur => filter::motion_blur(&mut self.doc, layer, s, v[0], v[1]),
+            DialogKind::RadialBlur => filter::radial_blur(&mut self.doc, layer, s, v[0]),
+            DialogKind::MedianFilter => filter::median(&mut self.doc, layer, s, v[0] as u32),
+            DialogKind::Emboss => filter::emboss(&mut self.doc, layer, s, v[0] / 100.0),
+            DialogKind::Mosaic => filter::mosaic(&mut self.doc, layer, s, v[0] as u32),
+            DialogKind::HighPass => filter::high_pass(&mut self.doc, layer, s, v[0]),
+            DialogKind::OffsetFilter => {
+                filter::offset_filter(&mut self.doc, layer, s, v[0] as i32, v[1] as i32)
+            }
+            DialogKind::CustomFilter => {
+                let k: [f32; 25] = kern.map(|x| x as f32);
+                filter::custom_filter(
+                    &mut self.doc,
+                    layer,
+                    s,
+                    k,
+                    kscale as f32,
+                    koffset as f32 / 255.0,
+                )
             }
             _ => {}
         }
@@ -2669,6 +3068,20 @@ impl App {
             DialogKind::AddNoise => Some(RecordedStep::AddNoise(d.vals[0])),
             DialogKind::Posterize => Some(RecordedStep::Posterize(d.vals[0] as u8)),
             DialogKind::Threshold => Some(RecordedStep::Threshold(d.vals[0] as u8)),
+            DialogKind::MotionBlur => Some(RecordedStep::MotionBlur(d.vals[0], d.vals[1])),
+            DialogKind::RadialBlur => Some(RecordedStep::RadialBlur(d.vals[0])),
+            DialogKind::MedianFilter => Some(RecordedStep::Median(d.vals[0] as u32)),
+            DialogKind::Emboss => Some(RecordedStep::Emboss(d.vals[0] / 100.0)),
+            DialogKind::Mosaic => Some(RecordedStep::Mosaic(d.vals[0] as u32)),
+            DialogKind::HighPass => Some(RecordedStep::HighPass(d.vals[0])),
+            DialogKind::OffsetFilter => {
+                Some(RecordedStep::OffsetPx(d.vals[0] as i32, d.vals[1] as i32))
+            }
+            DialogKind::CustomFilter => Some(RecordedStep::CustomKernel(
+                d.kernel,
+                d.kernel_scale,
+                d.kernel_offset,
+            )),
             _ => None,
         };
         match d.kind {
@@ -2729,6 +3142,38 @@ impl App {
                 if let Some(s) = &mut self.sel {
                     s.feather(d.vals[0].round() as u32);
                     self.status = format!("Feathered by {} px", d.vals[0].round() as u32);
+                }
+            }
+            DialogKind::ColorRange => {
+                // Samples the foreground color (set it with the
+                // Eyedropper first); fuzziness widens the match.
+                let (r, g, b, _) = self.fg.to_rgba8();
+                let fuzz = d.vals[0].round().clamp(0.0, 200.0) as u8;
+                self.sel = Some(Selection::color_range(&self.doc, (r, g, b), fuzz));
+                self.status = format!("Color Range: foreground ({r}, {g}, {b}), fuzziness {fuzz}");
+            }
+            DialogKind::ModifySel => {
+                if let Some(s) = &mut self.sel {
+                    let n = d.vals[0].round().max(1.0) as u32;
+                    let label = match d.modify_op {
+                        0 => {
+                            s.expand(n);
+                            "Expand Selection"
+                        }
+                        1 => {
+                            s.contract(n);
+                            "Contract Selection"
+                        }
+                        2 => {
+                            s.smooth(n);
+                            "Smooth Selection"
+                        }
+                        _ => {
+                            s.border(n);
+                            "Border Selection"
+                        }
+                    };
+                    self.status = format!("{label} by {n} px");
                 }
             }
             DialogKind::Fill => {
@@ -2917,6 +3362,10 @@ pub struct DialogLayout {
     pub anchor_cells: Vec<Rect>,
     pub fill_buttons: Vec<Rect>,
     pub text_field: Option<Rect>,
+    /// Custom Filter: the 25 kernel cells and the Scale/Offset
+    /// stepper buttons (scale -, scale +, offset -, offset +).
+    pub kernel_cells: Vec<Rect>,
+    pub kernel_buttons: Vec<Rect>,
 }
 
 impl App {
@@ -2972,8 +3421,14 @@ impl App {
         if d.kind == DialogKind::PhotoFilter {
             h += 22; // preset swatches
         }
+        if d.kind == DialogKind::ColorRange {
+            h += 22; // sample swatch row
+        }
         if d.kind == DialogKind::Batch {
             h += 52; // info lines
+        }
+        if d.kind == DialogKind::CustomFilter {
+            h = 46 + 5 * 24 + 26 + 40; // kernel grid + scale/offset row
         }
         if d.kind == DialogKind::CanvasSize {
             h += 52; // anchor grid
@@ -3004,6 +3459,9 @@ impl App {
             y += 22;
         }
         if d.kind == DialogKind::PhotoFilter {
+            y += 22;
+        }
+        if d.kind == DialogKind::ColorRange {
             y += 22;
         }
         if matches!(
@@ -3066,6 +3524,26 @@ impl App {
         } else {
             None
         };
+        let (kernel_cells, kernel_buttons) = if d.kind == DialogKind::CustomFilter {
+            let gx = rect.x + 48;
+            let gy = rect.y + 30;
+            let mut cells = Vec::new();
+            for row in 0..5 {
+                for col in 0..5 {
+                    cells.push(Rect::new(gx + col * 62, gy + row * 24, 56, 20));
+                }
+            }
+            let by = gy + 5 * 24 + 6;
+            let buttons = vec![
+                Rect::new(rect.x + 150, by, 18, 18),
+                Rect::new(rect.x + 172, by, 18, 18),
+                Rect::new(rect.x + 318, by, 18, 18),
+                Rect::new(rect.x + 340, by, 18, 18),
+            ];
+            (cells, buttons)
+        } else {
+            (Vec::new(), Vec::new())
+        };
         Some(DialogLayout {
             rect,
             slider_rows,
@@ -3076,6 +3554,8 @@ impl App {
             anchor_cells,
             fill_buttons: range_buttons,
             text_field,
+            kernel_cells,
+            kernel_buttons,
         })
     }
 
@@ -3654,6 +4134,65 @@ impl App {
                 }
             }
         }
+        self.draw_tone_row(f);
+    }
+
+    /// The toning tools' option row at the bottom of the Brushes
+    /// panel: (value button, exposure -, exposure +). Present only
+    /// while Dodge, Burn or Sponge is the active tool.
+    fn tone_row_rects(&self) -> Option<(Rect, Rect, Rect)> {
+        if !matches!(self.tool, Tool::Dodge | Tool::Burn | Tool::Sponge) {
+            return None;
+        }
+        let r = self.group_rect(PanelKind::Brushes)?;
+        let y = r.bottom() - 21;
+        Some((
+            Rect::new(r.x + 52, y, 76, 16),
+            Rect::new(r.x + 152, y, 16, 16),
+            Rect::new(r.x + 190, y, 16, 16),
+        ))
+    }
+
+    fn draw_tone_row(&mut self, f: &mut Frame) {
+        let Some((value_btn, minus, plus)) = self.tone_row_rects() else {
+            return;
+        };
+        let r = self.group_rect(PanelKind::Brushes).unwrap();
+        f.fill_rect(Rect::new(r.x + 4, r.bottom() - 24, r.w - 8, 1), ui::SHADOW);
+        if self.tool == Tool::Sponge {
+            f.text(r.x + 6, value_btn.y + 4, "Mode:", 1, ui::BLACK);
+            f.button(
+                value_btn,
+                if self.sponge_saturate {
+                    "Saturate"
+                } else {
+                    "Desaturate"
+                },
+                false,
+                true,
+            );
+        } else {
+            f.text(r.x + 6, value_btn.y + 4, "Range:", 1, ui::BLACK);
+            f.button(
+                value_btn,
+                match self.tone_range {
+                    brush::ToneRange::Shadows => "Shadows",
+                    brush::ToneRange::Midtones => "Midtones",
+                    brush::ToneRange::Highlights => "Highlights",
+                },
+                false,
+                true,
+            );
+        }
+        f.button(minus, "-", false, true);
+        f.text(
+            minus.x + 21,
+            minus.y + 4,
+            &format!("{:.0}%", self.tone_exposure * 100.0),
+            1,
+            ui::BLACK,
+        );
+        f.button(plus, "+", false, true);
     }
 
     fn brushes_cell(&self, i: usize, row: usize) -> Rect {
@@ -4770,6 +5309,45 @@ impl App {
                 return self.actions_panel_click(r, mx, my);
             }
         }
+        // Toning-tool option row (Brushes panel, tone tools only)
+        if let Some((value_btn, minus, plus)) = self.tone_row_rects() {
+            if value_btn.contains(mx, my) {
+                if self.tool == Tool::Sponge {
+                    self.sponge_saturate = !self.sponge_saturate;
+                    self.status = format!(
+                        "Sponge mode: {}",
+                        if self.sponge_saturate {
+                            "Saturate"
+                        } else {
+                            "Desaturate"
+                        }
+                    );
+                } else {
+                    self.tone_range = match self.tone_range {
+                        brush::ToneRange::Shadows => brush::ToneRange::Midtones,
+                        brush::ToneRange::Midtones => brush::ToneRange::Highlights,
+                        brush::ToneRange::Highlights => brush::ToneRange::Shadows,
+                    };
+                    self.status = format!(
+                        "Range: {}",
+                        match self.tone_range {
+                            brush::ToneRange::Shadows => "Shadows",
+                            brush::ToneRange::Midtones => "Midtones",
+                            brush::ToneRange::Highlights => "Highlights",
+                        }
+                    );
+                }
+                return true;
+            }
+            if minus.contains(mx, my) {
+                self.tone_exposure = (self.tone_exposure - 0.05).max(0.05);
+                return true;
+            }
+            if plus.contains(mx, my) {
+                self.tone_exposure = (self.tone_exposure + 0.05).min(1.0);
+                return true;
+            }
+        }
         // Brushes cells
         if self.show_brushes {
             let sizes = [1.0f32, 3.0, 5.0, 9.0, 13.0, 21.0, 35.0, 50.0];
@@ -5096,6 +5674,56 @@ impl App {
                 }
             }
         }
+        if d.kind == DialogKind::ColorRange {
+            let (sr, sg, sb, _) = self.fg.to_rgba8();
+            let sw = Rect::new(r.x + 12, r.y + 28, 18, 18);
+            f.fill_rect(sw, (sr, sg, sb));
+            f.outline_rect(sw, ui::BLACK);
+            f.text(
+                r.x + 38,
+                r.y + 34,
+                "Sampling the foreground color",
+                1,
+                ui::BLACK,
+            );
+        }
+        if d.kind == DialogKind::CustomFilter {
+            for (i, cell) in layout.kernel_cells.iter().enumerate() {
+                f.fill_rect(*cell, ui::WHITE);
+                f.bevel_sunken(*cell);
+                if i == d.kernel_sel {
+                    f.outline_rect(
+                        Rect::new(cell.x - 1, cell.y - 1, cell.w + 2, cell.h + 2),
+                        ui::BLACK,
+                    );
+                }
+                let label = d.kernel[i].to_string();
+                let tx = cell.x + (cell.w - label.len() as i32 * 6) / 2;
+                f.text(tx, cell.y + 6, &label, 1, ui::BLACK);
+            }
+            let by = r.y + 156;
+            f.text(r.x + 48, by + 5, "Scale:", 1, ui::BLACK);
+            f.text(r.x + 96, by + 5, &d.kernel_scale.to_string(), 1, ui::BLACK);
+            f.button(layout.kernel_buttons[0], "-", false, true);
+            f.button(layout.kernel_buttons[1], "+", false, true);
+            f.text(r.x + 216, by + 5, "Offset:", 1, ui::BLACK);
+            f.text(
+                r.x + 268,
+                by + 5,
+                &d.kernel_offset.to_string(),
+                1,
+                ui::BLACK,
+            );
+            f.button(layout.kernel_buttons[2], "-", false, true);
+            f.button(layout.kernel_buttons[3], "+", false, true);
+            f.text(
+                r.x + 48,
+                by + 26,
+                "Click a cell, then type its value.",
+                1,
+                ui::DARK,
+            );
+        }
         if d.kind == DialogKind::Batch {
             let name = self
                 .actions
@@ -5407,6 +6035,37 @@ fn draw_tool_icon(f: &mut Frame, tool: Tool, r: Rect) {
             f.line(cx - 7, cy + 5, cx + 1, cy + 5, ui::SHADOW);
             f.line(cx - 4, cy + 7, cx + 4, cy + 7, ui::SHADOW);
         }
+        Tool::Dodge => {
+            // The darkroom dodging paddle: a disc on a stick, held
+            // to keep light off part of the print.
+            for yy in -5..=5i32 {
+                for xx in -5..=5i32 {
+                    let d2 = xx * xx + yy * yy;
+                    if (13..=25).contains(&d2) {
+                        f.set(cx - 2 + xx, cy - 3 + yy, b);
+                    }
+                }
+            }
+            f.line(cx + 1, cy + 1, cx + 6, cy + 7, b);
+        }
+        Tool::Burn => {
+            // A cupped hand shading the print to burn in an area.
+            for xx in -6..=6i32 {
+                let yy = ((36 - xx * xx) as f32).sqrt() as i32;
+                f.set(cx + xx, cy - yy / 2, b);
+                f.set(cx + xx, cy + 1 - yy / 2, b);
+            }
+            f.line(cx - 6, cy + 3, cx - 6, cy + 6, b);
+            f.line(cx + 6, cy + 3, cx + 6, cy + 6, b);
+            f.line(cx - 6, cy + 6, cx + 6, cy + 6, b);
+        }
+        Tool::Sponge => {
+            // A porous block.
+            f.outline_rect(Rect::new(cx - 6, cy - 5, 13, 11), b);
+            for (dx, dy) in [(-3, -2), (1, -3), (4, 0), (-1, 1), (-4, 3), (3, 3)] {
+                f.set(cx + dx, cy + dy, b);
+            }
+        }
     }
 }
 
@@ -5437,6 +6096,7 @@ impl App {
             (d.kind.clone(), idx),
             (DialogKind::Levels, 2)
                 | (DialogKind::GaussianBlur, 0)
+                | (DialogKind::HighPass, 0)
                 | (DialogKind::Unsharp, 0)
                 | (DialogKind::Unsharp, 1)
                 | (DialogKind::AddNoise, 0)
@@ -5508,6 +6168,27 @@ impl App {
                         d.curve_points.push((gx, gy));
                         d.curve_points.sort();
                         d.curve_drag = d.curve_points.iter().position(|p| *p == (gx, gy));
+                    }
+                    self.dialog_refresh_preview();
+                    return;
+                }
+            }
+            for (i, cell) in layout.kernel_cells.iter().enumerate() {
+                if cell.contains(mx, my) {
+                    self.dialog.as_mut().unwrap().kernel_sel = i;
+                    return;
+                }
+            }
+            for (i, b) in layout.kernel_buttons.iter().enumerate() {
+                if b.contains(mx, my) {
+                    {
+                        let d = self.dialog.as_mut().unwrap();
+                        match i {
+                            0 => d.kernel_scale = (d.kernel_scale - 1).max(1),
+                            1 => d.kernel_scale = (d.kernel_scale + 1).min(999),
+                            2 => d.kernel_offset = (d.kernel_offset - 1).max(-255),
+                            _ => d.kernel_offset = (d.kernel_offset + 1).min(255),
+                        }
                     }
                     self.dialog_refresh_preview();
                     return;
@@ -5810,7 +6491,10 @@ impl App {
             | Tool::Stamp
             | Tool::Blur
             | Tool::Sharpen
-            | Tool::Smudge => {
+            | Tool::Smudge
+            | Tool::Dodge
+            | Tool::Burn
+            | Tool::Sponge => {
                 if let PaintTarget::Mask(_) = self.paint_target {
                     if matches!(self.tool, Tool::Brush | Tool::Pencil | Tool::Eraser) {
                         self.alpha_cmd = Some(DocumentCommand::begin("Paint on mask", &self.doc));
@@ -6243,6 +6927,23 @@ impl App {
                 }
                 b
             }
+            Tool::Dodge | Tool::Burn | Tool::Sponge => brush::stamp_tone(
+                &mut self.doc,
+                layer,
+                sel.as_ref(),
+                center.0,
+                center.1,
+                &tip,
+                match tool {
+                    Tool::Dodge => brush::ToneKind::Dodge,
+                    Tool::Burn => brush::ToneKind::Burn,
+                    _ => brush::ToneKind::Sponge,
+                },
+                self.tone_range,
+                self.tone_exposure,
+                self.sponge_saturate,
+                opacity,
+            ),
             _ => return,
         };
         // Register tiles for undo. Segment capture (mouse_move /
@@ -6741,6 +7442,34 @@ impl App {
 
     pub fn key_char(&mut self, c: char) {
         let primary = self.primary_down();
+        // Custom Filter kernel entry: digits build the selected
+        // cell's value, '-' flips its sign.
+        if !primary
+            && self
+                .dialog
+                .as_ref()
+                .map(|d| d.kind == DialogKind::CustomFilter)
+                .unwrap_or(false)
+        {
+            let mut changed = false;
+            {
+                let d = self.dialog.as_mut().unwrap();
+                let cell = &mut d.kernel[d.kernel_sel];
+                if c.is_ascii_digit() {
+                    let sign = if *cell < 0 { -1 } else { 1 };
+                    *cell = sign * ((*cell).abs() * 10 + c.to_digit(10).unwrap() as i32);
+                    *cell = (*cell).clamp(-999, 999);
+                    changed = true;
+                } else if c == '-' {
+                    *cell = -*cell;
+                    changed = true;
+                }
+            }
+            if changed {
+                self.dialog_refresh_preview();
+            }
+            return;
+        }
         // dialog text entry
         if let Some(d) = &mut self.dialog {
             if d.text_focus && !primary {
@@ -6750,6 +7479,11 @@ impl App {
         }
         if primary {
             match c.to_ascii_lowercase() {
+                'c' if self.shift_down => self.do_action(Action::CopyMerged),
+                'v' if self.shift_down => self.do_action(Action::PasteInto),
+                'c' => self.do_action(Action::Copy),
+                'x' => self.do_action(Action::Cut),
+                'v' => self.do_action(Action::Paste),
                 'n' if self.shift_down => self.do_action(Action::NewLayer),
                 'e' => self.do_action(Action::MergeDown),
                 't' => self.do_action(Action::FreeTransform),
@@ -6829,6 +7563,20 @@ impl App {
                 }
             }
             SpecialKey::Backspace => {
+                if self
+                    .dialog
+                    .as_ref()
+                    .map(|d| d.kind == DialogKind::CustomFilter)
+                    .unwrap_or(false)
+                {
+                    {
+                        let d = self.dialog.as_mut().unwrap();
+                        let sel = d.kernel_sel;
+                        d.kernel[sel] /= 10;
+                    }
+                    self.dialog_refresh_preview();
+                    return;
+                }
                 let mut popped = false;
                 if let Some(d) = &mut self.dialog {
                     if d.text_focus {
@@ -7183,6 +7931,8 @@ fn run_shot(args: &[String]) -> i32 {
     let mut demo4 = false;
     let mut ctx = false;
     let mut batchtest = false;
+    let mut gaptest = false;
+    let mut tone = false;
     let mut tab: Option<String> = None;
     let mut cmyk = false;
     let mut ft = false;
@@ -7208,6 +7958,8 @@ fn run_shot(args: &[String]) -> i32 {
             "--demo4" => demo4 = true,
             "--ctx" => ctx = true,
             "--batchtest" => batchtest = true,
+            "--gaptest" => gaptest = true,
+            "--tone" => tone = true,
             "--cmyk" => cmyk = true,
             "--ft" => ft = true,
             "--manylayers" => many_layers = true,
@@ -7469,6 +8221,136 @@ fn run_shot(args: &[String]) -> i32 {
             return 1;
         }
     }
+    if gaptest {
+        // End-to-end check of the Phase 4.5 app paths: toning
+        // tools, Copy Merged / Paste Into, Color Range, Modify,
+        // a filter dialog (with Actions recording + replay), the
+        // Custom Filter dialog, Bring to Front, and Equalize.
+        let mut ok = true;
+        let mut check = |name: &str, cond: bool| {
+            eprintln!("GAPTEST {name}: {}", if cond { "ok" } else { "FAIL" });
+            ok = ok && cond;
+        };
+        // Dodge lightens a mid-gray pixel.
+        let mut doc = Document::new(24, 24);
+        doc.layers[0].fill_rect(0, 0, 24, 24, Pixel16::from_rgba8(100, 100, 100, 255));
+        let mut app = App::new(doc, None);
+        app.tool = Tool::Dodge;
+        app.tip = BrushTip::new(13.0, 0.0);
+        app.begin_stroke((12.0, 12.0));
+        let dodged = app.doc.layers[0].get_pixel(12, 12).to_rgba8().0;
+        check("dodge lightens", dodged > 100);
+        app.tool = Tool::Burn;
+        app.begin_stroke((12.0, 12.0));
+        let burned = app.doc.layers[0].get_pixel(12, 12).to_rgba8().0;
+        check("burn darkens back", burned < dodged);
+        // Copy Merged takes the composite; Paste Into clips to the
+        // current selection.
+        let mut doc = Document::new(10, 10);
+        doc.layers[0].fill_rect(0, 0, 10, 10, Pixel16::from_rgba8(0, 0, 200, 255));
+        let top = doc.add_layer("Top");
+        doc.layers[top].fill_rect(0, 0, 10, 10, Pixel16::from_rgba8(200, 0, 0, 128));
+        let mut app = App::new(doc, None);
+        app.sel = Some(Selection::all(10, 10));
+        app.do_action(Action::CopyMerged);
+        let mut app2 = App::new(Document::new(10, 10), None);
+        app2.sel = Some(Selection::rect(10, 10, 2, 2, 4, 4));
+        app2.do_action(Action::PasteInto);
+        let inside = app2.doc.layers[0].get_pixel(3, 3).to_rgba8();
+        let outside = app2.doc.layers[0].get_pixel(0, 0).to_rgba8();
+        check(
+            "paste into lands the merged color inside",
+            inside.0 > 60 && inside.2 > 60,
+        );
+        check(
+            "paste into leaves the outside alone",
+            outside == (0, 0, 0, 0),
+        );
+        // Color Range selects the red half by the foreground color.
+        let mut doc = Document::new(10, 4);
+        doc.layers[0].fill_rect(0, 0, 5, 4, Pixel16::from_rgba8(200, 40, 40, 255));
+        doc.layers[0].fill_rect(5, 0, 5, 4, Pixel16::from_rgba8(40, 40, 200, 255));
+        let mut app = App::new(doc, None);
+        app.fg = Pixel16::from_rgba8(200, 40, 40, 255);
+        app.open_dialog(DialogKind::ColorRange);
+        app.dialog_ok();
+        let sel = app.sel.clone().unwrap();
+        check(
+            "color range picks red only",
+            sel.value(2, 2) == 255 && sel.value(7, 2) == 0,
+        );
+        // Modify > Expand grows the selection by the dialog value.
+        app.sel = Some(Selection::rect(10, 4, 4, 1, 2, 2));
+        app.open_modify_dialog(0);
+        if let Some(d) = &mut app.dialog {
+            d.vals[0] = 1.0;
+        }
+        app.dialog_ok();
+        check(
+            "modify expand grows by 1",
+            app.sel.as_ref().unwrap().value(3, 1) == 255,
+        );
+        // A filter dialog applies, records, and replays identically.
+        let mut app = App::new(demo_document(), None);
+        app.actions = vec![RecordedAction {
+            name: "Gap".into(),
+            steps: Vec::new(),
+        }];
+        app.active_action = 0;
+        app.recording = true;
+        app.open_dialog(DialogKind::MotionBlur);
+        app.dialog_ok();
+        app.recording = false;
+        let mut expected = demo_document();
+        apply_steps(&mut expected, &app.actions[0].steps.clone(), None);
+        check(
+            "motion blur dialog records + replays",
+            app.actions[0].steps.len() == 1
+                && app.doc.render_checksum() == expected.render_checksum(),
+        );
+        // Custom Filter dialog with a sharpen kernel changes pixels.
+        let mut app = App::new(demo_document(), None);
+        let before = app.doc.render_checksum();
+        app.open_dialog(DialogKind::CustomFilter);
+        if let Some(d) = &mut app.dialog {
+            d.kernel = [
+                0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0, 0, 0,
+            ];
+        }
+        app.dialog_refresh_preview();
+        app.dialog_ok();
+        check("custom filter applies", app.doc.render_checksum() != before);
+        // Bring to Front moves the bottom layer to the top.
+        let mut doc = Document::new(6, 6);
+        doc.add_layer("Mid");
+        doc.add_layer("Top");
+        let mut app = App::new(doc, None);
+        app.doc.active_layer = 0;
+        app.do_action(Action::LayerToFront);
+        check(
+            "bring to front",
+            app.doc.active_layer == 2 && app.doc.layers[2].name == "Background",
+        );
+        // Equalize runs as a direct action.
+        let mut doc = Document::new(8, 2);
+        for x in 0..4 {
+            doc.layers[0].fill_rect(x, 0, 1, 2, Pixel16::from_rgba8(100, 100, 100, 255));
+        }
+        for x in 4..8 {
+            doc.layers[0].fill_rect(x, 0, 1, 2, Pixel16::from_rgba8(150, 150, 150, 255));
+        }
+        let mut app = App::new(doc, None);
+        app.do_action(Action::AdjustEqualize);
+        check(
+            "equalize action spreads values",
+            app.doc.layers[0].get_pixel(1, 1).to_rgba8().0 == 0
+                && app.doc.layers[0].get_pixel(6, 1).to_rgba8().0 == 255,
+        );
+        eprintln!("GAPTEST {}", if ok { "PASS" } else { "FAIL" });
+        if !ok {
+            return 1;
+        }
+    }
     if let Some(m) = menu {
         app.open_menu = Some(m);
         app.hover_item = Some((m, 0));
@@ -7483,6 +8365,8 @@ fn run_shot(args: &[String]) -> i32 {
     if let Some(name) = dialog_name {
         let kind = match name.as_str() {
             "bc" => DialogKind::BrightnessContrast,
+            "custom" => DialogKind::CustomFilter,
+            "colorrange" => DialogKind::ColorRange,
             "photo" => DialogKind::PhotoFilter,
             "levels" => DialogKind::Levels,
             "curves" => DialogKind::Curves,
@@ -7508,6 +8392,9 @@ fn run_shot(args: &[String]) -> i32 {
             _ => DialogKind::HueSaturation,
         };
         app.open_dialog(kind);
+    }
+    if tone {
+        app.tool = Tool::Dodge;
     }
     let mut frame = Frame::new(size.0, size.1);
     if ft {

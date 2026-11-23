@@ -328,6 +328,169 @@ impl Selection {
         }
     }
 
+    /// Chamfer distance (in pixels, approx. Euclidean) from every
+    /// pixel to the nearest pixel on the other side of the
+    /// selected/unselected divide. `to_selected = true` measures
+    /// distance to the nearest selected pixel (used by Expand);
+    /// false measures distance to the nearest unselected pixel
+    /// (used by Contract). Selected means mask >= 128.
+    fn distance_to(&self, to_selected: bool) -> Vec<f32> {
+        let (w, h) = (self.width as usize, self.height as usize);
+        const INF: f32 = 1.0e9;
+        let diag = std::f32::consts::SQRT_2;
+        let mut d = vec![INF; w * h];
+        for (i, &m) in self.mask.iter().enumerate() {
+            if (m >= 128) == to_selected {
+                d[i] = 0.0;
+            }
+        }
+        // Forward pass.
+        for y in 0..h {
+            for x in 0..w {
+                let i = y * w + x;
+                if d[i] == 0.0 {
+                    continue;
+                }
+                let mut best = d[i];
+                if x > 0 {
+                    best = best.min(d[i - 1] + 1.0);
+                }
+                if y > 0 {
+                    best = best.min(d[i - w] + 1.0);
+                    if x > 0 {
+                        best = best.min(d[i - w - 1] + diag);
+                    }
+                    if x + 1 < w {
+                        best = best.min(d[i - w + 1] + diag);
+                    }
+                }
+                d[i] = best;
+            }
+        }
+        // Backward pass.
+        for y in (0..h).rev() {
+            for x in (0..w).rev() {
+                let i = y * w + x;
+                if d[i] == 0.0 {
+                    continue;
+                }
+                let mut best = d[i];
+                if x + 1 < w {
+                    best = best.min(d[i + 1] + 1.0);
+                }
+                if y + 1 < h {
+                    best = best.min(d[i + w] + 1.0);
+                    if x + 1 < w {
+                        best = best.min(d[i + w + 1] + diag);
+                    }
+                    if x > 0 {
+                        best = best.min(d[i + w - 1] + diag);
+                    }
+                }
+                d[i] = best;
+            }
+        }
+        d
+    }
+
+    /// Select > Modify > Expand: grow the selection by `n` pixels.
+    pub fn expand(&mut self, n: u32) {
+        if n == 0 || self.is_empty() {
+            return;
+        }
+        let d = self.distance_to(true);
+        for (i, v) in self.mask.iter_mut().enumerate() {
+            if d[i] <= n as f32 {
+                *v = 255;
+            }
+        }
+    }
+
+    /// Select > Modify > Contract: shrink the selection by `n`
+    /// pixels.
+    pub fn contract(&mut self, n: u32) {
+        if n == 0 || self.is_empty() {
+            return;
+        }
+        let d = self.distance_to(false);
+        for (i, v) in self.mask.iter_mut().enumerate() {
+            if d[i] <= n as f32 {
+                *v = 0;
+            }
+        }
+    }
+
+    /// Select > Modify > Smooth: blur the mask edge by `radius`
+    /// and re-threshold, which rounds off jagged corners and
+    /// removes specks smaller than the radius.
+    pub fn smooth(&mut self, radius: u32) {
+        if radius == 0 || self.is_empty() {
+            return;
+        }
+        self.feather(radius);
+        for v in &mut self.mask {
+            *v = if *v >= 128 { 255 } else { 0 };
+        }
+    }
+
+    /// Select > Modify > Border: replace the selection with a band
+    /// `width` pixels wide straddling its edge (half outside, half
+    /// inside).
+    pub fn border(&mut self, width: u32) {
+        if width == 0 || self.is_empty() {
+            return;
+        }
+        let outer_n = width / 2;
+        let inner_n = width - outer_n;
+        let mut outer = self.clone();
+        outer.expand(outer_n);
+        let mut inner = self.clone();
+        inner.contract(inner_n);
+        for (i, v) in self.mask.iter_mut().enumerate() {
+            *v = if inner.mask[i] >= 128 {
+                0
+            } else {
+                outer.mask[i]
+            };
+        }
+    }
+
+    /// Select > Color Range: build a selection from the document's
+    /// composite by color similarity to `sample` (8-bit RGB).
+    /// `fuzziness` 0..=200 widens the accepted color range; pixels
+    /// near the sample are fully selected, with a graduated falloff
+    /// at the edge of the range (the classic behaviour).
+    pub fn color_range(doc: &Document, sample: (u8, u8, u8), fuzziness: u8) -> Selection {
+        let mut sel = Selection::none(doc.width, doc.height);
+        let t = fuzziness as f32 / 200.0 * 441.0; // max RGB distance
+        for y in 0..doc.height as i32 {
+            for x in 0..doc.width as i32 {
+                let (r, g, b, _) = doc.render_pixel(x, y).to_rgba8();
+                let dr = r as f32 - sample.0 as f32;
+                let dg = g as f32 - sample.1 as f32;
+                let db = b as f32 - sample.2 as f32;
+                let d = (dr * dr + dg * dg + db * db).sqrt();
+                let v = if t <= 0.0 {
+                    if d == 0.0 {
+                        255
+                    } else {
+                        0
+                    }
+                } else if d <= t * 0.5 {
+                    255
+                } else if d >= t {
+                    0
+                } else {
+                    (255.0 * (t - d) / (t * 0.5)) as u8
+                };
+                if v > 0 {
+                    sel.set(x, y, v);
+                }
+            }
+        }
+        sel
+    }
+
     /// Tile coordinates intersecting a pixel-space rect — the set a
     /// history command must snapshot to cover an edit in that rect.
     pub fn tiles_in_rect(x: i32, y: i32, w: u32, h: u32) -> Vec<TileCoord> {
