@@ -96,11 +96,113 @@ impl Command for TileEditCommand {
     }
 }
 
+/// Run an edit as one tile-snapshot command: capture `before` for the
+/// given tiles on `layer`, apply `edit`, capture `after`, push.
+/// This is the standard wrapper for every pixel edit (paint, adjust,
+/// filter) so undo granularity is always exactly the tiles touched.
+pub fn run_tile_edit(
+    doc: &mut Document,
+    hist: &mut History,
+    label: impl Into<String>,
+    layer: usize,
+    tiles: &[TileCoord],
+    edit: impl FnOnce(&mut Document),
+) {
+    let mut cmd = TileEditCommand::new(label);
+    for &c in tiles {
+        cmd.capture_before(doc, layer, c);
+    }
+    edit(doc);
+    for &c in tiles {
+        cmd.capture_after(doc, layer, c);
+    }
+    hist.push(Box::new(cmd));
+}
+
+/// A whole-document before/after command — for structural edits
+/// (resize, rotate, crop, canvas size) where tile deltas don't fit.
+/// Memory-heavy on huge documents; correct first, optimized later.
+#[derive(Clone, Debug)]
+pub struct DocumentCommand {
+    label: String,
+    before: Document,
+    after: Document,
+}
+
+impl DocumentCommand {
+    /// Snapshot `doc` as the before state; call `finish` after editing.
+    pub fn begin(label: impl Into<String>, doc: &Document) -> Self {
+        DocumentCommand {
+            label: label.into(),
+            before: doc.clone(),
+            after: doc.clone(),
+        }
+    }
+
+    pub fn finish(&mut self, doc: &Document) {
+        self.after = doc.clone();
+    }
+}
+
+impl Command for DocumentCommand {
+    fn label(&self) -> &str {
+        &self.label
+    }
+    fn apply(&mut self, doc: &mut Document) {
+        *doc = self.after.clone();
+    }
+    fn revert(&mut self, doc: &mut Document) {
+        *doc = self.before.clone();
+    }
+}
+
+/// A layer-offset change (the Move tool): no pixels change, only the
+/// layer's position in the document.
+#[derive(Clone, Debug)]
+pub struct MoveLayerCommand {
+    label: String,
+    layer: usize,
+    before: (i32, i32),
+    after: (i32, i32),
+}
+
+impl MoveLayerCommand {
+    pub fn new(
+        label: impl Into<String>,
+        layer: usize,
+        before: (i32, i32),
+        after: (i32, i32),
+    ) -> Self {
+        MoveLayerCommand {
+            label: label.into(),
+            layer,
+            before,
+            after,
+        }
+    }
+}
+
+impl Command for MoveLayerCommand {
+    fn label(&self) -> &str {
+        &self.label
+    }
+    fn apply(&mut self, doc: &mut Document) {
+        doc.layers[self.layer].offset = self.after;
+    }
+    fn revert(&mut self, doc: &mut Document) {
+        doc.layers[self.layer].offset = self.before;
+    }
+}
+
 /// The undo/redo stacks.
 #[derive(Default)]
 pub struct History {
     undo_stack: Vec<Box<dyn Command>>,
     redo_stack: Vec<Box<dyn Command>>,
+    /// Cap on undo depth. Photoshop 1.0 exposed exactly ONE level of
+    /// undo (Edit > Undo toggled with Redo), so the Phase 1 app sets
+    /// this to 1; the engine itself is unlimited by default.
+    limit: Option<usize>,
 }
 
 impl History {
@@ -108,11 +210,27 @@ impl History {
         History::default()
     }
 
+    /// Set a cap on undo depth (None = unlimited). Oldest commands
+    /// fall off the bottom when the cap is exceeded.
+    pub fn set_limit(&mut self, limit: Option<usize>) {
+        self.limit = limit;
+        self.trim();
+    }
+
+    fn trim(&mut self) {
+        if let Some(limit) = self.limit {
+            while self.undo_stack.len() > limit {
+                self.undo_stack.remove(0);
+            }
+        }
+    }
+
     /// Record a command that has ALREADY been applied to the document
     /// (the normal painting flow: snapshot, paint, capture, push).
     pub fn push(&mut self, cmd: Box<dyn Command>) {
         self.undo_stack.push(cmd);
         self.redo_stack.clear();
+        self.trim();
     }
 
     pub fn undo(&mut self, doc: &mut Document) -> Option<String> {

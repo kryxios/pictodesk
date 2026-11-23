@@ -71,3 +71,37 @@ Phase 0 exit criteria end to end: multi-tile multi-layer render,
 history undo/redo exactness, color conversion, and a lossless
 format round trip. Pixel-output (golden) checks use render
 checksums and known-value spot checks.
+
+## Phase 1 additions (v0.1.0)
+
+Core modules, all selection-aware and history-wrapped:
+
+- `selection.rs` — selections as a grayscale mask (255 = selected):
+  rect/ellipse/lasso polygon/magic wand constructors, feather
+  (separable box blur), inverse, bounds. History helpers snapshot
+  exactly the tiles a selection touches (`Selection::tiles_in_rect`).
+- `adjust.rs` — the Image > Adjust menu. A single `map_layer_pixels`
+  walker applies a per-pixel function over a layer's painted tiles,
+  blended by the selection mask; alpha is never created or destroyed.
+- `filter.rs` — region-snapshot filters (Gaussian Blur, Sharpen,
+  Unsharp Mask, Add Noise with a deterministic hash RNG).
+- `transform.rs` — Image Size (bilinear), Canvas Size (3x3 anchor),
+  Crop, Rotate, Flip; structural edits undo via `DocumentCommand`
+  (whole-document snapshot) in `history.rs`, which also gained a
+  configurable undo-depth limit and `MoveLayerCommand`.
+- `brush.rs` — the painting tools as stamp/stroke functions with
+  Photoshop spacing (25% of diameter): Brush, Pencil, Eraser, Clone
+  Stamp (aligned), Paint Bucket, Gradient, Blur/Sharpen/Smudge
+  stamps, plus the eyedropper's averaged sampler.
+- `io.rs` — PNG/JPEG/TIFF/BMP via the pure-Rust `image` crate;
+  embedded ICC profiles are converted into the working space on
+  import. `histogram.rs` feeds the Histogram palette.
+
+The app shell is now a Photoshop 1.0 workbench drawn on the CPU into
+a framebuffer (platinum chrome, `font8x8` pixel text) and uploaded
+as one GPU texture per frame: menu bar with submenus, two-column
+toolbox, FG/BG swatches + color palette, Brushes and Histogram
+palettes, modal dialogs with live preview (revert-from-snapshot,
+re-apply, commit on OK), a file-open panel, drag-and-drop, and the
+1.0-authentic single level of Undo (`History::set_limit(Some(1))` —
+the engine itself is unlimited; later phases raise the cap).

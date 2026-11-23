@@ -11,3 +11,4 @@ wgpu = "0.20"
 winit = "0.30"
 pollster = "0.3"
 bytemuck = { version = "1", features = ["derive"] }
+font8x8 = "0.3"
