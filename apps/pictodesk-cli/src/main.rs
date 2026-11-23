@@ -1,6 +1,6 @@
 //! Phase 0 exit-criteria demo, headless:
 //! build a document through the tile engine + color pipeline, paint on
-//! two layers with a blend mode, undo/redo, save `.pdesk`, reload,
+//! two layers with a blend mode, undo/redo, save `.pdk`, reload,
 //! verify the render is pixel-identical, and export a PPM preview.
 //!
 //! Usage: pictodesk-cli [outdir]   (default: ./phase0-demo)
@@ -69,10 +69,10 @@ fn main() {
     );
     println!("redo: checksum matches painted render ✓");
 
-    // 3. Save .pdesk, reload, renders must be identical (lossless format).
-    let file = outdir.join("demo.pdesk");
-    format::save(&doc, &file).expect("save .pdesk");
-    let loaded = format::load(&file).expect("load .pdesk");
+    // 3. Save .pdk, reload, renders must be identical (lossless format).
+    let file = outdir.join("demo.pdk");
+    format::save(&doc, &file).expect("save .pdk");
+    let loaded = format::load(&file).expect("load .pdk");
     assert_eq!(
         loaded, doc,
         "round-tripped document must equal the original"

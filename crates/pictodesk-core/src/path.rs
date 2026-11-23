@@ -6,7 +6,7 @@
 //! with the anchor it is a corner point; otherwise it is a smooth
 //! point. Paths are resolution-independent: they flatten to polygons
 //! for selection conversion and stroking, and they serialize into
-//! the `.pdesk` format and into Photoshop path resources on export.
+//! the `.pdk` format and into Photoshop path resources on export.
 
 use crate::selection::Selection;
 

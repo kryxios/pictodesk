@@ -3,7 +3,7 @@
 //! background, exported in CMYK TIFF."
 //!
 //! Plus the phase's supporting guarantees: selections save to alpha
-//! channels and back, Grow/Similar behave, the .pdesk v3 format
+//! channels and back, Grow/Similar behave, the .pdk v3 format
 //! round-trips paths/channels/mode, and 16-bit files keep their
 //! precision end to end.
 
@@ -126,7 +126,7 @@ fn pen_cutout_on_white_exported_as_cmyk_tiff() {
     mode::convert_mode(&mut doc, ColorMode::Cmyk);
     assert_eq!(doc.mode, ColorMode::Cmyk);
 
-    // .pdesk v3 round trip keeps mode, paths, channels, clipping.
+    // .pdk v3 round trip keeps mode, paths, channels, clipping.
     let bytes = format::serialize(&doc);
     let back = format::deserialize(&bytes).unwrap();
     assert_eq!(back.mode, ColorMode::Cmyk);
@@ -217,7 +217,7 @@ fn sixteen_bit_png_survives_import_exactly() {
         (0x1234, 0xABCD, 0x0001, 0xFFFF),
         "16-bit values must arrive bit-exact"
     );
-    // And through .pdesk too (the format is 16-bit native).
+    // And through .pdk too (the format is 16-bit native).
     let back = format::deserialize(&format::serialize(&doc)).unwrap();
     let p2 = back.render_pixel(1, 0);
     assert_eq!((p2.r, p2.g), (0xFF00, 0x00FF));

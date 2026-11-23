@@ -98,7 +98,7 @@ pub struct Document {
     pub paths: Vec<crate::path::Path>,
     pub work_path: Option<crate::path::Path>,
     pub clipping_path: Option<usize>,
-    /// Provenance event log, stored in the `.pdesk` file.
+    /// Provenance event log, stored in the `.pdk` file.
     pub history_log: Vec<HistoryEvent>,
 }
 

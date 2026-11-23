@@ -980,7 +980,7 @@ thread_local! {
 impl App {
     /// Push a finished command onto the history stack and record
     /// the edit in the document's provenance log (stored in the
-    /// `.pdesk` file, like the classic editors' embedded history).
+    /// `.pdk` file, like the classic editors' embedded history).
     fn push_cmd(&mut self, cmd: Box<dyn Command>) {
         self.doc.log_event(cmd.label());
         self.hist.push(cmd);
@@ -1247,7 +1247,7 @@ impl App {
     fn recovery_target(&self) -> std::path::PathBuf {
         match &self.file_path {
             Some(p) => format::recovery_path_for(p),
-            None => std::env::temp_dir().join("pictodesk-untitled.pdesk.recovery"),
+            None => std::env::temp_dir().join("pictodesk-untitled.pdk.recovery"),
         }
     }
 
@@ -1306,7 +1306,7 @@ impl App {
                 },
                 Err(e) => Err(e.to_string()),
             }
-        } else if path.extension().map(|e| e == "pdesk").unwrap_or(false) {
+        } else if path.extension().map(|e| e == "pdk").unwrap_or(false) {
             std::fs::read(path)
                 .map_err(|e| e.to_string())
                 .and_then(|bytes| format::deserialize(&bytes).map_err(|e| e.to_string()))
@@ -1346,11 +1346,11 @@ impl App {
     }
 
     fn save_to(&mut self, path: &Path) -> bool {
-        if path.extension().map(|e| e == "pdesk").unwrap_or(false) {
+        if path.extension().map(|e| e == "pdk").unwrap_or(false) {
             // Record the save in the file's own history log.
             self.doc.log_event("Saved");
         }
-        let result = if path.extension().map(|e| e == "pdesk").unwrap_or(false) {
+        let result = if path.extension().map(|e| e == "pdk").unwrap_or(false) {
             std::fs::write(path, format::serialize(&self.doc)).map_err(|e| e.to_string())
         } else if ExportFormat::from_path(path).is_some() {
             io::save_file(path, &self.doc, 92).map_err(|e| e.to_string())
@@ -1389,7 +1389,7 @@ impl App {
                                 p.extension()
                                     .map(|e| {
                                         let e = e.to_ascii_lowercase();
-                                        ["png", "jpg", "jpeg", "tif", "tiff", "bmp", "pdesk", "psd"]
+                                        ["png", "jpg", "jpeg", "tif", "tiff", "bmp", "pdk", "psd"]
                                             .contains(&e.to_str().unwrap_or(""))
                                     })
                                     .unwrap_or(false)
@@ -1413,7 +1413,7 @@ impl App {
                     .file_path
                     .as_ref()
                     .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "untitled.pdesk".into());
+                    .unwrap_or_else(|| "untitled.pdk".into());
                 d.text_focus = true;
                 self.dialog = Some(d);
             }
@@ -6078,7 +6078,7 @@ fn run_window(path: Option<PathBuf>) {
             app.open_path(&p);
         }
     } else {
-        let rec = std::env::temp_dir().join("pictodesk-untitled.pdesk.recovery");
+        let rec = std::env::temp_dir().join("pictodesk-untitled.pdk.recovery");
         if rec.exists() {
             if let Ok(doc) = format::load(&rec) {
                 app.doc = doc;

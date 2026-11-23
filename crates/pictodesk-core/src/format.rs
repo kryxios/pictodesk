@@ -1,4 +1,4 @@
-//! The `.pdesk` file format — v3 (v1 and v2 still readable).
+//! The `.pdk` file format — v3 (v1 and v2 still readable).
 //!
 //! v3 layout: the v2 envelope (magic "PDSK" | u32 version (=3) |
 //! u32 uncompressed_len | DEFLATE stream) around a payload that is
@@ -44,7 +44,7 @@ pub const MAGIC: &[u8; 4] = b"PDSK";
 pub const FORMAT_VERSION: u32 = 3;
 pub const V2_VERSION: u32 = 2;
 pub const LEGACY_VERSION: u32 = 1;
-pub const FILE_EXTENSION: &str = "pdesk";
+pub const FILE_EXTENSION: &str = "pdk";
 
 #[derive(Debug)]
 pub enum FormatError {
@@ -65,8 +65,8 @@ impl std::fmt::Display for FormatError {
         match self {
             FormatError::Io(e) => write!(f, "I/O error: {e}"),
             FormatError::BadMagic => write!(f, "not a PictoDesk file (bad magic)"),
-            FormatError::UnsupportedVersion(v) => write!(f, "unsupported .pdesk version {v}"),
-            FormatError::Corrupt(why) => write!(f, "corrupt .pdesk file: {why}"),
+            FormatError::UnsupportedVersion(v) => write!(f, "unsupported .pdk version {v}"),
+            FormatError::Corrupt(why) => write!(f, "corrupt .pdk file: {why}"),
         }
     }
 }
@@ -511,7 +511,7 @@ pub fn load(path: &Path) -> Result<Document, FormatError> {
 /// the worst case is the previous recovery file, intact.
 pub fn save_atomic(doc: &Document, path: &Path) -> Result<(), FormatError> {
     let mut tmp: PathBuf = path.to_path_buf();
-    tmp.set_extension("pdesk.tmp");
+    tmp.set_extension("pdk.tmp");
     fs::write(&tmp, serialize(doc))?;
     fs::rename(&tmp, path)?;
     Ok(())
@@ -520,7 +520,7 @@ pub fn save_atomic(doc: &Document, path: &Path) -> Result<(), FormatError> {
 /// The standard recovery-file path next to a document path.
 pub fn recovery_path_for(doc_path: &Path) -> PathBuf {
     let mut p = doc_path.to_path_buf();
-    p.set_extension("pdesk.recovery");
+    p.set_extension("pdk.recovery");
     p
 }
 
@@ -597,7 +597,7 @@ mod tests {
     fn save_load_and_atomic_recovery_via_disk() {
         let dir = std::env::temp_dir().join("pictodesk-format-test");
         fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("test.pdesk");
+        let path = dir.join("test.pdk");
         let doc = sample_doc();
         save(&doc, &path).unwrap();
         assert_eq!(load(&path).unwrap(), doc);
@@ -608,7 +608,7 @@ mod tests {
         assert_eq!(load(&rec).unwrap().render_checksum(), doc.render_checksum());
         // The temp staging file must not linger after a successful rename.
         let mut tmp = rec.clone();
-        tmp.set_extension("pdesk.tmp");
+        tmp.set_extension("pdk.tmp");
         assert!(!tmp.exists());
         fs::remove_dir_all(&dir).ok();
     }

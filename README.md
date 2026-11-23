@@ -3,7 +3,7 @@
 An open-source desktop photo and image editor — local files, no cloud,
 no account, no subscription. Built feature by feature, in the open.
 
-**Status: v0.3.2 — Phase 3 complete: layers, with the v0.3.0 reduced forms finished. First public alpha.**
+**Status: v0.3.3 — Phase 3 complete: layers, with the v0.3.0 reduced forms finished. First public alpha.**
 The UI follows the classic early-90s editor design: a File / Edit /
 Image / Mode / Filter / Select / Window menu bar, a compact
 two-column toolbox, modal dialogs with live preview, docked tabbed
@@ -15,7 +15,7 @@ What exists today:
   with layers in the model from day one, a 16-bit-per-channel color
   pipeline, blend modes and compositing, a command history (undo/redo),
   real ICC profile support (load any `.icc`/`.icm`, profile-to-profile
-  conversion, via the pure-Rust moxcms engine), and the `.pdesk` file
+  conversion, via the pure-Rust moxcms engine), and the `.pdk` file
   format — v3, DEFLATE-compressed, with atomic autosave/recovery
   (v1/v2 files still load).
 - Phase 1 editing, all selection-aware and undoable: Open/Save PNG,
@@ -44,7 +44,7 @@ What exists today:
   edits are undoable like everything else; Select > Grow and
   Similar; 16-bit files now import bit-exact; CMYK documents save
   as true CMYK TIFFs with the clipping path embedded. The
-  `.pdesk` format is now v3 (v1/v2 files still load).
+  `.pdk` format is now v3 (v1/v2 files still load).
 - Phase 3: layers — a Layer menu and a Layers panel with live
   thumbnails: new / duplicate / delete / reorder layers, opacity,
   12 blend modes, linking (linked layers move and transform
@@ -60,7 +60,7 @@ What exists today:
   dropped. The Layers panel scrolls (mouse wheel, footer buttons)
   and always keeps the active layer visible. The app autosaves a
   recovery copy of unsaved work every 20 seconds and offers it
-  back after a crash. Like the classic editors, `.pdesk` files
+  back after a crash. Like the classic editors, `.pdk` files
   carry a provenance history log — created / opened / saved and
   every edit's label, with timestamps — viewable any time via
   File > History Log. (The undo stack itself stays session-only,

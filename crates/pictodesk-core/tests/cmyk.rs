@@ -80,7 +80,7 @@ fn flip_preserves_white_ink_pixel() {
 }
 
 #[test]
-fn pdesk_round_trip_keeps_alpha_plane() {
+fn pdk_round_trip_keeps_alpha_plane() {
     let mut doc = cmyk_doc(30, 30);
     let tip = BrushTip::new(10.0, 1.0);
     brush::stamp_eraser(&mut doc, 0, None, 15.0, 15.0, &tip, 1.0);

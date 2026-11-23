@@ -219,7 +219,7 @@ fn phase3_task_test_three_photos_and_a_title() {
     doc.flatten();
     assert_eq!(doc.layers.len(), 1);
     assert!(doc.render_pixel(49, 9).to_rgba8().0 > 200);
-    // The flattened document survives a .pdesk round trip.
+    // The flattened document survives a .pdk round trip.
     let bytes = pictodesk_core::format::serialize(&doc);
     let back = pictodesk_core::format::deserialize(&bytes).unwrap();
     assert_eq!(back.render_pixel(49, 9), doc.render_pixel(49, 9));

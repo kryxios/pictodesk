@@ -57,7 +57,7 @@ fn main() {
 
     let t = Instant::now();
     let bytes = pictodesk_core::format::serialize(&doc);
-    println!("serialize .pdesk v2: {} ({} bytes)", ms(t), bytes.len());
+    println!("serialize .pdk v2: {} ({} bytes)", ms(t), bytes.len());
 
     let t = Instant::now();
     let back = pictodesk_core::format::deserialize(&bytes).unwrap();

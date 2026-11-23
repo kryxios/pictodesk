@@ -44,7 +44,7 @@ engine as built, not future plans.
   `TileEditCommand`s: snapshot the tiles a stroke will touch, paint,
   capture the result. Memory cost scales with tiles touched, not
   canvas size.
-- **`format`** — the `.pdesk` file format. v2 = header + DEFLATE
+- **`format`** — the `.pdk` file format. v2 = header + DEFLATE
   (flate2/miniz_oxide) over the complete v1 payload; the loader
   dispatches on version and reads v1 files forever. Saves for
   recovery are atomic (write temp, rename), so a crash mid-save
@@ -113,7 +113,7 @@ the engine itself is unlimited; later phases raise the cap).
   `move_layer`, `merge_down`, `merge_visible`, `flatten` — the
   merge/flatten bakes are mode-aware, with ink-space paths for
   CMYK documents). Layers carry a `linked` flag (persisted as an
-  optional trailing section in the `.pdesk` extension block, so
+  optional trailing section in the `.pdk` extension block, so
   older v3 files still load).
 - `blend.rs` — the component modes (Hue, Saturation, Color,
   Luminosity) join the eight per-channel modes, using the classic
@@ -126,7 +126,7 @@ the engine itself is unlimited; later phases raise the cap).
 - History metadata: `Document::history_log` records provenance
   events (Created / Opened / Saved, plus the label of every
   undoable edit, pushed centrally by the shell's `push_cmd`), is
-  stored as an optional trailing section of the `.pdesk`
+  stored as an optional trailing section of the `.pdk`
   extension block (capped at 500 entries), and is shown by the
   shell's File > History Log dialog. Undo states themselves are
   never stored — session-only, as in the classic editors.
@@ -159,7 +159,7 @@ the engine itself is unlimited; later phases raise the cap).
   trace that turns a selection back into a path.
 - Document model grows: a color mode (RGB / CMYK / Grayscale), alpha
   channels (an 8-bit buffer each; a channel may carry a spot color),
-  saved paths, a work path, and a clipping-path index. `.pdesk` is
+  saved paths, a work path, and a clipping-path index. `.pdk` is
   now v3 — the v2 envelope carries an extension block; v1/v2 files
   load with defaults.
 - `mode.rs` + `color.rs` — mode conversion. Since v0.2.1 a CMYK
@@ -168,7 +168,7 @@ the engine itself is unlimited; later phases raise the cap).
   holds coverage. Rendering composites in ink space and converts
   to RGB for display; painting, adjustments, filters, and
   transforms all have ink-space paths, and tile-snapshot undo
-  captures the alpha tiles alongside the ink tiles. The `.pdesk`
+  captures the alpha tiles alongside the ink tiles. The `.pdk`
   extension block appends the alpha planes (older v3 files load
   with empty planes).
 - `io.rs` — 16-bit sources import bit-exact (ICC conversion still

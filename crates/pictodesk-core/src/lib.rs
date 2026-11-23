@@ -2,7 +2,7 @@
 //!
 //! A UI-free library: tiled document model (layers from day one),
 //! 16-bit color pipeline, blend/compositing, command history, and the
-//! `.pdesk` file format with atomic autosave. The desktop UI will sit
+//! `.pdk` file format with atomic autosave. The desktop UI will sit
 //! on top of this; nothing in here knows a window exists.
 
 pub mod adjust;

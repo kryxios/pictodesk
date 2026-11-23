@@ -1,4 +1,4 @@
-//! History metadata: the provenance log stored in `.pdesk`.
+//! History metadata: the provenance log stored in `.pdk`.
 
 use pictodesk_core::document::{format_history_time, Document, HistoryEvent};
 use pictodesk_core::format;
@@ -11,7 +11,7 @@ fn history_time_formats_utc() {
 }
 
 #[test]
-fn history_log_round_trips_through_pdesk() {
+fn history_log_round_trips_through_pdk() {
     let mut doc = Document::new(8, 8);
     doc.history_log.push(HistoryEvent {
         when: 1_763_904_000,
