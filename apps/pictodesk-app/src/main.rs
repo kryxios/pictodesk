@@ -24,7 +24,9 @@ use pictodesk_core::document::{AlphaChannel, ColorMode};
 use pictodesk_core::filter;
 use pictodesk_core::format;
 use pictodesk_core::histogram::Histogram;
-use pictodesk_core::history::{run_tile_edit, Command, DocumentCommand, MoveLayerCommand, TileEditCommand};
+use pictodesk_core::history::{
+    run_tile_edit, Command, DocumentCommand, MoveLayerCommand, TileEditCommand,
+};
 use pictodesk_core::io::{self, ExportFormat};
 use pictodesk_core::path::{Anchor, Path as BezPath, Subpath};
 use pictodesk_core::selection::Selection;
@@ -622,11 +624,11 @@ impl App {
             hover_sub_item: None,
             hover_file: None,
             dialog: None,
-            show_histogram: false,
-            show_brushes: false,
+            show_histogram: true,
+            show_brushes: true,
             show_rulers: true,
-            show_palette: false,
-            show_cp: false,
+            show_palette: true,
+            show_cp: true,
             cp_tab: 0,
             channel_view: ChannelView::Composite,
             paint_target: PaintTarget::Image,
@@ -976,7 +978,6 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-
 impl App {
     /// Push a finished command onto the history stack and record
     /// the edit in the document's provenance log (stored in the
@@ -1149,7 +1150,10 @@ impl App {
                 drag = FtDrag::Move;
             } else {
                 let pad = 24.0 / self.viewport.scale.max(0.01);
-                if dp.0 >= bb.0 - pad && dp.0 <= bb.2 + pad && dp.1 >= bb.1 - pad && dp.1 <= bb.3 + pad
+                if dp.0 >= bb.0 - pad
+                    && dp.0 <= bb.2 + pad
+                    && dp.1 >= bb.1 - pad
+                    && dp.1 <= bb.3 + pad
                 {
                     drag = FtDrag::Rotate;
                 }
@@ -1194,8 +1198,26 @@ impl App {
                 ft.rot = deg;
             }
             FtDrag::Scale(i) => {
-                let hx = [-bw / 2.0, bw / 2.0, bw / 2.0, -bw / 2.0, 0.0, bw / 2.0, 0.0, -bw / 2.0][i];
-                let hy = [-bh / 2.0, -bh / 2.0, bh / 2.0, bh / 2.0, -bh / 2.0, 0.0, bh / 2.0, 0.0][i];
+                let hx = [
+                    -bw / 2.0,
+                    bw / 2.0,
+                    bw / 2.0,
+                    -bw / 2.0,
+                    0.0,
+                    bw / 2.0,
+                    0.0,
+                    -bw / 2.0,
+                ][i];
+                let hy = [
+                    -bh / 2.0,
+                    -bh / 2.0,
+                    bh / 2.0,
+                    bh / 2.0,
+                    -bh / 2.0,
+                    0.0,
+                    bh / 2.0,
+                    0.0,
+                ][i];
                 let th = rot0.to_radians();
                 let (sn, cs) = (th.sin(), th.cos());
                 let rel = (dp.0 - center.0, dp.1 - center.1);
@@ -2387,16 +2409,11 @@ impl App {
                     Rect::new(ui::TOOLBAR_W + ui::RULER_W - 6, sy, 6, 1),
                     ui::DARK,
                 );
-                // Vertical labels read top-down, one digit per row.
-                for (i, ch) in q.to_string().chars().enumerate() {
-                    f.text(
-                        ui::TOOLBAR_W + 5,
-                        sy + 3 + i as i32 * 9,
-                        &ch.to_string(),
-                        1,
-                        ui::BLACK,
-                    );
-                }
+                // Vertical labels read bottom-to-top, rotated like
+                // the classic rulers, centered on their tick.
+                let label = q.to_string();
+                let lw = Frame::text_width(&label, 1);
+                f.text_vertical(ui::TOOLBAR_W + 5, sy + lw / 2, &label, 1, ui::BLACK);
             }
             q += step;
         }
@@ -2686,6 +2703,8 @@ impl App {
         }
         // foreground/background swatches (classic layout: FG overlaps BG)
         let sy = area.bottom() - 52;
+        f.fill_rect(Rect::new(4, sy - 18, area.w - 8, 1), ui::SHADOW);
+        f.fill_rect(Rect::new(4, sy - 17, area.w - 8, 1), ui::WHITE);
         f.text(6, sy - 12, "Color", 1, ui::BLACK);
         let bg_r = Rect::new(24, sy + 12, 20, 20);
         let fg_r = Rect::new(10, sy, 20, 20);
@@ -2883,11 +2902,12 @@ impl App {
         for (i, label) in ["Layers", "Channels", "Paths"].iter().enumerate() {
             let tr = Self::cp_tab_rect(r, i);
             if self.cp_tab == i {
-                f.fill_rect(tr, ui::BLACK);
-                f.text(tr.x + 5, tr.y + 3, label, 1, ui::WHITE);
+                f.fill_rect(tr, ui::PLATINUM_LIGHT);
+                f.bevel_raised(tr);
+                f.text(tr.x + 5, tr.y + 3, label, 1, ui::BLACK);
             } else {
                 f.outline_rect(tr, ui::SHADOW);
-                f.text(tr.x + 5, tr.y + 3, label, 1, ui::BLACK);
+                f.text(tr.x + 5, tr.y + 3, label, 1, ui::DARK);
             }
         }
         if self.cp_tab == 0 {
@@ -3001,7 +3021,13 @@ impl App {
             let eye = Rect::new(rr.x + 3, rr.y + 7, 14, 14);
             f.outline_rect(eye, c);
             if visible {
-                f.fill_rect(Rect::new(eye.x + 4, eye.y + 4, 6, 6), c);
+                // An actual eye: almond outline + pupil.
+                let (ex, ey) = (eye.x + 7, eye.y + 7);
+                for a in 0..32 {
+                    let t = a as f32 / 32.0 * std::f32::consts::TAU;
+                    f.set(ex + (t.cos() * 5.0) as i32, ey + (t.sin() * 3.0) as i32, c);
+                }
+                f.fill_rect(Rect::new(ex - 1, ey - 1, 3, 3), c);
             }
             let th = Rect::new(rr.x + 21, rr.y + 2, 36, 24);
             self.draw_layer_thumb(f, th, li);
@@ -3009,9 +3035,17 @@ impl App {
             f.text(rr.x + 61, rr.y + 10, &name, 1, c);
             let lb = Rect::new(rr.right() - 18, rr.y + 8, 12, 12);
             if linked {
-                f.fill_rect(lb, c);
-                let tc = if active { ui::BLACK } else { ui::WHITE };
-                f.text(lb.x + 3, lb.y + 2, "L", 1, tc);
+                // Two interlocking chain links.
+                for (ox, oy) in [(-2, -2), (2, 2)] {
+                    for a in 0..24 {
+                        let t = a as f32 / 24.0 * std::f32::consts::TAU;
+                        f.set(
+                            lb.x + 6 + ox + (t.cos() * 3.0) as i32,
+                            lb.y + 6 + oy + (t.sin() * 3.0) as i32,
+                            c,
+                        );
+                    }
+                }
             } else {
                 f.outline_rect(lb, c);
             }
@@ -3615,7 +3649,7 @@ impl App {
             format!("Tool: {}", self.tool.name())
         };
         let text = format!(
-            "{}   |   {}x{}   Zoom {:.0}%   {}   FG {} {} {}",
+            "{}  |  {}x{}  |  Zoom {:.0}%  |  {}  |  FG {} {} {}",
             self.status,
             self.doc.width,
             self.doc.height,
@@ -3685,6 +3719,11 @@ impl App {
                 lum[l.min(255)] += 1;
             }
             let peak = lum.iter().max().copied().unwrap_or(1).max(1);
+            // Quarter gridlines, matching the Curves graph.
+            for gi in 1..4 {
+                let gx = strip.x + gi * strip.w / 4;
+                f.fill_rect(Rect::new(gx, strip.y, 1, strip.h), ui::PLATINUM);
+            }
             for i in 0..(strip.w as usize) {
                 let bin = lum[i * 256 / strip.w as usize];
                 let hgt = ((bin as f32 / peak as f32).sqrt() * strip.h as f32) as i32;
@@ -3701,7 +3740,13 @@ impl App {
             f.bevel_sunken(boxr);
             let log = &self.doc.history_log;
             if log.is_empty() {
-                f.text(boxr.x + 6, boxr.y + 6, "(no history recorded yet)", 1, ui::BLACK);
+                f.text(
+                    boxr.x + 6,
+                    boxr.y + 6,
+                    "(no history recorded yet)",
+                    1,
+                    ui::BLACK,
+                );
             } else {
                 let rows = ((boxr.h - 10) / 13).max(1) as usize;
                 let start = log.len().saturating_sub(rows);
@@ -3822,12 +3867,19 @@ fn draw_tool_icon(f: &mut Frame, tool: Tool, r: Rect) {
     let b = ui::BLACK;
     match tool {
         Tool::Move => {
-            f.line(cx - 7, cy, cx + 7, cy, b);
-            f.line(cx, cy - 7, cx, cy + 7, b);
-            f.fill_rect(Rect::new(cx - 8, cy - 2, 3, 5), b);
-            f.fill_rect(Rect::new(cx + 6, cy - 2, 3, 5), b);
-            f.fill_rect(Rect::new(cx - 2, cy - 8, 5, 3), b);
-            f.fill_rect(Rect::new(cx - 2, cy + 6, 5, 3), b);
+            f.line(cx - 8, cy, cx + 8, cy, b);
+            f.line(cx, cy - 8, cx, cy + 8, b);
+            // Triangular arrowheads on all four points.
+            for dy in -3i32..=3 {
+                let inset = dy.abs();
+                f.fill_rect(Rect::new(cx - 8 + inset, cy + dy, 4 - inset, 1), b);
+                f.fill_rect(Rect::new(cx + 5 - (3 - inset), cy + dy, 4 - inset, 1), b);
+            }
+            for dx in -3i32..=3 {
+                let inset = dx.abs();
+                f.fill_rect(Rect::new(cx + dx, cy - 8 + inset, 1, 4 - inset), b);
+                f.fill_rect(Rect::new(cx + dx, cy + 5 - (3 - inset), 1, 4 - inset), b);
+            }
         }
         Tool::MarqueeRect => {
             for x in (cx - 7)..(cx + 8) {
@@ -3866,21 +3918,32 @@ fn draw_tool_icon(f: &mut Frame, tool: Tool, r: Rect) {
         }
         Tool::Wand => {
             f.line(cx - 6, cy + 6, cx + 2, cy - 2, b);
-            f.line(cx + 4, cy - 7, cx + 4, cy - 2, b);
+            // Four-point sparkle at the tip, plus a small satellite.
+            f.line(cx + 4, cy - 8, cx + 4, cy - 2, b);
             f.line(cx + 1, cy - 5, cx + 7, cy - 5, b);
             f.line(cx + 2, cy - 7, cx + 6, cy - 3, b);
+            f.line(cx + 6, cy - 7, cx + 2, cy - 3, b);
+            f.set(cx - 2, cy - 6, b);
+            f.set(cx - 3, cy - 5, b);
+            f.set(cx - 2, cy - 4, b);
+            f.set(cx - 1, cy - 5, b);
         }
         Tool::Eyedropper => {
-            f.line(cx - 6, cy + 6, cx + 4, cy - 4, b);
-            f.line(cx - 5, cy + 7, cx + 5, cy - 3, b);
-            f.fill_rect(Rect::new(cx + 3, cy - 7, 4, 4), b);
+            // Pipette: rubber bulb upper-right, tube converging to
+            // the picking tip at lower-left.
+            f.line(cx - 6, cy + 6, cx + 3, cy - 3, b);
+            f.line(cx - 4, cy + 7, cx + 5, cy - 2, b);
+            f.fill_rect(Rect::new(cx + 3, cy - 7, 5, 5), b);
             f.set(cx - 7, cy + 7, b);
+            f.set(cx - 6, cy + 6, b);
         }
         Tool::Hand => {
-            f.fill_rect(Rect::new(cx - 5, cy - 3, 11, 9), b);
-            for i in 0..4 {
-                f.fill_rect(Rect::new(cx - 5 + i * 3, cy - 7, 2, 4), b);
+            // Four fingers with real gaps, a palm, and a thumb.
+            for (i, h) in [5i32, 7, 6, 4].iter().enumerate() {
+                f.fill_rect(Rect::new(cx - 5 + i as i32 * 3, cy - h, 2, h + 2), b);
             }
+            f.fill_rect(Rect::new(cx - 5, cy - 1, 11, 7), b);
+            f.fill_rect(Rect::new(cx - 7, cy + 1, 2, 4), b);
         }
         Tool::Zoom => {
             for a in 0..40 {
@@ -3895,15 +3958,15 @@ fn draw_tool_icon(f: &mut Frame, tool: Tool, r: Rect) {
             f.line(cx + 3, cy + 2, cx + 7, cy + 6, b);
         }
         Tool::Brush => {
-            for rad in [5, 3] {
-                for yy in -rad..=rad {
-                    for xx in -rad..=rad {
-                        if xx * xx + yy * yy <= rad * rad {
-                            f.set(cx + xx, cy + yy, if rad == 5 { ui::SHADOW } else { b });
-                        }
-                    }
-                }
+            // An angled paint brush: handle upper-right, ferrule,
+            // bristles tapering to the tip, and a paint dab below.
+            f.line(cx + 7, cy - 6, cx + 1, cy, b);
+            f.line(cx + 6, cy - 7, cx, cy - 1, b);
+            f.fill_rect(Rect::new(cx - 2, cy, 3, 3), b);
+            for i in 0..4 {
+                f.fill_rect(Rect::new(cx - 6 + i, cy + 3 + i, 4 - i, 1), b);
             }
+            f.fill_rect(Rect::new(cx - 8, cy + 8, 6, 1), ui::SHADOW);
         }
         Tool::Pen => {
             f.line(cx - 5, cy + 7, cx, cy - 7, b);
@@ -3913,32 +3976,51 @@ fn draw_tool_icon(f: &mut Frame, tool: Tool, r: Rect) {
             f.line(cx, cy + 7, cx, cy + 9, b);
         }
         Tool::Pencil => {
-            f.line(cx - 6, cy + 6, cx + 5, cy - 5, b);
-            f.line(cx - 5, cy + 7, cx + 6, cy - 4, b);
-            f.line(cx - 7, cy + 5, cx + 4, cy - 6, b);
+            // A single pencil: two body edges, a wood tip with a
+            // lead point at lower-left, an eraser cap at upper-right.
+            f.line(cx - 3, cy + 3, cx + 4, cy - 4, b);
+            f.line(cx - 1, cy + 5, cx + 6, cy - 2, b);
+            f.line(cx - 3, cy + 3, cx - 7, cy + 7, b);
+            f.line(cx - 1, cy + 5, cx - 7, cy + 7, b);
+            f.set(cx - 7, cy + 7, b);
+            f.line(cx + 4, cy - 4, cx + 6, cy - 2, b);
+            f.fill_rect(Rect::new(cx + 5, cy - 6, 3, 3), b);
         }
         Tool::Eraser => {
-            f.outline_rect(Rect::new(cx - 6, cy - 3, 11, 8), b);
-            f.line(cx - 6, cy + 5, cx + 6, cy + 5, b);
+            // A slanted block eraser over the surface line it cleans.
+            f.line(cx - 5, cy - 1, cx + 2, cy - 6, b);
+            f.line(cx + 2, cy - 6, cx + 7, cy - 6, b);
+            f.line(cx + 7, cy - 6, cx + 7, cy + 1, b);
+            f.line(cx + 7, cy + 1, cx, cy + 6, b);
+            f.line(cx, cy + 6, cx - 5, cy + 6, b);
+            f.line(cx - 5, cy + 6, cx - 5, cy - 1, b);
+            f.line(cx - 5, cy + 2, cx + 7, cy + 2, b);
+            f.line(cx - 8, cy + 8, cx + 8, cy + 8, ui::SHADOW);
         }
         Tool::Stamp => {
+            // Rubber stamp: round knob, neck, and a wide base.
             for a in 0..32 {
                 let t = a as f32 / 32.0 * std::f32::consts::TAU;
                 f.set(
-                    cx + (t.cos() * 4.0) as i32,
-                    cy - 3 + (t.sin() * 4.0) as i32,
+                    cx + (t.cos() * 3.0) as i32,
+                    cy - 5 + (t.sin() * 3.0) as i32,
                     b,
                 );
             }
-            f.fill_rect(Rect::new(cx - 1, cy + 1, 3, 3), b);
-            f.fill_rect(Rect::new(cx - 5, cy + 4, 11, 3), b);
+            f.fill_rect(Rect::new(cx - 1, cy - 2, 3, 3), b);
+            f.fill_rect(Rect::new(cx - 3, cy + 1, 7, 2), b);
+            f.fill_rect(Rect::new(cx - 6, cy + 3, 13, 3), b);
+            f.fill_rect(Rect::new(cx - 6, cy + 7, 13, 1), ui::SHADOW);
         }
         Tool::Bucket => {
             f.line(cx - 6, cy - 4, cx + 3, cy - 4, b);
             f.line(cx - 6, cy - 4, cx - 3, cy + 4, b);
             f.line(cx + 3, cy - 4, cx + 6, cy + 4, b);
             f.line(cx - 3, cy + 4, cx + 6, cy + 4, b);
-            f.set(cx + 6, cy + 7, b);
+            f.line(cx - 5, cy - 1, cx + 4, cy - 1, b);
+            // The pour: a falling drop at the spout.
+            f.fill_rect(Rect::new(cx + 6, cy + 6, 2, 2), b);
+            f.set(cx + 6, cy + 8, b);
         }
         Tool::Gradient => {
             for i in 0..14 {
@@ -3948,12 +4030,14 @@ fn draw_tool_icon(f: &mut Frame, tool: Tool, r: Rect) {
             f.outline_rect(Rect::new(cx - 7, cy - 5, 14, 11), b);
         }
         Tool::Blur => {
-            f.fill_rect(Rect::new(cx - 1, cy - 7, 3, 4), b);
+            // A water droplet: pointed top, round shaded body.
+            f.line(cx, cy - 8, cx - 4, cy + 1, b);
+            f.line(cx, cy - 8, cx + 4, cy + 1, b);
             for rad in [5, 3] {
                 for yy in -rad..=rad {
                     for xx in -rad..=rad {
                         if xx * xx + yy * yy <= rad * rad {
-                            f.set(cx + xx, cy + 2 + yy, if rad == 5 { ui::SHADOW } else { b });
+                            f.set(cx + xx, cy + 3 + yy, if rad == 5 { ui::SHADOW } else { b });
                         }
                     }
                 }
@@ -3965,8 +4049,11 @@ fn draw_tool_icon(f: &mut Frame, tool: Tool, r: Rect) {
             f.line(cx - 6, cy + 6, cx + 6, cy + 6, b);
         }
         Tool::Smudge => {
-            f.fill_rect(Rect::new(cx - 2, cy - 7, 5, 9), b);
-            f.fill_rect(Rect::new(cx - 1, cy + 2, 3, 5), b);
+            // A fingertip pressing down, with the smear it drags.
+            f.fill_rect(Rect::new(cx - 2, cy - 8, 5, 8), b);
+            f.fill_rect(Rect::new(cx - 1, cy, 3, 3), b);
+            f.line(cx - 7, cy + 5, cx + 1, cy + 5, ui::SHADOW);
+            f.line(cx - 4, cy + 7, cx + 4, cy + 7, ui::SHADOW);
         }
     }
 }

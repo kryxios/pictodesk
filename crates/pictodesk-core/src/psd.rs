@@ -312,9 +312,7 @@ pub fn load_psd(bytes: &[u8]) -> Result<(Document, PsdReport), String> {
         4 => ColorMode::Cmyk,
         7 => {
             if file_channels >= 4 {
-                report
-                    .notes
-                    .push("Multichannel PSD read as CMYK".into());
+                report.notes.push("Multichannel PSD read as CMYK".into());
                 ColorMode::Cmyk
             } else {
                 ColorMode::Grayscale
@@ -431,15 +429,8 @@ pub fn load_psd(bytes: &[u8]) -> Result<(Document, PsdReport), String> {
                 let mut layer_planes = Vec::with_capacity(rec.channels.len());
                 for ch in &rec.channels {
                     let start = r.pos;
-                    let plane = read_channel(
-                        &mut r,
-                        w,
-                        h,
-                        depth,
-                        Some(ch.len),
-                        &mut report,
-                        &rec.name,
-                    )?;
+                    let plane =
+                        read_channel(&mut r, w, h, depth, Some(ch.len), &mut report, &rec.name)?;
                     if r.pos != start + ch.len && ch.len >= 2 {
                         r.pos = start + ch.len;
                     }
@@ -483,7 +474,16 @@ pub fn load_psd(bytes: &[u8]) -> Result<(Document, PsdReport), String> {
             }
         }
         let mut layer = Layer::new("Background");
-        compose_layer(&mut layer, &by_id, 0, 0, width, height, mode, palette.as_deref());
+        compose_layer(
+            &mut layer,
+            &by_id,
+            0,
+            0,
+            width,
+            height,
+            mode,
+            palette.as_deref(),
+        );
         doc.layers.push(layer);
         report.layers_imported = 1;
         report
@@ -546,12 +546,10 @@ pub fn load_psd(bytes: &[u8]) -> Result<(Document, PsdReport), String> {
             // Layer mask (channel -2): bake into transparency and
             // preserve the mask itself as a named alpha channel.
             if let Some(mask) = by_id.iter().find(|(id, _)| *id == -2).map(|(_, p)| p) {
-                apply_layer_mask(&mut layer, mask, rec.left, rec.top, w as u32, h as u32, mode);
-                let mut ch = AlphaChannel::new(
-                    format!("{} Mask", layer.name),
-                    width,
-                    height,
+                apply_layer_mask(
+                    &mut layer, mask, rec.left, rec.top, w as u32, h as u32, mode,
                 );
+                let mut ch = AlphaChannel::new(format!("{} Mask", layer.name), width, height);
                 for yy in 0..h {
                     for xx in 0..w {
                         let i = (yy * w + xx) as usize;

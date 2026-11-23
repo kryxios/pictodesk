@@ -13,7 +13,15 @@ struct B {
     psb: bool,
 }
 impl B {
-    fn new(w: u32, h: u32, depth: u16, mode: u16, channels: u16, color_data: &[u8], psb: bool) -> B {
+    fn new(
+        w: u32,
+        h: u32,
+        depth: u16,
+        mode: u16,
+        channels: u16,
+        color_data: &[u8],
+        psb: bool,
+    ) -> B {
         let mut b = B {
             buf: Vec::new(),
             psb,
@@ -27,7 +35,8 @@ impl B {
         b.buf.extend_from_slice(&w.to_be_bytes());
         b.buf.extend_from_slice(&depth.to_be_bytes());
         b.buf.extend_from_slice(&mode.to_be_bytes());
-        b.buf.extend_from_slice(&(color_data.len() as u32).to_be_bytes());
+        b.buf
+            .extend_from_slice(&(color_data.len() as u32).to_be_bytes());
         b.buf.extend_from_slice(color_data);
         b.buf.extend_from_slice(&0u32.to_be_bytes()); // resources
         b
@@ -123,12 +132,7 @@ fn psd_zip_channels() {
         &mut rec,
         "Zip",
         (0, 0, 2, 4),
-        &[
-            (-1, alpha.len()),
-            (0, r.len()),
-            (1, g.len()),
-            (2, bl.len()),
-        ],
+        &[(-1, alpha.len()), (0, r.len()), (1, g.len()), (2, bl.len())],
         b"norm",
         255,
     );

@@ -141,6 +141,36 @@ impl Frame {
         }
     }
 
+    /// Draw pixel-font text rotated 90° counter-clockwise, reading
+    /// bottom-to-top — the classic vertical-ruler style. `(x, y)` is
+    /// the bottom-left corner of the rotated run: glyphs occupy
+    /// `x..x + 8*scale` horizontally and extend upward from `y`.
+    pub fn text_vertical(&mut self, x: i32, y: i32, text: &str, scale: i32, c: Rgb) {
+        let mut bx = 0i32; // block offset along the unrotated run
+        for ch in text.chars() {
+            if let Some(glyph) = font8x8::BASIC_FONTS.get(ch) {
+                for (row, &bits) in glyph.iter().enumerate() {
+                    for col in 0..8 {
+                        if bits & (1 << col) != 0 {
+                            // Unrotated block coords: (bx + col, row).
+                            // Rotated 90° CCW: (row, -(bx + col)).
+                            self.fill_rect(
+                                Rect::new(
+                                    x + row as i32 * scale,
+                                    y - (bx + col + 1) * scale,
+                                    scale,
+                                    scale,
+                                ),
+                                c,
+                            );
+                        }
+                    }
+                }
+            }
+            bx += 9;
+        }
+    }
+
     pub fn text_centered(&mut self, r: Rect, text: &str, scale: i32, c: Rgb) {
         let tw = Self::text_width(text, scale);
         let th = 8 * scale;

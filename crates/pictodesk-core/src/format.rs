@@ -440,7 +440,8 @@ fn parse_ext(payload: &[u8], doc: &mut Document) -> Result<(), FormatError> {
             let len = r.u16()? as usize;
             let action = String::from_utf8(r.take(len)?.to_vec())
                 .map_err(|_| FormatError::Corrupt("history action not UTF-8"))?;
-            doc.history_log.push(crate::document::HistoryEvent { when, action });
+            doc.history_log
+                .push(crate::document::HistoryEvent { when, action });
         }
     }
     Ok(())
