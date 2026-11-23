@@ -5342,7 +5342,11 @@ impl Gpu {
                 &wgpu::DeviceDescriptor {
                     label: Some("pictodesk-device"),
                     required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::downlevel_defaults(),
+                    // The adapter's own limits, NOT downlevel
+                    // defaults: downlevel caps textures at 2048px,
+                    // which a Retina window (2560x1600 physical)
+                    // exceeds — configuring the surface then panics.
+                    required_limits: adapter.limits(),
                 },
                 None,
             )
@@ -5996,8 +6000,8 @@ impl Runner {
                             &wgpu::SurfaceConfiguration {
                                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
                                 format: gpu.format,
-                                width: sz.width,
-                                height: sz.height,
+                                width: sz.width.min(gpu.device.limits().max_texture_dimension_2d),
+                                height: sz.height.min(gpu.device.limits().max_texture_dimension_2d),
                                 present_mode: wgpu::PresentMode::Fifo,
                                 desired_maximum_frame_latency: 2,
                                 alpha_mode: wgpu::CompositeAlphaMode::Auto,
@@ -6049,8 +6053,8 @@ impl ApplicationHandler for Runner {
                     &wgpu::SurfaceConfiguration {
                         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
                         format: gpu.format,
-                        width: sz.width,
-                        height: sz.height,
+                        width: sz.width.min(gpu.device.limits().max_texture_dimension_2d),
+                        height: sz.height.min(gpu.device.limits().max_texture_dimension_2d),
                         present_mode: wgpu::PresentMode::Fifo,
                         desired_maximum_frame_latency: 2,
                         alpha_mode: wgpu::CompositeAlphaMode::Auto,
@@ -6084,8 +6088,8 @@ impl ApplicationHandler for Runner {
                             &wgpu::SurfaceConfiguration {
                                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
                                 format: gpu.format,
-                                width: sz.width,
-                                height: sz.height,
+                                width: sz.width.min(gpu.device.limits().max_texture_dimension_2d),
+                                height: sz.height.min(gpu.device.limits().max_texture_dimension_2d),
                                 present_mode: wgpu::PresentMode::Fifo,
                                 desired_maximum_frame_latency: 2,
                                 alpha_mode: wgpu::CompositeAlphaMode::Auto,

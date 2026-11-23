@@ -3,7 +3,7 @@
 An open-source desktop photo and image editor — local files, no cloud,
 no account, no subscription. Built feature by feature, in the open.
 
-**Status: v0.3.6 — Phase 3 complete: layers, with the v0.3.0 reduced forms finished. First public alpha.**
+**Status: v0.3.7 — Phase 3 complete: layers, with the v0.3.0 reduced forms finished. First public alpha.**
 The UI follows the classic early-90s editor design: a File / Edit /
 Image / Mode / Filter / Select / Window menu bar, a compact
 two-column toolbox, modal dialogs with live preview, docked tabbed
