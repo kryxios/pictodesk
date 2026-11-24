@@ -365,16 +365,29 @@ pub fn render_type_layer(doc: &mut Document, layer: usize) {
     let mut placed: Vec<PlacedGlyph> = Vec::new();
     let mut scratch: Vec<(i32, i32, i32, i32)> = Vec::new();
 
+    let mut strikes: Vec<(i32, i32, i32, Pixel16)> = Vec::new();
     if spec.vertical {
         render_vertical(doc, layer, &spec, ox, oy, &mut placed);
     } else {
-        render_horizontal(doc, layer, &spec, ox, oy, &mut placed);
+        render_horizontal(doc, layer, &spec, ox, oy, &mut placed, &mut strikes);
     }
     for g in &placed {
         blit_glyph(doc, layer, g, &mut scratch);
     }
     // Underlines: one rule per underlined segment per line.
     draw_underlines(doc, layer, &spec, ox, oy);
+    // Strikethrough rules (Phase 6 Character extras).
+    for (x0, x1, y, color) in strikes {
+        for xx in x0..x1 {
+            let cur = doc.layers[layer].get_pixel(xx, y);
+            doc.layers[layer].set_pixel(xx, y, over(cur, color));
+        }
+    }
+    // Warp Text (Phase 6): the warp deforms the rendered layer
+    // while the spec stays editable; re-rendering re-applies it.
+    if let Some(w) = spec.warp_style {
+        pictodesk_core::warp::warp_layer(doc, layer, w, spec.warp_bend, spec.warp_h, spec.warp_v);
+    }
 }
 
 fn line_height(spec: &TextSpec) -> f32 {
@@ -392,37 +405,182 @@ fn render_horizontal(
     ox: i32,
     oy: i32,
     placed: &mut Vec<PlacedGlyph>,
+    strikes: &mut Vec<(i32, i32, i32, Pixel16)>,
 ) {
     let lh = line_height(spec);
     let mut byte_pos = 0usize;
-    for (li, line) in spec.text.split('\n').enumerate() {
-        // Metrics from the line's first style (the default when
-        // the line is empty).
-        let first_style = if line.is_empty() {
-            spec.default_style.clone()
-        } else {
-            spec.style_at(byte_pos)
-        };
-        let font = find_entry(&first_style.font, &first_style.style).and_then(load_font);
-        let (ascent, _descent) = match font {
-            Some(f) => (
-                f.ascent * (first_style.size / f.units_per_em),
-                f.descent * (first_style.size / f.units_per_em),
-            ),
-            None => (first_style.size * 0.8, first_style.size * -0.2),
-        };
-        let baseline = oy as f32 + li as f32 * lh + ascent;
-        let width = measure_line(spec, line, byte_pos);
-        let start_x = match spec.align {
-            1 => ox as f32 - width / 2.0,
-            2 => ox as f32 - width,
-            _ => ox as f32,
-        };
-        let mut pen = start_x;
-        for (s, e, style) in segments(spec, line, byte_pos) {
-            pen += shape_segment(&line[s..e], &style, pen, baseline, placed);
+    let mut y = oy as f32;
+    // Visual lines for one paragraph: (start, end, hyphenated)
+    // byte ranges relative to the paragraph string.
+    let wrap = |para: &str, base: usize| -> Vec<(usize, usize, bool)> {
+        if spec.box_w == 0 {
+            return vec![(0, para.len(), false)];
         }
-        byte_pos += line.len() + 1;
+        let boxw = spec.box_w as f32;
+        let mut out: Vec<(usize, usize, bool)> = Vec::new();
+        let mut line_start = 0usize;
+        let mut last_break: Option<usize> = None; // byte after a space
+        let mut i = 0usize;
+        let bytes = para.as_bytes();
+        while i < para.len() {
+            // Advance to the next word end.
+            let mut j = i;
+            while j < para.len() && bytes[j] != b' ' {
+                j += 1;
+            }
+            let w = measure_line(spec, &para[line_start..j], base + line_start);
+            if w > boxw && line_start < i {
+                // Break at the last space.
+                let br = last_break.unwrap_or(i);
+                out.push((line_start, br.saturating_sub(1).max(line_start), false));
+                line_start = br;
+                last_break = None;
+                i = line_start;
+                continue;
+            }
+            if w > boxw && line_start == i {
+                // A single word wider than the boxw.
+                if spec.hyphenate {
+                    // Split at the widest fitting char boundary.
+                    let mut k = i + 1;
+                    let mut best = i + 1;
+                    while k < j {
+                        if measure_line(spec, &para[i..k], base + i) > boxw {
+                            break;
+                        }
+                        best = k;
+                        k += para[k..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+                    }
+                    out.push((i, best, true));
+                    line_start = best;
+                    i = best;
+                    last_break = None;
+                    continue;
+                }
+                // No hyphenation: let the word overflow its line.
+                out.push((line_start, j, false));
+                line_start = (j + 1).min(para.len());
+                i = line_start;
+                last_break = None;
+                continue;
+            }
+            if j < para.len() {
+                last_break = Some(j + 1);
+            }
+            i = (j + 1).min(para.len());
+            if j >= para.len() {
+                break;
+            }
+        }
+        if line_start < para.len() || out.is_empty() {
+            out.push((line_start, para.len(), false));
+        }
+        out
+    };
+    for (pi, para) in spec.text.split('\n').enumerate() {
+        if pi > 0 {
+            y += spec.space_before;
+        }
+        let visual = wrap(para, byte_pos);
+        let nvis = visual.len();
+        for (vi, (ls, le, hyphen)) in visual.into_iter().enumerate() {
+            let line = &para[ls..le];
+            let first_style = if line.is_empty() {
+                spec.default_style.clone()
+            } else {
+                spec.style_at(byte_pos + ls)
+            };
+            let font = find_entry(&first_style.font, &first_style.style).and_then(load_font);
+            let (ascent, _descent) = match font {
+                Some(f) => (
+                    f.ascent * (first_style.size / f.units_per_em),
+                    f.descent * (first_style.size / f.units_per_em),
+                ),
+                None => (first_style.size * 0.8, first_style.size * -0.2),
+            };
+            let baseline = y + ascent;
+            let width = measure_line(spec, line, byte_pos + ls);
+            let boxw = spec.box_w as f32;
+            let start_x = match spec.align {
+                1 => {
+                    if boxw > 0.0 {
+                        ox as f32 + (boxw - width) / 2.0
+                    } else {
+                        ox as f32 - width / 2.0
+                    }
+                }
+                2 => {
+                    if boxw > 0.0 {
+                        ox as f32 + (boxw - width)
+                    } else {
+                        ox as f32 - width
+                    }
+                }
+                3 => ox as f32,
+                _ => ox as f32 + if vi == 0 { spec.first_indent } else { 0.0 },
+            };
+            // Justification: extra space distributed over the
+            // gaps (not on the paragraph's last line).
+            let justify_extra = if spec.align == 3 && boxw > 0.0 && vi + 1 < nvis {
+                let gaps = line.matches(' ').count();
+                if gaps > 0 && width < boxw {
+                    (boxw - width) / gaps as f32
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            };
+            let mut pen = start_x;
+            for (s0, e0, style) in segments(spec, line, byte_pos + ls) {
+                let seg = &line[s0..e0];
+                if spec.extras & 0b1011 != 0 && spec.extras & 7 != 0 {
+                    // Small caps / super / sub shape per character
+                    // (kerning across the segment is lost, v1).
+                    for ch in seg.chars() {
+                        let mut st = style.clone();
+                        let mut b = baseline;
+                        let mut txt = ch.to_string();
+                        if spec.extras & 1 != 0 && ch.is_lowercase() {
+                            txt = ch.to_uppercase().collect();
+                            st.size *= 0.75;
+                        }
+                        if spec.extras & 2 != 0 {
+                            st.size *= 0.65;
+                            b -= style.size * 0.35;
+                        }
+                        if spec.extras & 4 != 0 {
+                            st.size *= 0.65;
+                            b += style.size * 0.12;
+                        }
+                        pen += shape_segment(&txt, &st, pen, b, placed);
+                        if justify_extra > 0.0 && ch == ' ' {
+                            pen += justify_extra;
+                        }
+                    }
+                } else {
+                    pen += shape_segment(seg, &style, pen, baseline, placed);
+                    if justify_extra > 0.0 {
+                        pen += justify_extra * seg.matches(' ').count() as f32;
+                    }
+                }
+            }
+            if hyphen {
+                let st = first_style.clone();
+                pen += shape_segment("-", &st, pen, baseline, placed);
+            }
+            if spec.extras & 8 != 0 && pen > start_x {
+                strikes.push((
+                    start_x.round() as i32,
+                    pen.round() as i32,
+                    (baseline - first_style.size * 0.3).round() as i32,
+                    first_style.color,
+                ));
+            }
+            y += lh;
+        }
+        y += spec.space_after;
+        byte_pos += para.len() + 1;
         let _ = layer;
         let _ = doc;
     }

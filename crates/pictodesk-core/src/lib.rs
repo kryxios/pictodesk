@@ -8,6 +8,7 @@
 pub mod adjust;
 pub mod blend;
 pub mod brush;
+pub mod channels;
 pub mod color;
 pub mod document;
 pub mod effects;
@@ -18,14 +19,17 @@ pub mod history;
 pub mod icc;
 pub mod io;
 pub mod layer;
+pub mod liquify;
 pub mod mode;
 pub mod path;
 pub mod pixel;
 pub mod psd;
 pub mod selection;
+pub mod shapes;
 pub mod text;
 pub mod tile;
 pub mod transform;
+pub mod warp;
 
 pub use blend::BlendMode;
 pub use color::WorkingSpace;

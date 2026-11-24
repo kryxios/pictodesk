@@ -32,6 +32,9 @@ pub struct ShadowSpec {
     pub blur: u32,
     /// Choke/intensity percent: raises the shadow's alpha.
     pub intensity: u32,
+    /// Contour curve (Phase 6): 0 Linear, 1 Cone, 2 Ring,
+    /// 3 Cove. Applied to the blurred alpha before compositing.
+    pub contour: u8,
 }
 
 impl Default for ShadowSpec {
@@ -46,6 +49,7 @@ impl Default for ShadowSpec {
             distance: 5,
             blur: 5,
             intensity: 0,
+            contour: 0,
         }
     }
 }
@@ -65,6 +69,8 @@ pub struct GlowSpec {
     /// Inner glow only: true = glow wells up from the center,
     /// false = glow creeps in from the edges.
     pub source_center: bool,
+    /// Contour curve (Phase 6), same numbering as ShadowSpec.
+    pub contour: u8,
 }
 
 impl Default for GlowSpec {
@@ -77,6 +83,7 @@ impl Default for GlowSpec {
             blur: 5,
             intensity: 0,
             source_center: false,
+            contour: 0,
         }
     }
 }
@@ -99,6 +106,14 @@ pub struct BevelSpec {
     pub sh_opacity: f32,
     pub angle: i32,
     pub use_global_angle: bool,
+    /// Contour curve (Phase 6), same numbering as ShadowSpec.
+    pub contour: u8,
+    /// Texture (Phase 6): modulate the bevel shading with a
+    /// built-in pattern (0 = none/checker when on, 1 = dots,
+    /// 2 = lines). `texture_depth` scales the modulation.
+    pub texture: bool,
+    pub texture_kind: u8,
+    pub texture_depth: u32,
 }
 
 impl Default for BevelSpec {
@@ -116,6 +131,188 @@ impl Default for BevelSpec {
             sh_opacity: 1.0,
             angle: 120,
             use_global_angle: true,
+            contour: 0,
+            texture: false,
+            texture_kind: 0,
+            texture_depth: 100,
+        }
+    }
+}
+
+/// Satin (Phase 6): two offset, blurred copies of the shape
+/// blended inside it, giving a satiny sheen.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SatinSpec {
+    pub enabled: bool,
+    pub mode: BlendMode,
+    pub color: Pixel16,
+    pub opacity: f32,
+    pub angle: i32,
+    pub distance: u32,
+    pub blur: u32,
+    /// Invert the satin (swap light/dark lobes).
+    pub invert: bool,
+    pub contour: u8,
+}
+
+impl Default for SatinSpec {
+    fn default() -> Self {
+        SatinSpec {
+            enabled: false,
+            mode: BlendMode::Multiply,
+            color: Pixel16::from_rgba8(0, 0, 0, 255),
+            opacity: 0.5,
+            angle: 19,
+            distance: 11,
+            blur: 14,
+            invert: false,
+            contour: 0,
+        }
+    }
+}
+
+/// Color Overlay (Phase 6): a flat color blended over the
+/// layer's opaque pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ColorOverlaySpec {
+    pub enabled: bool,
+    pub mode: BlendMode,
+    pub color: Pixel16,
+    pub opacity: f32,
+}
+
+impl Default for ColorOverlaySpec {
+    fn default() -> Self {
+        ColorOverlaySpec {
+            enabled: false,
+            mode: BlendMode::Normal,
+            color: Pixel16::from_rgba8(255, 0, 0, 255),
+            opacity: 1.0,
+        }
+    }
+}
+
+/// Gradient Overlay (Phase 6): a two-color gradient blended
+/// over the layer's opaque pixels, mapped over the content's
+/// bounds. Style 0 = Linear (at `angle`), 1 = Radial.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GradientOverlaySpec {
+    pub enabled: bool,
+    pub mode: BlendMode,
+    pub opacity: f32,
+    pub from: Pixel16,
+    pub to: Pixel16,
+    pub style: u8,
+    pub angle: i32,
+    /// Gradient scale percent (100 = spans the content bounds).
+    pub scale: u32,
+}
+
+impl Default for GradientOverlaySpec {
+    fn default() -> Self {
+        GradientOverlaySpec {
+            enabled: false,
+            mode: BlendMode::Normal,
+            opacity: 1.0,
+            from: Pixel16::from_rgba8(0, 0, 0, 255),
+            to: Pixel16::from_rgba8(255, 255, 255, 255),
+            style: 0,
+            angle: 90,
+            scale: 100,
+        }
+    }
+}
+
+/// Pattern Overlay (Phase 6): a built-in pattern blended over
+/// the layer's opaque pixels. Pattern kinds: 0 checker,
+/// 1 dots, 2 diagonal lines (the app's user patterns ride the
+/// pattern stamp; overlays use these built-ins in v1).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PatternOverlaySpec {
+    pub enabled: bool,
+    pub mode: BlendMode,
+    pub opacity: f32,
+    pub kind: u8,
+    /// Pattern scale percent.
+    pub scale: u32,
+}
+
+impl Default for PatternOverlaySpec {
+    fn default() -> Self {
+        PatternOverlaySpec {
+            enabled: false,
+            mode: BlendMode::Normal,
+            opacity: 1.0,
+            kind: 0,
+            scale: 100,
+        }
+    }
+}
+
+/// Stroke (Phase 6): an outline around the layer's alpha edge.
+/// Position: 0 Outside, 1 Inside, 2 Center.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StrokeSpec {
+    pub enabled: bool,
+    pub mode: BlendMode,
+    pub color: Pixel16,
+    pub opacity: f32,
+    /// Stroke width in pixels.
+    pub size: u32,
+    pub position: u8,
+}
+
+impl Default for StrokeSpec {
+    fn default() -> Self {
+        StrokeSpec {
+            enabled: false,
+            mode: BlendMode::Normal,
+            color: Pixel16::from_rgba8(0, 0, 0, 255),
+            opacity: 1.0,
+            size: 3,
+            position: 0,
+        }
+    }
+}
+
+/// Apply a contour curve to a 0..=1 alpha value (Phase 6).
+pub fn contour_curve(kind: u8, t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    match kind {
+        1 => t * t,                                   // Cone (peaked falloff)
+        2 => (t * std::f32::consts::TAU).sin().abs(), // Ring
+        3 => 1.0 - (1.0 - t) * (1.0 - t),             // Cove (fast rise)
+        _ => t,                                       // Linear
+    }
+}
+
+/// A built-in pattern's coverage at a point (Phase 6 overlays
+/// and bevel texture): returns 0..=1.
+pub fn pattern_value(kind: u8, x: i32, y: i32, scale: u32) -> f32 {
+    let cell = ((scale.max(10) as f32 / 100.0) * 8.0).max(2.0);
+    let (fx, fy) = (x as f32 / cell, y as f32 / cell);
+    match kind {
+        1 => {
+            let d = ((fx.fract() - 0.5).powi(2) + (fy.fract() - 0.5).powi(2)).sqrt();
+            if d < 0.32 {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        2 => {
+            if ((fx + fy).fract()) < 0.5 {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        _ => {
+            if (fx.floor() as i32 + fy.floor() as i32) % 2 == 0 {
+                1.0
+            } else {
+                0.0
+            }
         }
     }
 }
@@ -130,6 +327,12 @@ pub struct Effects {
     pub outer_glow: GlowSpec,
     pub inner_glow: GlowSpec,
     pub bevel: BevelSpec,
+    // Phase 6 additions.
+    pub satin: SatinSpec,
+    pub color_overlay: ColorOverlaySpec,
+    pub gradient_overlay: GradientOverlaySpec,
+    pub pattern_overlay: PatternOverlaySpec,
+    pub stroke: StrokeSpec,
 }
 
 impl Effects {
@@ -139,11 +342,18 @@ impl Effects {
             || self.outer_glow.enabled
             || self.inner_glow.enabled
             || self.bevel.enabled
+            || self.satin.enabled
+            || self.color_overlay.enabled
+            || self.gradient_overlay.enabled
+            || self.pattern_overlay.enabled
+            || self.stroke.enabled
     }
 
     /// Does this set paint anything under the layer content?
     pub fn has_below(&self) -> bool {
-        self.drop_shadow.enabled || self.outer_glow.enabled
+        self.drop_shadow.enabled
+            || self.outer_glow.enabled
+            || (self.stroke.enabled && self.stroke.position != 1)
     }
 
     /// Extra margin (pixels) a render region needs around the
@@ -164,6 +374,9 @@ impl Effects {
         }
         if self.inner_glow.enabled {
             m = m.max(self.inner_glow.blur as i32 * 2 + 2);
+        }
+        if self.stroke.enabled && self.stroke.position != 1 {
+            m = m.max(self.stroke.size as i32 + 2);
         }
         m
     }
@@ -261,6 +474,48 @@ fn sample_plane(plane: &[f32], w: usize, h: usize, x: i32, y: i32) -> f32 {
     }
 }
 
+/// Max-filter dilation of an alpha plane by radius `r`
+/// (separable approximation, two passes).
+fn dilate_plane(src: &[f32], w: usize, h: usize, r: i32) -> Vec<f32> {
+    if r <= 0 || w == 0 || h == 0 {
+        return src.to_vec();
+    }
+    let mut cur = src.to_vec();
+    let mut tmp = vec![0f32; w * h];
+    for _ in 0..2 {
+        for y in 0..h {
+            for x in 0..w {
+                let mut m = 0f32;
+                for k in -r..=r {
+                    m = m.max(sample_plane(&cur, w, h, x as i32 + k, y as i32));
+                }
+                tmp[y * w + x] = m;
+            }
+        }
+        std::mem::swap(&mut cur, &mut tmp);
+        for x in 0..w {
+            for y in 0..h {
+                let mut m = 0f32;
+                for k in -r..=r {
+                    m = m.max(sample_plane(&cur, w, h, x as i32, y as i32 + k));
+                }
+                tmp[y * w + x] = m;
+            }
+        }
+        std::mem::swap(&mut cur, &mut tmp);
+    }
+    cur
+}
+
+/// Erosion via the complement of a dilation.
+fn erode_plane(src: &[f32], w: usize, h: usize, r: i32) -> Vec<f32> {
+    let inv: Vec<f32> = src.iter().map(|a| 1.0 - a).collect();
+    dilate_plane(&inv, w, h, r)
+        .iter()
+        .map(|a| 1.0 - a)
+        .collect()
+}
+
 /// Blend `color` over `px` per channel with `mode`, mixed by
 /// `strength` (0..=1), writing rgb only (alpha untouched).
 fn blend_toward(px: &mut Pixel16, mode: BlendMode, color: Pixel16, strength: f32) {
@@ -324,7 +579,10 @@ pub fn below_buffer(
             s.angle
         };
         let (dx, dy) = offset_of(angle, s.distance);
-        let blurred = blur_plane(&alpha, w, h, s.blur as i32, 2);
+        let blurred: Vec<f32> = blur_plane(&alpha, w, h, s.blur as i32, 2)
+            .iter()
+            .map(|a| contour_curve(s.contour, *a))
+            .collect();
         let boost = 1.0 + s.intensity as f32 / 100.0 * 1.5;
         let (cr, cg, cb, _) = s.color.to_f32s();
         for y in 0..h as i32 {
@@ -334,6 +592,25 @@ pub fn below_buffer(
                 if a > 0.0 {
                     over(&mut out[(y as usize) * w + x as usize], (cr, cg, cb), a);
                 }
+            }
+        }
+    }
+    if fx.stroke.enabled && fx.stroke.position != 1 {
+        // Outside (0) or Center (2): the ring between the alpha
+        // and its dilation (full size for Outside, half for
+        // Center), painted under the content.
+        let st = &fx.stroke;
+        let r = if st.position == 2 {
+            (st.size / 2).max(1)
+        } else {
+            st.size
+        };
+        let dil = dilate_plane(&alpha, w, h, r as i32);
+        let (cr, cg, cb, _) = st.color.to_f32s();
+        for i in 0..w * h {
+            let ring = (dil[i] - alpha[i]).clamp(0.0, 1.0) * st.opacity;
+            if ring > 0.0 {
+                over(&mut out[i], (cr, cg, cb), ring);
             }
         }
     }
@@ -452,6 +729,116 @@ pub fn apply_within(content: &mut [Pixel16], w: usize, h: usize, fx: &Effects, g
                     let (cr, cg, cb, _) = b.sh_color.to_f32s();
                     over(&mut content[i], (cr, cg, cb), ba);
                 }
+            }
+        }
+    }
+
+    // ---- Phase 6 within-content effects, in dialog order:
+    // satin, then the three overlays, then the inside stroke.
+    if fx.satin.enabled {
+        let sp = &fx.satin;
+        let (dx, dy) = offset_of(sp.angle, sp.distance);
+        let blurred = blur_plane(&alpha, w, h, sp.blur as i32, 2);
+        for y in 0..h as i32 {
+            for x in 0..w as i32 {
+                let i = (y as usize) * w + x as usize;
+                if alpha[i] <= 0.0 {
+                    continue;
+                }
+                let a = sample_plane(&blurred, w, h, x - dx, y - dy);
+                let b = sample_plane(&blurred, w, h, x + dx, y + dy);
+                let mut lobe = ((a - b) * 0.5 + 0.5).clamp(0.0, 1.0);
+                lobe = contour_curve(sp.contour, lobe);
+                if sp.invert {
+                    lobe = 1.0 - lobe;
+                }
+                let strength = ((lobe - 0.5).abs() * 2.0) * alpha[i] * sp.opacity;
+                if strength > 0.01 {
+                    blend_toward(&mut content[i], sp.mode, sp.color, strength);
+                }
+            }
+        }
+    }
+    if fx.color_overlay.enabled {
+        let o = &fx.color_overlay;
+        for i in 0..w * h {
+            if alpha[i] > 0.0 {
+                blend_toward(&mut content[i], o.mode, o.color, o.opacity * alpha[i]);
+            }
+        }
+    }
+    if fx.gradient_overlay.enabled {
+        let o = &fx.gradient_overlay;
+        // Map over the content's painted bounds.
+        let (mut x0, mut y0, mut x1, mut y1) = (w as i32, h as i32, -1i32, -1i32);
+        for y in 0..h as i32 {
+            for x in 0..w as i32 {
+                if alpha[(y as usize) * w + x as usize] > 0.0 {
+                    x0 = x0.min(x);
+                    y0 = y0.min(y);
+                    x1 = x1.max(x);
+                    y1 = y1.max(y);
+                }
+            }
+        }
+        if x1 >= x0 {
+            let (bw, bh) = ((x1 - x0 + 1) as f32, (y1 - y0 + 1) as f32);
+            let ang = (o.angle as f32).to_radians();
+            let (ga_x, ga_y) = (ang.cos(), -ang.sin());
+            let (fr, fg, fb, _) = o.from.to_f32s();
+            let (tr, tg, tb, _) = o.to.to_f32s();
+            let scale = (o.scale.max(10) as f32) / 100.0;
+            for y in 0..h as i32 {
+                for x in 0..w as i32 {
+                    let i = (y as usize) * w + x as usize;
+                    if alpha[i] <= 0.0 {
+                        continue;
+                    }
+                    let (nx, ny) = ((x - x0) as f32 / bw - 0.5, (y - y0) as f32 / bh - 0.5);
+                    let t = if o.style == 1 {
+                        ((nx * nx + ny * ny).sqrt() * 1.42 / scale).clamp(0.0, 1.0)
+                    } else {
+                        ((nx * ga_x + ny * ga_y) / scale + 0.5).clamp(0.0, 1.0)
+                    };
+                    let col = Pixel16::from_f32s(
+                        fr + (tr - fr) * t,
+                        fg + (tg - fg) * t,
+                        fb + (tb - fb) * t,
+                        1.0,
+                    );
+                    blend_toward(&mut content[i], o.mode, col, o.opacity * alpha[i]);
+                }
+            }
+        }
+    }
+    if fx.pattern_overlay.enabled {
+        let o = &fx.pattern_overlay;
+        for y in 0..h as i32 {
+            for x in 0..w as i32 {
+                let i = (y as usize) * w + x as usize;
+                if alpha[i] <= 0.0 {
+                    continue;
+                }
+                let v = pattern_value(o.kind, x, y, o.scale);
+                let col = Pixel16::from_f32s(v, v, v, 1.0);
+                blend_toward(&mut content[i], o.mode, col, o.opacity * alpha[i]);
+            }
+        }
+    }
+    if fx.stroke.enabled && fx.stroke.position != 0 {
+        // Inside (1) or Center (2): the ring between the alpha
+        // and its erosion, painted over the content edge.
+        let st = &fx.stroke;
+        let r = if st.position == 2 {
+            (st.size / 2).max(1)
+        } else {
+            st.size
+        };
+        let ero = erode_plane(&alpha, w, h, r as i32);
+        for i in 0..w * h {
+            let ring = (alpha[i] - ero[i]).clamp(0.0, 1.0) * st.opacity;
+            if ring > 0.0 {
+                blend_toward(&mut content[i], st.mode, st.color, ring);
             }
         }
     }

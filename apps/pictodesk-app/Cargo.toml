@@ -14,3 +14,4 @@ bytemuck = { version = "1", features = ["derive"] }
 font8x8 = "0.3"
 fontdue = "0.9"
 rustybuzz = "0.18"
+cpal = "0.15"

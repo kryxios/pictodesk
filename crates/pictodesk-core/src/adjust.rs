@@ -51,6 +51,14 @@ pub enum Adjustment {
         /// Strength, 0..=100 percent.
         density: u8,
     },
+    /// Gradient Map (Phase 6): map luminance through a
+    /// two-color gradient (from = shadows, to = highlights),
+    /// optionally reversed.
+    GradientMap {
+        from: (u8, u8, u8),
+        to: (u8, u8, u8),
+        reverse: bool,
+    },
 }
 
 impl Adjustment {
@@ -62,6 +70,7 @@ impl Adjustment {
             Adjustment::HueSaturation { .. } => "Hue/Saturation",
             Adjustment::ColorBalance { .. } => "Color Balance",
             Adjustment::PhotoFilter { .. } => "Photo Filter",
+            Adjustment::GradientMap { .. } => "Gradient Map",
         }
     }
 
@@ -172,6 +181,14 @@ impl Adjustment {
                     b + (tinted.2 - b) * t,
                 )
             }
+            Adjustment::GradientMap { from, to, reverse } => {
+                let l = 0.299 * r + 0.587 * g + 0.114 * b;
+                let t = if *reverse { 1.0 - l } else { l }.clamp(0.0, 1.0);
+                let mix = |a: u8, b: u8| {
+                    (a as f32 / 255.0) + ((b as f32 / 255.0) - (a as f32 / 255.0)) * t
+                };
+                (mix(from.0, to.0), mix(from.1, to.1), mix(from.2, to.2))
+            }
         }
     }
 }
@@ -208,6 +225,11 @@ pub fn map_layer_pixels(
     sel: Option<&Selection>,
     f: impl Fn(Pixel16) -> Pixel16,
 ) {
+    // Lab documents (Phase 6.5): adjustments are RGB-space math,
+    // so each stored Lab pixel is decoded to RGB for `f` and the
+    // result encoded back — the same round-trip the filter path
+    // takes in CMYK mode.
+    let lab = doc.mode == crate::document::ColorMode::Lab;
     let offset = doc.layers[layer].offset;
     let coords: Vec<_> = doc.layers[layer].tiles.keys().copied().collect();
     for coord in coords {
@@ -226,14 +248,30 @@ pub fn map_layer_pixels(
                 if strength == 0 {
                     continue;
                 }
-                let out = f(p);
+                let pin = if lab {
+                    let (r, g, b, a) = p.to_f32s();
+                    let (l, la, lb) = crate::color::slots_to_lab(r, g, b);
+                    let (r, g, b) = crate::color::lab_to_rgb(l, la, lb);
+                    Pixel16::from_f32s(r, g, b, a)
+                } else {
+                    p
+                };
+                let out = f(pin);
                 let out = if strength == 255 {
                     out
                 } else {
-                    blend_px(p, out, strength as f32 / 255.0)
+                    blend_px(pin, out, strength as f32 / 255.0)
                 };
-                if out != p {
-                    tile.set(lx as u32, ly as u32, out);
+                let stored = if lab {
+                    let (r, g, b, a) = out.to_f32s();
+                    let (l, la, lb) = crate::color::rgb_to_lab(r, g, b);
+                    let (sr, sg, sb) = crate::color::lab_to_slots(l, la, lb);
+                    Pixel16::from_f32s(sr, sg, sb, a)
+                } else {
+                    out
+                };
+                if stored != p {
+                    tile.set(lx as u32, ly as u32, stored);
                 }
             }
         }
@@ -631,6 +669,28 @@ pub fn photo_filter(
     });
 }
 
+/// Image > Adjustments > Gradient Map (Phase 6): map each
+/// pixel's luminance through a two-color gradient.
+pub fn gradient_map(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    from: (u8, u8, u8),
+    to: (u8, u8, u8),
+    reverse: bool,
+) {
+    let adj = Adjustment::GradientMap { from, to, reverse };
+    if doc.mode == ColorMode::Cmyk {
+        map_layer_inks(doc, layer, sel, |ink| {
+            via_rgb(ink, |r, g, b| adj.apply(r, g, b))
+        });
+        return;
+    }
+    map_layer_pixels(doc, layer, sel, |p| {
+        map_rgb(p, |r, g, b| adj.apply(r, g, b))
+    });
+}
+
 /// Image > Adjust > Posterize: reduce to `levels_count` tonal levels.
 /// Image > Adjust > Equalize: redistribute each channel's values
 /// so its histogram spans the full range evenly (darkest present
@@ -724,6 +784,123 @@ impl Default for ChannelMixer {
 }
 
 /// Image > Adjust > Channel Mixer.
+/// Selective Color (Phase 6.5 Batch 4): shift the CMYK
+/// components of pixels belonging to one color range.
+/// `range`: 0 Reds, 1 Yellows, 2 Greens, 3 Cyans, 4 Blues,
+/// 5 Magentas, 6 Whites, 7 Neutrals, 8 Blacks. `adj` holds
+/// C/M/Y/K shifts in -1..=1 (era -100..+100). Membership is
+/// fuzzy: hue sectors use a triangular falloff, Whites /
+/// Blacks fade in near the ends, Neutrals peak at zero
+/// saturation. Relative shifts scale by the component's
+/// current amount; absolute shifts apply flat.
+pub fn selective_color(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    range: u8,
+    adj: [f32; 4],
+    relative: bool,
+) {
+    map_layer_pixels(doc, layer, sel, |p| {
+        let (r, g, b, a) = p.to_f32s();
+        let (h, s, l) = rgb_to_hsl(r, g, b);
+        let w = selective_weight(range, h, s, l);
+        if w <= 0.0 {
+            return p;
+        }
+        // RGB -> simple CMYK.
+        let k = 1.0 - r.max(g).max(b);
+        let (mut c, mut m, mut y) = if k >= 0.999 {
+            (0.0, 0.0, 0.0)
+        } else {
+            (
+                (1.0 - r - k) / (1.0 - k),
+                (1.0 - g - k) / (1.0 - k),
+                (1.0 - b - k) / (1.0 - k),
+            )
+        };
+        let mut kk = k;
+        let comps = [&mut c, &mut m, &mut y, &mut kk];
+        for (comp, shift) in comps.into_iter().zip(adj.iter()) {
+            if relative {
+                *comp = (*comp + shift * w * *comp).clamp(0.0, 1.0);
+            } else {
+                *comp = (*comp + shift * w).clamp(0.0, 1.0);
+            }
+        }
+        let nr = (1.0 - c) * (1.0 - kk);
+        let ng = (1.0 - m) * (1.0 - kk);
+        let nb = (1.0 - y) * (1.0 - kk);
+        Pixel16::from_f32s(nr, ng, nb, a)
+    });
+}
+
+fn selective_weight(range: u8, h: f32, s: f32, l: f32) -> f32 {
+    // Hue sector membership (this module's hues are in
+    // turns, 0..1): triangular falloff a sixth of a turn
+    // wide around the sector center, gated by saturation so
+    // grays stay out of the chromatic ranges.
+    let sector = |center: f32| -> f32 {
+        let mut d = (h - center).abs();
+        if d > 0.5 {
+            d = 1.0 - d;
+        }
+        (1.0 - d / (1.0 / 6.0)).clamp(0.0, 1.0) * s.clamp(0.0, 1.0)
+    };
+    match range {
+        0 => sector(0.0),
+        1 => sector(1.0 / 6.0),
+        2 => sector(2.0 / 6.0),
+        3 => sector(3.0 / 6.0),
+        4 => sector(4.0 / 6.0),
+        5 => sector(5.0 / 6.0),
+        6 => ((l - 0.7) / 0.3).clamp(0.0, 1.0),
+        7 => (1.0 - s * 3.0).clamp(0.0, 1.0) * (1.0 - (l - 0.5).abs() * 2.0).clamp(0.0, 1.0),
+        _ => ((0.3 - l) / 0.3).clamp(0.0, 1.0),
+    }
+}
+
+/// Replace Color (Phase 6.5 Batch 4): pixels resembling
+/// `target` (RGB 0..=1) within `fuzziness` (0..=200, era
+/// scale) get an HSL shift (hue degrees -180..=180,
+/// saturation / lightness -100..=100), weighted by
+/// resemblance so edges blend.
+#[allow(clippy::too_many_arguments)]
+pub fn replace_color(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    target: (f32, f32, f32),
+    fuzziness: f32,
+    hue: f32,
+    sat: f32,
+    light: f32,
+) {
+    let (th, ts, tl) = rgb_to_hsl(target.0, target.1, target.2);
+    map_layer_pixels(doc, layer, sel, |p| {
+        let (r, g, b, a) = p.to_f32s();
+        let (h, s, l) = rgb_to_hsl(r, g, b);
+        // Distance in HSL (hues in turns): hue is circular
+        // and counts double weight, saturation / lightness
+        // linear.
+        let mut dh = (h - th).abs();
+        if dh > 0.5 {
+            dh = 1.0 - dh;
+        }
+        let dist = ((dh / 0.5).powi(2) * 2.0 + (s - ts).powi(2) + (l - tl).powi(2)).sqrt();
+        let range = (fuzziness / 200.0) * 1.5 + 0.02;
+        let w = (1.0 - dist / range).clamp(0.0, 1.0);
+        if w <= 0.0 {
+            return p;
+        }
+        let nh = (h + (hue / 360.0) * w).rem_euclid(1.0);
+        let ns = (s + (sat / 100.0) * w).clamp(0.0, 1.0);
+        let nl = (l + (light / 100.0) * w).clamp(0.0, 1.0);
+        let (nr, ng, nb) = hsl_to_rgb(nh, ns, nl);
+        Pixel16::from_f32s(nr, ng, nb, a)
+    });
+}
+
 pub fn channel_mixer(
     doc: &mut Document,
     layer: usize,
@@ -811,6 +988,183 @@ pub fn threshold(doc: &mut Document, layer: usize, sel: Option<&Selection>, leve
             }
         })
     });
+}
+
+/// Layer > Matting > Defringe (Phase 6.5): replace the color
+/// of partially transparent edge pixels with the color of
+/// the nearest fully opaque pixel within `width` + 1 px, so
+/// a cut-out object loses the halo of its old background.
+/// Alpha is untouched.
+pub fn defringe(doc: &mut Document, layer: usize, width: u32) {
+    let Some(b) = crate::transform::layer_painted_bounds(&doc.layers[layer]) else {
+        return;
+    };
+    let cmyk = doc.mode == crate::document::ColorMode::Cmyk;
+    let alpha = |doc: &Document, x: i32, y: i32| -> u16 {
+        if cmyk {
+            doc.layers[layer].get_alpha(x, y)
+        } else {
+            doc.layers[layer].get_pixel(x, y).a
+        }
+    };
+    let (x0, y0, x1, y1) = (
+        b.0.max(0),
+        b.1.max(0),
+        b.2.min(doc.width as i32),
+        b.3.min(doc.height as i32),
+    );
+    let r = (width as i32 + 1).max(1);
+    let mut fixes: Vec<(i32, i32, Pixel16)> = Vec::new();
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let a = alpha(doc, x, y);
+            if a == 0 || a == u16::MAX {
+                continue;
+            }
+            // Nearest opaque pixel by expanding ring search.
+            let mut best: Option<(i32, Pixel16)> = None;
+            for rad in 1..=r {
+                for dy in -rad..=rad {
+                    for dx in -rad..=rad {
+                        if dx.abs() != rad && dy.abs() != rad {
+                            continue;
+                        }
+                        let (nx, ny) = (x + dx, y + dy);
+                        if alpha(doc, nx, ny) == u16::MAX {
+                            let d2 = dx * dx + dy * dy;
+                            if best.map(|(bd, _)| d2 < bd).unwrap_or(true) {
+                                best = Some((d2, doc.layers[layer].get_pixel(nx, ny)));
+                            }
+                        }
+                    }
+                }
+                if best.is_some() {
+                    break;
+                }
+            }
+            if let Some((_, c)) = best {
+                fixes.push((x, y, c));
+            }
+        }
+    }
+    for (x, y, c) in fixes {
+        let mut p = doc.layers[layer].get_pixel(x, y);
+        let a = p.a;
+        p = Pixel16::new(c.r, c.g, c.b, a);
+        doc.layers[layer].set_pixel(x, y, p);
+    }
+}
+
+/// Layer > Matting > Remove Black/White Matte (Phase 6.5):
+/// undo a composite over a black (`white == false`) or
+/// white matte: c' = (c - m(1-a)) / a per channel. Alpha is
+/// unchanged; fully transparent pixels are skipped.
+pub fn remove_matte(doc: &mut Document, layer: usize, white: bool) {
+    let m = if white { 1.0f32 } else { 0.0 };
+    map_layer_pixels(doc, layer, None, |p| {
+        let a = p.a as f32 / 65535.0;
+        if a <= 0.0 {
+            return p;
+        }
+        let f = |v: u16| -> u16 {
+            let c = v as f32 / 65535.0;
+            (((c - m * (1.0 - a)) / a).clamp(0.0, 1.0) * 65535.0 + 0.5) as u16
+        };
+        Pixel16::new(f(p.r), f(p.g), f(p.b), p.a)
+    });
+}
+
+/// Edit > Stroke (Phase 6.5): paint `color` along the
+/// selection boundary on the active layer. `position`:
+/// 0 = Inside, 1 = Center, 2 = Outside. Distances come from
+/// iterative erosion of the selection mask, capped at
+/// `width` (1..=64). `opacity` 0.0..=1.0.
+pub fn stroke_selection(
+    doc: &mut Document,
+    layer: usize,
+    sel: &Selection,
+    width: u32,
+    color: Pixel16,
+    position: u8,
+    opacity: f32,
+) {
+    let (w, h) = (doc.width as i32, doc.height as i32);
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let width = width.clamp(1, 64) as i32;
+    let inside =
+        |x: i32, y: i32| -> bool { x >= 0 && y >= 0 && x < w && y < h && sel.value(x, y) >= 128 };
+    // Distance (in px, capped at width) from a selected pixel
+    // to the nearest unselected pixel, and vice versa.
+    let dist = |want_inside: bool| -> Vec<i32> {
+        let mut d = vec![0i32; (w * h) as usize];
+        let mut cur: Vec<bool> = (0..w * h)
+            .map(|i| inside(i % w, i / w) == want_inside)
+            .collect();
+        for step in 1..=width {
+            let mut next = cur.clone();
+            let mut any = false;
+            for y in 0..h {
+                for x in 0..w {
+                    let i = (y * w + x) as usize;
+                    if cur[i] && d[i] == 0 {
+                        let edge = [(1, 0), (-1, 0), (0, 1), (0, -1)].iter().any(|(dx, dy)| {
+                            let (nx, ny) = (x + dx, y + dy);
+                            nx < 0 || ny < 0 || nx >= w || ny >= h || !cur[(ny * w + nx) as usize]
+                        });
+                        if edge {
+                            d[i] = step;
+                            next[i] = false;
+                            any = true;
+                        }
+                    }
+                }
+            }
+            cur = next;
+            if !any {
+                break;
+            }
+        }
+        // Pixels never reached are deeper than the cap.
+        for i in 0..(w * h) as usize {
+            if cur[i] && d[i] == 0 {
+                d[i] = width + 1;
+            }
+        }
+        d
+    };
+    let din = dist(true);
+    let dout = dist(false);
+    let (half_in, half_out) = match position {
+        0 => (width, 0),
+        2 => (0, width),
+        _ => ((width + 1) / 2, width / 2),
+    };
+    let cf = color.to_f32s();
+    for y in 0..h {
+        for x in 0..w {
+            let i = (y * w + x) as usize;
+            let hit = if inside(x, y) {
+                half_in > 0 && din[i] <= half_in
+            } else {
+                half_out > 0 && dout[i] <= half_out
+            };
+            if !hit {
+                continue;
+            }
+            let dst = doc.layers[layer].get_pixel(x, y);
+            let df = dst.to_f32s();
+            let sa = cf.3 * opacity;
+            let out_a = sa + df.3 * (1.0 - sa);
+            if out_a <= 0.0 {
+                continue;
+            }
+            let mix = |sc: f32, dc: f32| (sc * sa + dc * df.3 * (1.0 - sa)) / out_a;
+            let p = Pixel16::from_f32s(mix(cf.0, df.0), mix(cf.1, df.1), mix(cf.2, df.2), out_a);
+            doc.layers[layer].set_pixel(x, y, p);
+        }
+    }
 }
 
 #[cfg(test)]

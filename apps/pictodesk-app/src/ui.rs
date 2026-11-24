@@ -20,6 +20,7 @@ pub const CANVAS_SURROUND: Rgb = (105, 105, 105);
 pub const ACCENT: Rgb = (36, 36, 36);
 
 pub const MENU_H: i32 = 22;
+pub const OPTIONS_H: i32 = 26;
 pub const TOOLBAR_W: i32 = 54;
 pub const STATUS_H: i32 = 18;
 

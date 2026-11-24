@@ -68,6 +68,32 @@ pub struct TextSpec {
     pub align: u8,
     /// Vertical type (columns run top-to-bottom, right-to-left).
     pub vertical: bool,
+    // ---- Phase 6 additions.
+    /// Paragraph text box (0 = point text, no wrapping).
+    pub box_w: u32,
+    pub box_h: u32,
+    /// Paragraph spacing / first-line indent, points.
+    pub space_before: f32,
+    pub space_after: f32,
+    pub first_indent: f32,
+    /// Hyphenate long words at the box edge (simple syllable-
+    /// free break with a hyphen, v1).
+    pub hyphenate: bool,
+    /// Character extras bitmask: 1 Small Caps, 2 Superscript,
+    /// 4 Subscript, 8 Strikethrough (layer-wide in v1).
+    pub extras: u8,
+    /// Warp Text (Phase 6): style index into warp::WARP_STYLES
+    /// plus bend / horizontal / vertical distortion percents.
+    pub warp_style: Option<u8>,
+    pub warp_bend: f32,
+    pub warp_h: f32,
+    pub warp_v: f32,
+}
+
+impl Default for TextSpec {
+    fn default() -> Self {
+        TextSpec::new("")
+    }
 }
 
 impl TextSpec {
@@ -79,6 +105,17 @@ impl TextSpec {
             leading: 0.0,
             align: 0,
             vertical: false,
+            box_w: 0,
+            box_h: 0,
+            space_before: 0.0,
+            space_after: 0.0,
+            first_indent: 0.0,
+            hyphenate: false,
+            extras: 0,
+            warp_style: None,
+            warp_bend: 50.0,
+            warp_h: 0.0,
+            warp_v: 0.0,
         }
     }
 

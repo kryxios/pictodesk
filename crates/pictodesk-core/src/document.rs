@@ -19,6 +19,61 @@ pub enum ColorMode {
     Rgb,
     Cmyk,
     Grayscale,
+    /// Phase 6.5: CIE Lab — tile slots hold (L/100,
+    /// (a+128)/255, (b+128)/255), alpha stays in the pixel.
+    Lab,
+    /// Phase 6.5: palette-indexed color — pixels hold palette
+    /// RGB values; the palette lives in `Document::color_table`.
+    Indexed,
+    /// Phase 6.5: 1-bit black/white.
+    Bitmap,
+    /// Phase 6.5: duotone family — grayscale pixels rendered
+    /// through ink curves (`Document::duotone`).
+    Duotone,
+    /// Phase 6.5: channels as independent ink planes.
+    Multichannel,
+}
+
+/// One duotone ink (Phase 6.5): an RGB ink color and its
+/// transfer curve as a 256-entry LUT over the gray value.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DuotoneInk {
+    pub color: (u8, u8, u8),
+    pub curve: [u8; 256],
+}
+
+impl DuotoneInk {
+    /// A linear-curve ink.
+    pub fn new(color: (u8, u8, u8)) -> Self {
+        let mut curve = [0u8; 256];
+        for (i, v) in curve.iter_mut().enumerate() {
+            *v = i as u8;
+        }
+        DuotoneInk { color, curve }
+    }
+}
+
+/// Duotone family setup (Phase 6.5): 1 ink = Monotone,
+/// 2 = Duotone, 3 = Tritone, 4 = Quadtone.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DuotoneSpec {
+    pub inks: Vec<DuotoneInk>,
+}
+
+impl Default for DuotoneSpec {
+    /// Era default: a single black ink, linear curve.
+    fn default() -> Self {
+        DuotoneSpec {
+            inks: vec![DuotoneInk::new((0, 0, 0))],
+        }
+    }
+}
+
+/// Multichannel plane metadata (Phase 6.5).
+#[derive(Clone, Debug, PartialEq)]
+pub struct MultiChannelInfo {
+    pub name: String,
+    pub color: (u8, u8, u8),
 }
 
 /// An alpha channel: a document-sized grayscale buffer. Holds saved
@@ -28,6 +83,10 @@ pub enum ColorMode {
 pub struct AlphaChannel {
     pub name: String,
     pub spot_color: Option<(u8, u8, u8)>,
+    /// Channel Options (Phase 6.5): true when the channel's
+    /// color overlay indicates MASKED areas (the rubylith
+    /// covers unselected pixels), false for SELECTED areas.
+    pub masked: bool,
     pub data: Vec<u8>, // width * height, row-major
 }
 
@@ -36,6 +95,7 @@ impl AlphaChannel {
         AlphaChannel {
             name: name.into(),
             spot_color: None,
+            masked: true,
             data: vec![0; (width * height) as usize],
         }
     }
@@ -87,6 +147,10 @@ pub fn format_history_time(secs: u64) -> String {
     format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}")
 }
 
+/// Isolated set-group state for the layer loops: (group id,
+/// blend mode, set opacity, group accumulator).
+type SetGroup<T> = (u16, crate::blend::BlendMode, f32, T);
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Document {
     pub width: u32,
@@ -95,8 +159,29 @@ pub struct Document {
     pub active_layer: usize,
     pub working_space: WorkingSpace,
     pub mode: ColorMode,
+    /// Indexed-mode palette (Phase 6.5): up to 256 RGB entries.
+    /// Pixels in an Indexed document hold these exact values.
+    pub color_table: Vec<(u8, u8, u8)>,
+    /// Duotone-mode ink setup (Phase 6.5).
+    pub duotone: Option<DuotoneSpec>,
+    /// Multichannel-mode plane metadata (Phase 6.5): names and
+    /// ink colors, parallel to `multi_planes`.
+    pub multi_channels: Vec<MultiChannelInfo>,
+    /// Multichannel-mode planes (Phase 6.5): one full-document
+    /// grayscale buffer per channel, row-major u16.
+    pub multi_planes: Vec<Vec<u16>>,
+    /// Session-only: the multichannel plane painting targets
+    /// (None = all planes, the composite-view behavior).
+    /// Not persisted.
+    pub multi_active: Option<usize>,
     pub alphas: Vec<AlphaChannel>,
     pub paths: Vec<crate::path::Path>,
+    /// File Info (IPTC-style) fields, Phase 6.5.
+    pub info_title: String,
+    pub info_caption: String,
+    pub info_keywords: String,
+    pub info_copyright: String,
+    pub info_credit: String,
     pub work_path: Option<crate::path::Path>,
     pub clipping_path: Option<usize>,
     /// Provenance event log, stored in the `.pdk` file.
@@ -119,6 +204,66 @@ pub struct Document {
     /// Session-only: hide all layer effects without removing
     /// them (Layer > Effects > Hide All Effects). Not persisted.
     pub effects_suppressed: bool,
+    /// Layer sets (Phase 6), one level deep.
+    pub sets: Vec<LayerSet>,
+    /// Annotations (Phase 6, Notes tool).
+    pub notes: Vec<Note>,
+    /// Web slices (Phase 6).
+    pub slices: Vec<SliceRect>,
+    /// User-defined custom shapes (Phase 6).
+    pub custom_shapes: Vec<CustomShape>,
+    /// Global light altitude in degrees (Phase 6, Layer Style
+    /// Global Light: angle is `global_angle`).
+    pub global_altitude: i32,
+}
+
+/// A layer set (Phase 6): a one-level folder of layers. Sets
+/// default to Pass Through (`mode: None`) — members blend with
+/// everything below the set, exactly the classic default; a
+/// set opacity scales its members, an invisible set hides them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LayerSet {
+    pub name: String,
+    pub opacity: f32,
+    pub mode: Option<crate::blend::BlendMode>,
+    pub visible: bool,
+    pub color: u8,
+}
+
+/// A document annotation (Phase 6, Notes tool): a small marker
+/// at a document point with text. Non-printing.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Note {
+    pub x: i32,
+    pub y: i32,
+    /// Marker color index (palette row, 0..=7).
+    pub color: u8,
+    pub text: String,
+    /// Audio annotation (v0.6.1): a recorded voice note as
+    /// WAV bytes (16-bit mono PCM), played back from the
+    /// Notes tool. None for text-only notes.
+    pub audio: Option<Vec<u8>>,
+}
+
+/// A web slice (Phase 6): a rectangular region exported as its
+/// own image, with link metadata.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SliceRect {
+    pub x: i32,
+    pub y: i32,
+    pub w: u32,
+    pub h: u32,
+    pub name: String,
+    pub url: String,
+    pub alt: String,
+}
+
+/// A user-defined custom shape (Phase 6, Edit > Define Custom
+/// Shape): normalized points (0..=1) of a polygon.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CustomShape {
+    pub name: String,
+    pub points: Vec<(f32, f32)>,
 }
 
 /// A defined pattern: a small RGBA tile that repeats.
@@ -154,8 +299,18 @@ impl Document {
             active_layer: 0,
             working_space: WorkingSpace::Srgb,
             mode: ColorMode::Rgb,
+            color_table: Vec::new(),
+            duotone: None,
+            multi_channels: Vec::new(),
+            multi_planes: Vec::new(),
+            multi_active: None,
             alphas: Vec::new(),
             paths: Vec::new(),
+            info_title: String::new(),
+            info_caption: String::new(),
+            info_keywords: String::new(),
+            info_copyright: String::new(),
+            info_credit: String::new(),
             work_path: None,
             clipping_path: None,
             history_log: Vec::new(),
@@ -166,6 +321,11 @@ impl Document {
             last_selection: None,
             global_angle: 120,
             effects_suppressed: false,
+            sets: Vec::new(),
+            notes: Vec::new(),
+            slices: Vec::new(),
+            custom_shapes: Vec::new(),
+            global_altitude: 30,
         }
     }
 
@@ -269,6 +429,19 @@ impl Document {
                                     Pixel16::from_f32s(ink[0], ink[1], ink[2], ink[3]),
                                 );
                                 merged.set_alpha(x, y, e(a));
+                            }
+                        }
+                    }
+                }
+                ColorMode::Lab => {
+                    for y in 0..self.height as i32 {
+                        for x in 0..self.width as i32 {
+                            let p = pair.render_pixel(x, y);
+                            if p.a > 0 {
+                                let (r, g, b, a) = p.to_f32s();
+                                let (l, la, lb) = crate::color::rgb_to_lab(r, g, b);
+                                let (sr, sg, sb) = crate::color::lab_to_slots(l, la, lb);
+                                merged.set_pixel(x, y, Pixel16::from_f32s(sr, sg, sb, a));
                             }
                         }
                     }
@@ -463,6 +636,28 @@ impl Document {
                     y += bh as i32;
                 }
             }
+            ColorMode::Lab => {
+                // Composite in RGB (render path), then encode
+                // the flat layer back into Lab slots.
+                let mut y = 0i32;
+                while y < self.height as i32 {
+                    let bh = band.min(self.height as i32 - y) as u32;
+                    let px = self.render_region_px(0, y, self.width, bh);
+                    for (n, p) in px.iter().enumerate() {
+                        if p.a > 0 {
+                            let (xx, yy) = (
+                                (n as u32 % self.width) as i32,
+                                y + (n as u32 / self.width) as i32,
+                            );
+                            let (r, g, b, a) = p.to_f32s();
+                            let (l, la, lb) = crate::color::rgb_to_lab(r, g, b);
+                            let (sr, sg, sb) = crate::color::lab_to_slots(l, la, lb);
+                            flat.set_pixel(xx, yy, Pixel16::from_f32s(sr, sg, sb, a));
+                        }
+                    }
+                    y += bh as i32;
+                }
+            }
             _ => {
                 let mut y = 0i32;
                 while y < self.height as i32 {
@@ -498,6 +693,226 @@ impl Document {
         let l = &mut self.layers[layer];
         l.set_pixel(x, y, Pixel16::new(v.0, v.1, v.2, v.3));
         l.set_alpha(x, y, v.4);
+    }
+
+    /// Phase 6 set handling, full form (v0.6.1): returns None
+    /// when the layer's set is invisible (the layer does not
+    /// render), else (opacity_factor, isolated). A Pass Through
+    /// set (no blend mode) multiplies member opacity directly;
+    /// a set WITH a blend mode renders its members into an
+    /// isolated group accumulator (factor 1.0 inside) that is
+    /// flushed onto the backdrop with the set's mode + opacity.
+    fn set_render(&self, layer: &Layer) -> Option<(f32, bool)> {
+        if layer.group == 0 {
+            return Some((1.0, false));
+        }
+        match self.sets.get((layer.group - 1) as usize) {
+            Some(set) => {
+                if !set.visible {
+                    None
+                } else if set.mode.is_some() {
+                    Some((1.0, true))
+                } else {
+                    Some((set.opacity, false))
+                }
+            }
+            None => Some((1.0, false)),
+        }
+    }
+
+    /// The blend mode a clipped layer effectively uses when
+    /// "Blend Clipped Layers as Group" is on: the mode of the
+    /// nearest non-clipped visible layer below (its base).
+    fn clipped_base_mode(&self, li: usize) -> Option<crate::blend::BlendMode> {
+        for bi in (0..li).rev() {
+            let b = &self.layers[bi];
+            if !b.clipped && b.visible {
+                return Some(b.blend_mode);
+            }
+        }
+        None
+    }
+
+    /// The bounds inside which a layer with Transparency
+    /// Shapes off blends at full strength: the shape spec's
+    /// rect for shape layers, the whole document for fill
+    /// layers, else the layer's painted bounds.
+    fn shapes_off_bounds(&self, layer: &Layer) -> (i32, i32, i32, i32) {
+        if let Some(sp) = &layer.shape {
+            return (
+                sp.rect.0 + layer.offset.0,
+                sp.rect.1 + layer.offset.1,
+                sp.rect.2 + layer.offset.0,
+                sp.rect.3 + layer.offset.1,
+            );
+        }
+        if layer.fill.is_some() {
+            return (0, 0, self.width as i32, self.height as i32);
+        }
+        crate::transform::layer_painted_bounds(layer).unwrap_or((
+            0,
+            0,
+            self.width as i32,
+            self.height as i32,
+        ))
+    }
+
+    /// Knockout punch on an accumulator's alpha (v0.6.1):
+    /// Deep drives alpha toward 0; Shallow drives it toward
+    /// `base_a` — the alpha the accumulator had at the base of
+    /// the layer's set (0 for a group accumulator) or just
+    /// above the bottom layer for set-less layers.
+    fn knockout_punch(acc_a: f32, base_a: f32, deep: bool, punch: f32) -> f32 {
+        if deep {
+            acc_a * (1.0 - punch)
+        } else {
+            base_a + (acc_a - base_a) * (1.0 - punch)
+        }
+    }
+
+    /// Phase 6: a layer's content pixel at a document point,
+    /// honoring shape and fill payloads (RGB path; CMYK shape /
+    /// fill layers fall back to their stored pixels).
+    pub fn content_pixel(&self, li: usize, x: i32, y: i32) -> (f32, f32, f32, f32) {
+        let layer = &self.layers[li];
+        if let Some(spec) = &layer.shape {
+            return crate::shapes::shape_pixel(spec, x - layer.offset.0, y - layer.offset.1)
+                .to_f32s();
+        }
+        if let Some(spec) = &layer.fill {
+            return crate::shapes::fill_pixel(spec, x, y, self.width, self.height).to_f32s();
+        }
+        let p = layer.get_pixel(x, y).to_f32s();
+        if self.mode == ColorMode::Lab {
+            // Lab storage: slots decode to Lab, then to RGB for
+            // the (RGB-space) compositor. Shape/fill layers
+            // above keep their RGB-defined colors.
+            let (l, a, b) = crate::color::slots_to_lab(p.0, p.1, p.2);
+            let (r, g, b) = crate::color::lab_to_rgb(l, a, b);
+            return (r, g, b, p.3);
+        }
+        p
+    }
+
+    /// The composited pixel at (x, y) expressed as CIE Lab
+    /// (L 0..=100, a/b -128..=127) plus alpha — the Channels
+    /// panel's Lab view and Lab readouts use this.
+    pub fn render_lab_pixel(&self, x: i32, y: i32) -> (f32, f32, f32, f32) {
+        let p = self.render_pixel(x, y).to_f32s();
+        let (l, a, b) = crate::color::rgb_to_lab(p.0, p.1, p.2);
+        (l, a, b, p.3)
+    }
+
+    /// One pixel of `layer` as Lab slots + alpha, each
+    /// 0..=65535. Meaningful when `mode == ColorMode::Lab`.
+    pub fn get_lab(&self, layer: usize, x: i32, y: i32) -> (u16, u16, u16, u16) {
+        let p = self.layers[layer].get_pixel(x, y);
+        (p.r, p.g, p.b, p.a)
+    }
+
+    pub fn set_lab(&mut self, layer: usize, x: i32, y: i32, v: (u16, u16, u16, u16)) {
+        self.layers[layer].set_pixel(x, y, Pixel16::new(v.0, v.1, v.2, v.3));
+    }
+
+    /// Phase 6 advanced blending: composite one layer pixel
+    /// with Blend If (feathered), clipping-group, knockout,
+    /// and per-channel switches applied around the classic
+    /// composite_over. `ko_base_a` is the alpha at the base of
+    /// the accumulator the layer lands in — the floor a
+    /// Shallow knockout punches toward. `p` must already carry
+    /// mask, fill-opacity, and set scaling. Returns the new
+    /// accumulator.
+    #[allow(clippy::too_many_arguments)]
+    fn adv_composite(
+        &self,
+        mut acc: (f32, f32, f32, f32),
+        li: usize,
+        layer: &Layer,
+        p: (f32, f32, f32, f32),
+        mode: crate::blend::BlendMode,
+        opacity: f32,
+        ko_base_a: f32,
+        x: i32,
+        y: i32,
+    ) -> (f32, f32, f32, f32) {
+        let luma = |c: (f32, f32, f32)| 0.299 * c.0 + 0.587 * c.1 + 0.114 * c.2;
+        let mut p = p;
+        // Blend If with split-slider feathering (v0.6.1): the
+        // stored ranges are the inner thresholds; each split
+        // width feathers the factor outward from its threshold.
+        // Zero splits reproduce the old hard edges exactly.
+        let [tlo, thi, ulo, uhi] = layer.blend_if;
+        let [stlo, sthi, sulo, suhi] = layer.blend_if_split;
+        if tlo > 0
+            || thi < 255
+            || ulo > 0
+            || uhi < 255
+            || stlo > 0
+            || sthi > 0
+            || sulo > 0
+            || suhi > 0
+        {
+            let ramp = |v: f32, lo: u8, lf: u8, hi: u8, hf: u8| -> f32 {
+                let (lo, lf, hi, hf) = (lo as f32, lf as f32, hi as f32, hf as f32);
+                if v < lo - lf || v > hi + hf {
+                    0.0
+                } else if v < lo {
+                    (v - (lo - lf)) / lf.max(1.0)
+                } else if v > hi {
+                    1.0 - (v - hi) / hf.max(1.0)
+                } else {
+                    1.0
+                }
+            };
+            let tl = luma((p.0, p.1, p.2)) * 255.0;
+            let ul = luma((acc.0, acc.1, acc.2)) * 255.0;
+            p.3 *= ramp(tl, tlo, stlo, thi, sthi) * ramp(ul, ulo, sulo, uhi, suhi);
+        }
+        // Clipping group: clip to the nearest non-clipped
+        // visible layer below.
+        if layer.clipped && p.3 > 0.0 {
+            let mut factor = 0.0f32;
+            for bi in (0..li).rev() {
+                let below = &self.layers[bi];
+                if below.clipped || !below.visible {
+                    continue;
+                }
+                let bp = self.content_pixel(bi, x, y);
+                factor = bp.3 * Self::mask_factor(below, x, y);
+                break;
+            }
+            p.3 *= factor;
+        }
+        if p.3 <= 0.0 {
+            return acc;
+        }
+        // Knockout: the layer's coverage punches the target
+        // accumulator's alpha down before the layer itself
+        // lands. Deep punches toward transparency; Shallow
+        // punches toward `ko_base_a`, the alpha at the base of
+        // the accumulator the layer lands in (its set's base,
+        // or just above the bottom layer), supplied by the
+        // layer loops.
+        if layer.knockout != 0 {
+            let punch = (p.3 * opacity).clamp(0.0, 1.0);
+            acc.3 = Self::knockout_punch(acc.3, ko_base_a, layer.knockout == 2, punch);
+        }
+        let before = acc;
+        acc = composite_over(acc, p, mode, opacity);
+        // Per-channel switches: a cleared channel keeps the
+        // backdrop's value.
+        if layer.blend_channels != 0xF {
+            if layer.blend_channels & 1 == 0 {
+                acc.0 = before.0;
+            }
+            if layer.blend_channels & 2 == 0 {
+                acc.1 = before.1;
+            }
+            if layer.blend_channels & 4 == 0 {
+                acc.2 = before.2;
+            }
+        }
+        acc
     }
 
     /// The layer's mask strength at (x, y) as 0.0..=1.0 — 1.0 when
@@ -553,7 +968,7 @@ impl Document {
                             Pixel16::from_f32s(r, g, b, bf(a) * mf)
                         }
                         _ => {
-                            let p = layer.get_pixel(dx, dy).to_f32s();
+                            let p = self.content_pixel(li, dx, dy);
                             Pixel16::from_f32s(p.0, p.1, p.2, p.3 * mf)
                         }
                     };
@@ -579,60 +994,170 @@ impl Document {
     /// effected layers. Only called when `has_effects()`.
     fn composite_with_fx(&self, fx: &[FxBuf], x: i32, y: i32) -> Pixel16 {
         let mut acc = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+        // Isolated set-group state (v0.6.1): (group id, mode,
+        // opacity, group accumulator). A set with a blend mode
+        // renders its members in isolation; the group result is
+        // flushed onto the backdrop with the set's own mode and
+        // opacity when the run of members ends.
+        let mut group: Option<SetGroup<(f32, f32, f32, f32)>> = None;
+        // Main-accumulator snapshot just above the bottom
+        // rendered layer: a set-less Shallow knockout's floor.
+        let mut base: Option<(f32, f32, f32, f32)> = None;
         for (li, layer) in self.layers.iter().enumerate() {
             if !layer.visible {
                 continue;
             }
+            let Some((set_f, isolated)) = self.set_render(layer) else {
+                if let Some((_, gm, go, gacc)) = group.take() {
+                    acc = composite_over(acc, gacc, gm, go);
+                    if base.is_none() {
+                        base = Some(acc);
+                    }
+                }
+                continue;
+            };
+            let want = if isolated { Some(layer.group) } else { None };
+            let in_group = matches!(&group, Some((gid, _, _, _)) if Some(*gid) == want);
+            if !in_group {
+                if let Some((_, gm, go, gacc)) = group.take() {
+                    acc = composite_over(acc, gacc, gm, go);
+                    if base.is_none() {
+                        base = Some(acc);
+                    }
+                }
+                if let Some(gid) = want {
+                    let set = &self.sets[(gid - 1) as usize];
+                    group = Some((gid, set.mode.unwrap(), set.opacity, (0.0, 0.0, 0.0, 0.0)));
+                }
+            }
+            let ko_base_a = if group.is_some() {
+                0.0
+            } else {
+                base.map(|b| b.3).unwrap_or(0.0)
+            };
+            let mut landed = false;
             if let Some(adj) = &layer.adjustment {
-                if acc.3 > 0.0 {
-                    let t = layer.opacity * Self::mask_factor(layer, x, y);
+                let target = match &mut group {
+                    Some((_, _, _, g)) => g,
+                    None => &mut acc,
+                };
+                if target.3 > 0.0 {
+                    let t = layer.opacity * set_f * Self::mask_factor(layer, x, y);
                     if t > 0.0 {
-                        let (r, g, b) = adj.apply(acc.0, acc.1, acc.2);
-                        acc.0 += (r - acc.0) * t;
-                        acc.1 += (g - acc.1) * t;
-                        acc.2 += (b - acc.2) * t;
+                        let (r, g, b) = adj.apply(target.0, target.1, target.2);
+                        target.0 += (r - target.0) * t;
+                        target.1 += (g - target.1) * t;
+                        target.2 += (b - target.2) * t;
+                        landed = true;
                     }
                 }
-                continue;
-            }
-            let buf = fx.iter().find(|b| b.li == li);
-            if let Some(buf) = buf {
-                let idx = ((y - buf.oy) as usize) * buf.w + (x - buf.ox) as usize;
-                let bp = buf.below[idx].to_f32s();
-                if bp.3 > 0.0 {
-                    acc = composite_over(acc, bp, crate::blend::BlendMode::Normal, layer.opacity);
-                }
-                let mut p = buf.within[idx].to_f32s();
-                let mut mode = layer.blend_mode;
-                let mut opacity = layer.opacity;
-                if mode == crate::blend::BlendMode::Dissolve {
-                    let prob = opacity * p.3;
-                    if prob <= 0.0 || crate::blend::dissolve_hash(x, y, li as u32) >= prob {
-                        continue;
+            } else {
+                let buf = fx.iter().find(|b| b.li == li);
+                if let Some(buf) = buf {
+                    let idx = ((y - buf.oy) as usize) * buf.w + (x - buf.ox) as usize;
+                    let mut bp = buf.below[idx].to_f32s();
+                    if layer.mask_hides_effects {
+                        bp.3 *= Self::mask_factor(layer, x, y);
                     }
-                    p.3 = 1.0;
-                    opacity = 1.0;
-                    mode = crate::blend::BlendMode::Normal;
+                    {
+                        let target = match &mut group {
+                            Some((_, _, _, g)) => g,
+                            None => &mut acc,
+                        };
+                        if bp.3 > 0.0 {
+                            *target = composite_over(
+                                *target,
+                                bp,
+                                crate::blend::BlendMode::Normal,
+                                layer.opacity * set_f,
+                            );
+                            landed = true;
+                        }
+                    }
+                    let mut p = buf.within[idx].to_f32s();
+                    if !layer.transparency_shapes && p.3 > 0.0 {
+                        let (bx0, by0, bx1, by1) = self.shapes_off_bounds(layer);
+                        if x >= bx0 && x < bx1 && y >= by0 && y < by1 {
+                            // The within alpha already carries
+                            // the mask; lift the content part to
+                            // full strength (mask still applies).
+                            p.3 = Self::mask_factor(layer, x, y);
+                        }
+                    }
+                    p.3 *= layer.fill_opacity;
+                    let mut mode = layer.blend_mode;
+                    if layer.clipped && layer.blend_clipped_group {
+                        if let Some(bm) = self.clipped_base_mode(li) {
+                            mode = bm;
+                        }
+                    }
+                    let mut opacity = layer.opacity * set_f;
+                    let mut skip = false;
+                    if mode == crate::blend::BlendMode::Dissolve {
+                        let prob = opacity * p.3;
+                        if prob <= 0.0 || crate::blend::dissolve_hash(x, y, li as u32) >= prob {
+                            skip = true;
+                        } else {
+                            p.3 = 1.0;
+                            opacity = 1.0;
+                            mode = crate::blend::BlendMode::Normal;
+                        }
+                    }
+                    if !skip {
+                        let target = match &mut group {
+                            Some((_, _, _, g)) => g,
+                            None => &mut acc,
+                        };
+                        *target = self
+                            .adv_composite(*target, li, layer, p, mode, opacity, ko_base_a, x, y);
+                        landed = true;
+                    }
+                } else {
+                    let mut p = self.content_pixel(li, x, y);
+                    if !layer.transparency_shapes && p.3 > 0.0 {
+                        let (bx0, by0, bx1, by1) = self.shapes_off_bounds(layer);
+                        if x >= bx0 && x < bx1 && y >= by0 && y < by1 {
+                            p.3 = 1.0;
+                        }
+                    }
+                    p.3 *= Self::mask_factor(layer, x, y) * layer.fill_opacity;
+                    let mut mode = layer.blend_mode;
+                    if layer.clipped && layer.blend_clipped_group {
+                        if let Some(bm) = self.clipped_base_mode(li) {
+                            mode = bm;
+                        }
+                    }
+                    let mut opacity = layer.opacity * set_f;
+                    let mut skip = false;
+                    if mode == crate::blend::BlendMode::Dissolve {
+                        let prob = opacity * p.3;
+                        if prob <= 0.0 || crate::blend::dissolve_hash(x, y, li as u32) >= prob {
+                            skip = true;
+                        } else {
+                            p.3 = 1.0;
+                            opacity = 1.0;
+                            mode = crate::blend::BlendMode::Normal;
+                        }
+                    }
+                    if !skip {
+                        let target = match &mut group {
+                            Some((_, _, _, g)) => g,
+                            None => &mut acc,
+                        };
+                        *target = self
+                            .adv_composite(*target, li, layer, p, mode, opacity, ko_base_a, x, y);
+                        landed = true;
+                    }
                 }
-                acc = composite_over(acc, p, mode, opacity);
-                continue;
             }
-            let mut p = layer.get_pixel(x, y).to_f32s();
-            p.3 *= Self::mask_factor(layer, x, y);
-            let mut mode = layer.blend_mode;
-            let mut opacity = layer.opacity;
-            if mode == crate::blend::BlendMode::Dissolve {
-                let prob = opacity * p.3;
-                if prob <= 0.0 || crate::blend::dissolve_hash(x, y, li as u32) >= prob {
-                    continue;
-                }
-                p.3 = 1.0;
-                opacity = 1.0;
-                mode = crate::blend::BlendMode::Normal;
+            if landed && group.is_none() && base.is_none() {
+                base = Some(acc);
             }
-            acc = composite_over(acc, p, mode, opacity);
         }
-        Pixel16::from_f32s(acc.0, acc.1, acc.2, acc.3)
+        if let Some((_, gm, go, gacc)) = group.take() {
+            acc = composite_over(acc, gacc, gm, go);
+        }
+        self.duotone_map(Pixel16::from_f32s(acc.0, acc.1, acc.2, acc.3))
     }
 
     /// Render a region to Pixel16 rows, effects-aware: buffers are
@@ -657,9 +1182,74 @@ impl Document {
         out
     }
 
+    /// Duotone ink mapping (Phase 6.5) applied to a composited
+    /// pixel: the gray value drives each ink's curve, and the
+    /// inks mix subtractively over paper white. Identity for
+    /// non-Duotone documents.
+    pub fn duotone_map(&self, p: Pixel16) -> Pixel16 {
+        if self.mode != ColorMode::Duotone {
+            return p;
+        }
+        let Some(spec) = &self.duotone else {
+            return p;
+        };
+        let (r, g, b, a) = p.to_f32s();
+        let gray = 0.299 * r + 0.587 * g + 0.114 * b;
+        let d = ((1.0 - gray) * 255.0).round().clamp(0.0, 255.0) as usize;
+        let mut out = (1.0f32, 1.0f32, 1.0f32);
+        for ink in &spec.inks {
+            let amt = ink.curve[d] as f32 / 255.0;
+            let ic = (
+                ink.color.0 as f32 / 255.0,
+                ink.color.1 as f32 / 255.0,
+                ink.color.2 as f32 / 255.0,
+            );
+            out.0 *= 1.0 - amt * (1.0 - ic.0);
+            out.1 *= 1.0 - amt * (1.0 - ic.1);
+            out.2 *= 1.0 - amt * (1.0 - ic.2);
+        }
+        Pixel16::from_f32s(out.0, out.1, out.2, a)
+    }
+
+    /// Multichannel composite (Phase 6.5): the planes mix
+    /// subtractively over paper white, like duotone inks with
+    /// fixed colors. Alpha comes from the flattened layer's
+    /// CMYK alpha plane.
+    pub fn composite_multi(&self, x: i32, y: i32) -> Pixel16 {
+        if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
+            return Pixel16::TRANSPARENT;
+        }
+        let i = (y as usize) * self.width as usize + x as usize;
+        let mut out = (1.0f32, 1.0f32, 1.0f32);
+        for (pi, plane) in self.multi_planes.iter().enumerate() {
+            let amt = plane.get(i).copied().unwrap_or(0) as f32 / 65535.0;
+            if amt <= 0.0 {
+                continue;
+            }
+            let c = self
+                .multi_channels
+                .get(pi)
+                .map(|m| m.color)
+                .unwrap_or((0, 0, 0));
+            let ic = (c.0 as f32 / 255.0, c.1 as f32 / 255.0, c.2 as f32 / 255.0);
+            out.0 *= 1.0 - amt * (1.0 - ic.0);
+            out.1 *= 1.0 - amt * (1.0 - ic.1);
+            out.2 *= 1.0 - amt * (1.0 - ic.2);
+        }
+        let a = if self.layers.is_empty() {
+            1.0
+        } else {
+            self.layers[0].get_alpha(x, y) as f32 / 65535.0
+        };
+        Pixel16::from_f32s(out.0, out.1, out.2, a)
+    }
+
     /// Flattened pixel at (x, y): all visible layers composited.
     /// CMYK documents composite in ink space and convert to RGB.
     pub fn render_pixel(&self, x: i32, y: i32) -> Pixel16 {
+        if self.mode == ColorMode::Multichannel && !self.multi_planes.is_empty() {
+            return self.composite_multi(x, y);
+        }
         if self.has_effects() {
             // Single-pixel query on an effected document: render
             // a window around the point (margin-capped) and take
@@ -683,82 +1273,228 @@ impl Document {
             return Pixel16::from_f32s(r, g, b, a);
         }
         let mut acc = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+        // Isolated set-group state (v0.6.1): (group id, mode,
+        // opacity, group accumulator). A set with a blend mode
+        // renders its members in isolation; the group result is
+        // flushed onto the backdrop with the set's own mode and
+        // opacity when the run of members ends.
+        let mut group: Option<SetGroup<(f32, f32, f32, f32)>> = None;
+        // Main-accumulator snapshot just above the bottom
+        // rendered layer: a set-less Shallow knockout's floor.
+        let mut base: Option<(f32, f32, f32, f32)> = None;
         for (li, layer) in self.layers.iter().enumerate() {
             if !layer.visible {
                 continue;
             }
-            if let Some(adj) = &layer.adjustment {
-                // Adjustment layer: transform the composite of
-                // everything below, strength = opacity x mask.
-                if acc.3 > 0.0 {
-                    let t = layer.opacity * Self::mask_factor(layer, x, y);
-                    if t > 0.0 {
-                        let (r, g, b) = adj.apply(acc.0, acc.1, acc.2);
-                        acc.0 += (r - acc.0) * t;
-                        acc.1 += (g - acc.1) * t;
-                        acc.2 += (b - acc.2) * t;
+            let Some((set_f, isolated)) = self.set_render(layer) else {
+                if let Some((_, gm, go, gacc)) = group.take() {
+                    acc = composite_over(acc, gacc, gm, go);
+                    if base.is_none() {
+                        base = Some(acc);
                     }
                 }
                 continue;
-            }
-            let mut p = layer.get_pixel(x, y).to_f32s();
-            p.3 *= Self::mask_factor(layer, x, y);
-            let mut mode = layer.blend_mode;
-            let mut opacity = layer.opacity;
-            if mode == crate::blend::BlendMode::Dissolve {
-                // Dissolve: the pixel lands whole or not at all,
-                // with probability = its final alpha, decided by a
-                // stable per-pixel hash (no frame-to-frame shimmer).
-                let prob = opacity * p.3;
-                if prob <= 0.0 || crate::blend::dissolve_hash(x, y, li as u32) >= prob {
-                    continue;
+            };
+            let want = if isolated { Some(layer.group) } else { None };
+            let in_group = matches!(&group, Some((gid, _, _, _)) if Some(*gid) == want);
+            if !in_group {
+                if let Some((_, gm, go, gacc)) = group.take() {
+                    acc = composite_over(acc, gacc, gm, go);
+                    if base.is_none() {
+                        base = Some(acc);
+                    }
                 }
-                p.3 = 1.0;
-                opacity = 1.0;
-                mode = crate::blend::BlendMode::Normal;
+                if let Some(gid) = want {
+                    let set = &self.sets[(gid - 1) as usize];
+                    group = Some((gid, set.mode.unwrap(), set.opacity, (0.0, 0.0, 0.0, 0.0)));
+                }
             }
-            acc = composite_over(acc, p, mode, opacity);
+            let ko_base_a = if group.is_some() {
+                0.0
+            } else {
+                base.map(|b| b.3).unwrap_or(0.0)
+            };
+            let mut landed = false;
+            if let Some(adj) = &layer.adjustment {
+                // Adjustment layer: transform the composite of
+                // everything below it in its accumulator,
+                // strength = opacity x mask.
+                let target = match &mut group {
+                    Some((_, _, _, g)) => g,
+                    None => &mut acc,
+                };
+                if target.3 > 0.0 {
+                    let t = layer.opacity * set_f * Self::mask_factor(layer, x, y);
+                    if t > 0.0 {
+                        let (r, g, b) = adj.apply(target.0, target.1, target.2);
+                        target.0 += (r - target.0) * t;
+                        target.1 += (g - target.1) * t;
+                        target.2 += (b - target.2) * t;
+                        landed = true;
+                    }
+                }
+            } else {
+                let mut p = self.content_pixel(li, x, y);
+                if !layer.transparency_shapes && p.3 > 0.0 {
+                    let (bx0, by0, bx1, by1) = self.shapes_off_bounds(layer);
+                    if x >= bx0 && x < bx1 && y >= by0 && y < by1 {
+                        p.3 = 1.0;
+                    }
+                }
+                p.3 *= Self::mask_factor(layer, x, y) * layer.fill_opacity;
+                let mut mode = layer.blend_mode;
+                if layer.clipped && layer.blend_clipped_group {
+                    if let Some(bm) = self.clipped_base_mode(li) {
+                        mode = bm;
+                    }
+                }
+                let mut opacity = layer.opacity * set_f;
+                let mut skip = false;
+                if mode == crate::blend::BlendMode::Dissolve {
+                    // Dissolve: the pixel lands whole or not at
+                    // all, with probability = its final alpha,
+                    // decided by a stable per-pixel hash (no
+                    // frame-to-frame shimmer).
+                    let prob = opacity * p.3;
+                    if prob <= 0.0 || crate::blend::dissolve_hash(x, y, li as u32) >= prob {
+                        skip = true;
+                    } else {
+                        p.3 = 1.0;
+                        opacity = 1.0;
+                        mode = crate::blend::BlendMode::Normal;
+                    }
+                }
+                if !skip {
+                    let target = match &mut group {
+                        Some((_, _, _, g)) => g,
+                        None => &mut acc,
+                    };
+                    *target =
+                        self.adv_composite(*target, li, layer, p, mode, opacity, ko_base_a, x, y);
+                    landed = true;
+                }
+            }
+            if landed && group.is_none() && base.is_none() {
+                base = Some(acc);
+            }
         }
-        Pixel16::from_f32s(acc.0, acc.1, acc.2, acc.3)
+        if let Some((_, gm, go, gacc)) = group.take() {
+            acc = composite_over(acc, gacc, gm, go);
+        }
+        self.duotone_map(Pixel16::from_f32s(acc.0, acc.1, acc.2, acc.3))
     }
 
     /// Composite all visible layers at (x, y) in ink space; returns
     /// (c, m, y, k) in 0.0..=1.0 and the composited alpha.
     pub fn composite_inks(&self, x: i32, y: i32) -> ([f32; 4], f32) {
         let mut acc = ([0.0f32; 4], 0.0f32);
+        // Isolated set-group state (v0.6.1): (group id, mode,
+        // opacity, group accumulator). A set with a blend mode
+        // renders its members in isolation; the group result is
+        // flushed onto the backdrop with the set's own mode and
+        // opacity when the run of members ends.
+        let mut group: Option<SetGroup<([f32; 4], f32)>> = None;
+        // Main-accumulator snapshot just above the bottom
+        // rendered layer: a set-less Shallow knockout's floor.
+        let mut base: Option<([f32; 4], f32)> = None;
         for (li, layer) in self.layers.iter().enumerate() {
             if !layer.visible {
                 continue;
             }
-            if let Some(adj) = &layer.adjustment {
-                if acc.1 > 0.0 {
-                    let t = layer.opacity * Self::mask_factor(layer, x, y);
-                    if t > 0.0 {
-                        let (r, g, b) = cmyk_to_rgb(acc.0[0], acc.0[1], acc.0[2], acc.0[3]);
-                        let (r, g, b) = adj.apply(r, g, b);
-                        let (ic, im, iy, ik) = crate::color::rgb_to_cmyk(r, g, b);
-                        let ink = [ic, im, iy, ik];
-                        for (acc_v, ink_v) in acc.0.iter_mut().zip(ink.iter()) {
-                            *acc_v += (ink_v - *acc_v) * t;
-                        }
+            let Some((set_f, isolated)) = self.set_render(layer) else {
+                if let Some((_, gm, go, gacc)) = group.take() {
+                    acc = composite_over_inks(acc, gacc, gm, go);
+                    if base.is_none() {
+                        base = Some(acc);
                     }
                 }
                 continue;
-            }
-            let p = layer.get_pixel(x, y).to_f32s();
-            let mut a = layer.get_alpha(x, y) as f32 / 65535.0 * Self::mask_factor(layer, x, y);
-            let mut mode = layer.blend_mode;
-            let mut opacity = layer.opacity;
-            if mode == crate::blend::BlendMode::Dissolve {
-                let prob = opacity * a;
-                if prob <= 0.0 || crate::blend::dissolve_hash(x, y, li as u32) >= prob {
-                    continue;
+            };
+            let want = if isolated { Some(layer.group) } else { None };
+            let in_group = matches!(&group, Some((gid, _, _, _)) if Some(*gid) == want);
+            if !in_group {
+                if let Some((_, gm, go, gacc)) = group.take() {
+                    acc = composite_over_inks(acc, gacc, gm, go);
+                    if base.is_none() {
+                        base = Some(acc);
+                    }
                 }
-                a = 1.0;
-                opacity = 1.0;
-                mode = crate::blend::BlendMode::Normal;
+                if let Some(gid) = want {
+                    let set = &self.sets[(gid - 1) as usize];
+                    group = Some((
+                        gid,
+                        set.mode.unwrap(),
+                        set.opacity,
+                        ([0.0, 0.0, 0.0, 0.0], 0.0),
+                    ));
+                }
             }
-            acc = composite_over_inks(acc, ([p.0, p.1, p.2, p.3], a), mode, opacity);
+            let mut landed = false;
+            if let Some(adj) = &layer.adjustment {
+                let target = match &mut group {
+                    Some((_, _, _, g)) => g,
+                    None => &mut acc,
+                };
+                if target.1 > 0.0 {
+                    let t = layer.opacity * set_f * Self::mask_factor(layer, x, y);
+                    if t > 0.0 {
+                        let (r, g, b) =
+                            cmyk_to_rgb(target.0[0], target.0[1], target.0[2], target.0[3]);
+                        let (r, g, b) = adj.apply(r, g, b);
+                        let (ic, im, iy, ik) = crate::color::rgb_to_cmyk(r, g, b);
+                        let ink = [ic, im, iy, ik];
+                        for (acc_v, ink_v) in target.0.iter_mut().zip(ink.iter()) {
+                            *acc_v += (ink_v - *acc_v) * t;
+                        }
+                        landed = true;
+                    }
+                }
+            } else {
+                // Shape / fill layers render from their specs
+                // (v0.6.1: converted to ink space; before, CMYK
+                // fell back to their stored pixels).
+                let (ink, raw_a) = if layer.shape.is_some() || layer.fill.is_some() {
+                    let c = self.content_pixel(li, x, y);
+                    let (ic, im, iy, ik) = crate::color::rgb_to_cmyk(c.0, c.1, c.2);
+                    ([ic, im, iy, ik], c.3)
+                } else {
+                    let p = layer.get_pixel(x, y).to_f32s();
+                    ([p.0, p.1, p.2, p.3], layer.get_alpha(x, y) as f32 / 65535.0)
+                };
+                let mut a = raw_a * Self::mask_factor(layer, x, y);
+                let mut mode = layer.blend_mode;
+                if layer.clipped && layer.blend_clipped_group {
+                    if let Some(bm) = self.clipped_base_mode(li) {
+                        mode = bm;
+                    }
+                }
+                let mut opacity = layer.opacity * set_f;
+                let mut skip = false;
+                if mode == crate::blend::BlendMode::Dissolve {
+                    let prob = opacity * a;
+                    if prob <= 0.0 || crate::blend::dissolve_hash(x, y, li as u32) >= prob {
+                        skip = true;
+                    } else {
+                        a = 1.0;
+                        opacity = 1.0;
+                        mode = crate::blend::BlendMode::Normal;
+                    }
+                }
+                if !skip {
+                    let target = match &mut group {
+                        Some((_, _, _, g)) => g,
+                        None => &mut acc,
+                    };
+                    *target = composite_over_inks(*target, (ink, a), mode, opacity);
+                    landed = true;
+                }
+            }
+            if landed && group.is_none() && base.is_none() {
+                base = Some(acc);
+            }
+        }
+        if let Some((_, gm, go, gacc)) = group.take() {
+            acc = composite_over_inks(acc, gacc, gm, go);
         }
         acc
     }

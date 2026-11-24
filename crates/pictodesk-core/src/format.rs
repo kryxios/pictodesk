@@ -3,7 +3,8 @@
 //! v3 layout: the v2 envelope (magic "PDSK" | u32 version (=3) |
 //! u32 uncompressed_len | DEFLATE stream) around a payload that is
 //! the v1 payload plus an extension block:
-//!   "PX2E" | u8 color mode (0=RGB, 1=CMYK, 2=Grayscale)
+//!   "PX2E" | u8 color mode (0=RGB, 1=CMYK, 2=Grayscale,
+//!   3=Lab, 4=Indexed, 5=Bitmap, 6=Duotone, 7=Multichannel)
 //!   u32 alpha_count; per alpha: u16 name_len + name | u8 spot flag
 //!     (+ 3 bytes RGB when spot) | u32 data_len + data bytes
 //!   i32 clipping_path index (-1 = none)
@@ -209,6 +210,11 @@ fn serialize_ext(w: &mut Writer, doc: &Document) {
         crate::document::ColorMode::Rgb => 0,
         crate::document::ColorMode::Cmyk => 1,
         crate::document::ColorMode::Grayscale => 2,
+        crate::document::ColorMode::Lab => 3,
+        crate::document::ColorMode::Indexed => 4,
+        crate::document::ColorMode::Bitmap => 5,
+        crate::document::ColorMode::Duotone => 6,
+        crate::document::ColorMode::Multichannel => 7,
     });
     w.u32(doc.alphas.len() as u32);
     for ch in &doc.alphas {
@@ -350,6 +356,16 @@ fn serialize_ext(w: &mut Writer, doc: &Document) {
                 w.u8(color.2);
                 w.u8(*density);
             }
+            Some(Adjustment::GradientMap { from, to, reverse }) => {
+                w.u8(7);
+                w.u8(from.0);
+                w.u8(from.1);
+                w.u8(from.2);
+                w.u8(to.0);
+                w.u8(to.1);
+                w.u8(to.2);
+                w.u8(*reverse as u8);
+            }
         }
     }
     w.u32(doc.guides_x.len() as u32);
@@ -469,6 +485,256 @@ fn serialize_ext(w: &mut Writer, doc: &Document) {
             }
         }
     }
+    // Phase 6 section (v0.6.0 addition, optional trailing):
+    // new effects + contours, advanced blending, layer org,
+    // shape/fill payloads, text warp/paragraph, then document
+    // sets, notes, slices, custom shapes, global altitude.
+    fn write_str(w: &mut Writer, t: &str) {
+        let b = t.as_bytes();
+        w.u16(b.len() as u16);
+        w.bytes(b);
+    }
+    for layer in &doc.layers {
+        match &layer.effects {
+            None => w.u8(0),
+            Some(fx) => {
+                w.u8(1);
+                let sp = &fx.satin;
+                w.u8(sp.enabled as u8);
+                w.u8(sp.mode.to_id());
+                write_px(w, &sp.color);
+                w.f32(sp.opacity);
+                w.i32(sp.angle);
+                w.u32(sp.distance);
+                w.u32(sp.blur);
+                w.u8(sp.invert as u8);
+                w.u8(sp.contour);
+                let co = &fx.color_overlay;
+                w.u8(co.enabled as u8);
+                w.u8(co.mode.to_id());
+                write_px(w, &co.color);
+                w.f32(co.opacity);
+                let go = &fx.gradient_overlay;
+                w.u8(go.enabled as u8);
+                w.u8(go.mode.to_id());
+                w.f32(go.opacity);
+                write_px(w, &go.from);
+                write_px(w, &go.to);
+                w.u8(go.style);
+                w.i32(go.angle);
+                w.u32(go.scale);
+                let po = &fx.pattern_overlay;
+                w.u8(po.enabled as u8);
+                w.u8(po.mode.to_id());
+                w.f32(po.opacity);
+                w.u8(po.kind);
+                w.u32(po.scale);
+                let st = &fx.stroke;
+                w.u8(st.enabled as u8);
+                w.u8(st.mode.to_id());
+                write_px(w, &st.color);
+                w.f32(st.opacity);
+                w.u32(st.size);
+                w.u8(st.position);
+                w.u8(fx.drop_shadow.contour);
+                w.u8(fx.inner_shadow.contour);
+                w.u8(fx.outer_glow.contour);
+                w.u8(fx.inner_glow.contour);
+                w.u8(fx.bevel.contour);
+                w.u8(fx.bevel.texture as u8);
+                w.u8(fx.bevel.texture_kind);
+                w.u32(fx.bevel.texture_depth);
+            }
+        }
+        w.f32(layer.fill_opacity);
+        for v in layer.blend_if {
+            w.u8(v);
+        }
+        w.u8(layer.knockout);
+        w.u8(layer.blend_channels);
+        w.u8(layer.blend_clipped_group as u8);
+        w.u8(layer.blend_interior_group as u8);
+        w.u8(layer.transparency_shapes as u8);
+        w.u8(layer.mask_hides_effects as u8);
+        w.u16(layer.group);
+        w.u8(layer.clipped as u8);
+        w.u8(layer.locks);
+        w.u8(layer.color);
+        match &layer.shape {
+            None => w.u8(0),
+            Some(sp) => {
+                w.u8(1);
+                w.u8(sp.kind);
+                w.i32(sp.rect.0);
+                w.i32(sp.rect.1);
+                w.i32(sp.rect.2);
+                w.i32(sp.rect.3);
+                w.u8(sp.sides);
+                w.u8(sp.star as u8);
+                w.u32(sp.radius);
+                write_px(w, &sp.fill);
+                w.u8(sp.fill_on as u8);
+                write_px(w, &sp.stroke);
+                w.u32(sp.stroke_width);
+                w.u32(sp.points.len() as u32);
+                for pt in &sp.points {
+                    w.f32(pt.0);
+                    w.f32(pt.1);
+                }
+            }
+        }
+        match &layer.fill {
+            None => w.u8(0),
+            Some(fl) => {
+                w.u8(1);
+                w.u8(fl.kind);
+                write_px(w, &fl.color);
+                write_px(w, &fl.to);
+                w.i32(fl.angle);
+                w.u8(fl.style);
+                w.u32(fl.scale);
+                w.u8(fl.pattern_kind);
+            }
+        }
+        match &layer.text {
+            None => w.u8(0),
+            Some(t) => {
+                w.u8(1);
+                w.u32(t.box_w);
+                w.u32(t.box_h);
+                w.f32(t.space_before);
+                w.f32(t.space_after);
+                w.f32(t.first_indent);
+                w.u8(t.hyphenate as u8);
+                w.u8(t.extras);
+                w.u8(t.warp_style.unwrap_or(255));
+                w.f32(t.warp_bend);
+                w.f32(t.warp_h);
+                w.f32(t.warp_v);
+            }
+        }
+    }
+    w.i32(doc.global_altitude);
+    w.u32(doc.sets.len() as u32);
+    for set in &doc.sets {
+        write_str(w, &set.name);
+        w.f32(set.opacity);
+        w.u8(set.mode.map(|m| m.to_id()).unwrap_or(255));
+        w.u8(set.visible as u8);
+        w.u8(set.color);
+    }
+    w.u32(doc.notes.len() as u32);
+    for n in &doc.notes {
+        w.i32(n.x);
+        w.i32(n.y);
+        w.u8(n.color);
+        write_str(w, &n.text);
+    }
+    w.u32(doc.slices.len() as u32);
+    for sl in &doc.slices {
+        w.i32(sl.x);
+        w.i32(sl.y);
+        w.u32(sl.w);
+        w.u32(sl.h);
+        write_str(w, &sl.name);
+        write_str(w, &sl.url);
+        write_str(w, &sl.alt);
+    }
+    w.u32(doc.custom_shapes.len() as u32);
+    for cs in &doc.custom_shapes {
+        write_str(w, &cs.name);
+        w.u32(cs.points.len() as u32);
+        for pt in &cs.points {
+            w.f32(pt.0);
+            w.f32(pt.1);
+        }
+    }
+    // v0.6.1 section (optional trailing): Blend If split
+    // feather widths, one [u8; 4] per layer in layer order.
+    for layer in &doc.layers {
+        for v in layer.blend_if_split {
+            w.u8(v);
+        }
+    }
+    // v0.6.1 section (optional trailing): note audio — per
+    // note a presence byte, then length + WAV bytes.
+    for n in &doc.notes {
+        match &n.audio {
+            None => w.u8(0),
+            Some(wav) => {
+                w.u8(1);
+                w.u32(wav.len() as u32);
+                w.bytes(wav);
+            }
+        }
+    }
+    // Phase 6.5 section (optional trailing): color table,
+    // duotone spec, multichannel planes.
+    w.u16(doc.color_table.len() as u16);
+    for c in &doc.color_table {
+        w.u8(c.0);
+        w.u8(c.1);
+        w.u8(c.2);
+    }
+    match &doc.duotone {
+        None => w.u8(0),
+        Some(spec) => {
+            w.u8(1);
+            w.u8(spec.inks.len() as u8);
+            for ink in &spec.inks {
+                w.u8(ink.color.0);
+                w.u8(ink.color.1);
+                w.u8(ink.color.2);
+                w.bytes(&ink.curve);
+            }
+        }
+    }
+    // Phase 6.5 Batch 3 section (optional trailing): alpha
+    // channels' "color indicates masked areas" flags.
+    for ch in &doc.alphas {
+        w.u8(ch.masked as u8);
+    }
+    w.u8(doc.multi_planes.len() as u8);
+    for (i, plane) in doc.multi_planes.iter().enumerate() {
+        let info = doc.multi_channels.get(i);
+        write_str(w, info.map(|m| m.name.as_str()).unwrap_or(""));
+        let c = info.map(|m| m.color).unwrap_or((0, 0, 0));
+        w.u8(c.0);
+        w.u8(c.1);
+        w.u8(c.2);
+        w.u32(plane.len() as u32);
+        for v in plane {
+            w.u16(*v);
+        }
+    }
+    // Phase 6.5 Batch 6 section (optional trailing): line
+    // arrowhead flags per shape layer (layer index + flags).
+    let arrowed: Vec<(usize, u8)> = doc
+        .layers
+        .iter()
+        .enumerate()
+        .filter_map(|(i, l)| {
+            l.shape.as_ref().and_then(|sp| {
+                if sp.arrow_start || sp.arrow_end {
+                    Some((i, (sp.arrow_start as u8) | ((sp.arrow_end as u8) << 1)))
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+    w.u16(arrowed.len() as u16);
+    for (i, flags) in arrowed {
+        w.u16(i as u16);
+        w.u8(flags);
+    }
+    // Phase 6.5 Batch 6 section (optional trailing): File
+    // Info fields.
+    write_str(w, &doc.info_title);
+    write_str(w, &doc.info_caption);
+    write_str(w, &doc.info_keywords);
+    write_str(w, &doc.info_copyright);
+    write_str(w, &doc.info_credit);
 }
 
 /// The current (v3) serialization: header + DEFLATE-compressed
@@ -582,6 +848,11 @@ fn parse_ext(payload: &[u8], doc: &mut Document) -> Result<(), FormatError> {
         0 => crate::document::ColorMode::Rgb,
         1 => crate::document::ColorMode::Cmyk,
         2 => crate::document::ColorMode::Grayscale,
+        3 => crate::document::ColorMode::Lab,
+        4 => crate::document::ColorMode::Indexed,
+        5 => crate::document::ColorMode::Bitmap,
+        6 => crate::document::ColorMode::Duotone,
+        7 => crate::document::ColorMode::Multichannel,
         _ => return Err(FormatError::Corrupt("unknown color mode")),
     };
     let alpha_count = r.u32()?;
@@ -599,6 +870,7 @@ fn parse_ext(payload: &[u8], doc: &mut Document) -> Result<(), FormatError> {
         doc.alphas.push(crate::document::AlphaChannel {
             name,
             spot_color: spot,
+            masked: true,
             data,
         });
     }
@@ -702,6 +974,11 @@ fn parse_ext(payload: &[u8], doc: &mut Document) -> Result<(), FormatError> {
                     color: (r.u8()?, r.u8()?, r.u8()?),
                     density: r.u8()?,
                 }),
+                7 => Some(Adjustment::GradientMap {
+                    from: (r.u8()?, r.u8()?, r.u8()?),
+                    to: (r.u8()?, r.u8()?, r.u8()?),
+                    reverse: r.u8()? != 0,
+                }),
                 _ => return Err(FormatError::Corrupt("unknown adjustment kind")),
             };
         }
@@ -734,6 +1011,7 @@ fn parse_ext(payload: &[u8], doc: &mut Document) -> Result<(), FormatError> {
                 distance: r.u32()?,
                 blur: r.u32()?,
                 intensity: r.u32()?,
+                contour: 0,
             })
         }
         fn read_glow(r: &mut Reader) -> Result<crate::effects::GlowSpec, FormatError> {
@@ -745,6 +1023,7 @@ fn parse_ext(payload: &[u8], doc: &mut Document) -> Result<(), FormatError> {
                 blur: r.u32()?,
                 intensity: r.u32()?,
                 source_center: r.u8()? != 0,
+                contour: 0,
             })
         }
         fn read_str(r: &mut Reader) -> Result<String, FormatError> {
@@ -784,6 +1063,10 @@ fn parse_ext(payload: &[u8], doc: &mut Document) -> Result<(), FormatError> {
                     sh_opacity: r.f32()?,
                     angle: r.i32()?,
                     use_global_angle: r.u8()? != 0,
+                    contour: 0,
+                    texture: false,
+                    texture_kind: 0,
+                    texture_depth: 100,
                 };
                 layer.effects = Some(crate::effects::Effects {
                     drop_shadow,
@@ -791,6 +1074,7 @@ fn parse_ext(payload: &[u8], doc: &mut Document) -> Result<(), FormatError> {
                     outer_glow,
                     inner_glow,
                     bevel,
+                    ..Default::default()
                 });
             }
             if r.u8()? != 0 {
@@ -815,6 +1099,7 @@ fn parse_ext(payload: &[u8], doc: &mut Document) -> Result<(), FormatError> {
                     leading,
                     align,
                     vertical,
+                    ..Default::default()
                 });
             }
         }
@@ -839,6 +1124,304 @@ fn parse_ext(payload: &[u8], doc: &mut Document) -> Result<(), FormatError> {
                 height,
                 px,
             });
+        }
+    }
+    // Optional trailing section: Phase 6 additions (v0.6.0).
+    if r.pos < payload.len() {
+        fn read_px6(r: &mut Reader) -> Result<Pixel16, FormatError> {
+            Ok(Pixel16::new(r.u16()?, r.u16()?, r.u16()?, r.u16()?))
+        }
+        fn read_mode6(r: &mut Reader) -> Result<BlendMode, FormatError> {
+            BlendMode::from_id(r.u8()?).ok_or(FormatError::Corrupt("bad blend mode id"))
+        }
+        fn read_str6(r: &mut Reader) -> Result<String, FormatError> {
+            let n = r.u16()? as usize;
+            Ok(String::from_utf8_lossy(r.take(n)?).into_owned())
+        }
+        for layer in &mut doc.layers {
+            if r.u8()? != 0 {
+                let mut fx = layer.effects.unwrap_or_default();
+                fx.satin = crate::effects::SatinSpec {
+                    enabled: r.u8()? != 0,
+                    mode: read_mode6(&mut r)?,
+                    color: read_px6(&mut r)?,
+                    opacity: r.f32()?,
+                    angle: r.i32()?,
+                    distance: r.u32()?,
+                    blur: r.u32()?,
+                    invert: r.u8()? != 0,
+                    contour: r.u8()?,
+                };
+                fx.color_overlay = crate::effects::ColorOverlaySpec {
+                    enabled: r.u8()? != 0,
+                    mode: read_mode6(&mut r)?,
+                    color: read_px6(&mut r)?,
+                    opacity: r.f32()?,
+                };
+                fx.gradient_overlay = crate::effects::GradientOverlaySpec {
+                    enabled: r.u8()? != 0,
+                    mode: read_mode6(&mut r)?,
+                    opacity: r.f32()?,
+                    from: read_px6(&mut r)?,
+                    to: read_px6(&mut r)?,
+                    style: r.u8()?,
+                    angle: r.i32()?,
+                    scale: r.u32()?,
+                };
+                fx.pattern_overlay = crate::effects::PatternOverlaySpec {
+                    enabled: r.u8()? != 0,
+                    mode: read_mode6(&mut r)?,
+                    opacity: r.f32()?,
+                    kind: r.u8()?,
+                    scale: r.u32()?,
+                };
+                fx.stroke = crate::effects::StrokeSpec {
+                    enabled: r.u8()? != 0,
+                    mode: read_mode6(&mut r)?,
+                    color: read_px6(&mut r)?,
+                    opacity: r.f32()?,
+                    size: r.u32()?,
+                    position: r.u8()?,
+                };
+                fx.drop_shadow.contour = r.u8()?;
+                fx.inner_shadow.contour = r.u8()?;
+                fx.outer_glow.contour = r.u8()?;
+                fx.inner_glow.contour = r.u8()?;
+                fx.bevel.contour = r.u8()?;
+                fx.bevel.texture = r.u8()? != 0;
+                fx.bevel.texture_kind = r.u8()?;
+                fx.bevel.texture_depth = r.u32()?;
+                layer.effects = Some(fx);
+            }
+            layer.fill_opacity = r.f32()?;
+            for v in &mut layer.blend_if {
+                *v = r.u8()?;
+            }
+            layer.knockout = r.u8()?;
+            layer.blend_channels = r.u8()?;
+            layer.blend_clipped_group = r.u8()? != 0;
+            layer.blend_interior_group = r.u8()? != 0;
+            layer.transparency_shapes = r.u8()? != 0;
+            layer.mask_hides_effects = r.u8()? != 0;
+            layer.group = r.u16()?;
+            layer.clipped = r.u8()? != 0;
+            layer.locks = r.u8()?;
+            layer.color = r.u8()?;
+            if r.u8()? != 0 {
+                let kind = r.u8()?;
+                let rect = (r.i32()?, r.i32()?, r.i32()?, r.i32()?);
+                let sides = r.u8()?;
+                let star = r.u8()? != 0;
+                let radius = r.u32()?;
+                let fill = read_px6(&mut r)?;
+                let fill_on = r.u8()? != 0;
+                let stroke = read_px6(&mut r)?;
+                let stroke_width = r.u32()?;
+                let np = r.u32()?;
+                let mut points = Vec::new();
+                for _ in 0..np {
+                    points.push((r.f32()?, r.f32()?));
+                }
+                layer.shape = Some(crate::shapes::ShapeSpec {
+                    kind,
+                    rect,
+                    sides,
+                    star,
+                    radius,
+                    fill,
+                    fill_on,
+                    stroke,
+                    stroke_width,
+                    points,
+                    arrow_start: false,
+                    arrow_end: false,
+                });
+            }
+            if r.u8()? != 0 {
+                layer.fill = Some(crate::shapes::FillSpec {
+                    kind: r.u8()?,
+                    color: read_px6(&mut r)?,
+                    to: read_px6(&mut r)?,
+                    angle: r.i32()?,
+                    style: r.u8()?,
+                    scale: r.u32()?,
+                    pattern_kind: r.u8()?,
+                });
+            }
+            if r.u8()? != 0 {
+                if let Some(t) = &mut layer.text {
+                    t.box_w = r.u32()?;
+                    t.box_h = r.u32()?;
+                    t.space_before = r.f32()?;
+                    t.space_after = r.f32()?;
+                    t.first_indent = r.f32()?;
+                    t.hyphenate = r.u8()? != 0;
+                    t.extras = r.u8()?;
+                    let ws = r.u8()?;
+                    t.warp_style = if ws == 255 { None } else { Some(ws) };
+                    t.warp_bend = r.f32()?;
+                    t.warp_h = r.f32()?;
+                    t.warp_v = r.f32()?;
+                } else {
+                    // Text payload without a text layer: skip.
+                    let _ = r.u32()?;
+                    let _ = r.u32()?;
+                    let _ = r.f32()?;
+                    let _ = r.f32()?;
+                    let _ = r.f32()?;
+                    let _ = r.u8()?;
+                    let _ = r.u8()?;
+                    let _ = r.u8()?;
+                    let _ = r.f32()?;
+                    let _ = r.f32()?;
+                    let _ = r.f32()?;
+                }
+            }
+        }
+        doc.global_altitude = r.i32()?;
+        let nsets = r.u32()?;
+        for _ in 0..nsets {
+            let name = read_str6(&mut r)?;
+            let opacity = r.f32()?;
+            let mid = r.u8()?;
+            let mode = if mid == 255 {
+                None
+            } else {
+                Some(BlendMode::from_id(mid).ok_or(FormatError::Corrupt("bad set mode"))?)
+            };
+            let visible = r.u8()? != 0;
+            let color = r.u8()?;
+            doc.sets.push(crate::document::LayerSet {
+                name,
+                opacity,
+                mode,
+                visible,
+                color,
+            });
+        }
+        let nnotes = r.u32()?;
+        for _ in 0..nnotes {
+            let x = r.i32()?;
+            let y = r.i32()?;
+            let color = r.u8()?;
+            let text = read_str6(&mut r)?;
+            doc.notes.push(crate::document::Note {
+                x,
+                y,
+                color,
+                text,
+                audio: None,
+            });
+        }
+        let nslices = r.u32()?;
+        for _ in 0..nslices {
+            let x = r.i32()?;
+            let y = r.i32()?;
+            let w = r.u32()?;
+            let h = r.u32()?;
+            let name = read_str6(&mut r)?;
+            let url = read_str6(&mut r)?;
+            let alt = read_str6(&mut r)?;
+            doc.slices.push(crate::document::SliceRect {
+                x,
+                y,
+                w,
+                h,
+                name,
+                url,
+                alt,
+            });
+        }
+        let ncs = r.u32()?;
+        for _ in 0..ncs {
+            let name = read_str6(&mut r)?;
+            let np = r.u32()?;
+            let mut points = Vec::new();
+            for _ in 0..np {
+                points.push((r.f32()?, r.f32()?));
+            }
+            doc.custom_shapes
+                .push(crate::document::CustomShape { name, points });
+        }
+        // v0.6.1 trailing: Blend If split widths. Absent in
+        // v0.6.0 files — splits stay zero (hard edges).
+        if r.pos < r.buf.len() {
+            for layer in &mut doc.layers {
+                for v in &mut layer.blend_if_split {
+                    *v = r.u8()?;
+                }
+            }
+        }
+        // v0.6.1 trailing: note audio payloads.
+        if r.pos < r.buf.len() {
+            for n in &mut doc.notes {
+                if r.u8()? != 0 {
+                    let len = r.u32()? as usize;
+                    n.audio = Some(r.take(len)?.to_vec());
+                }
+            }
+        }
+        // Phase 6.5 trailing: color table, duotone spec,
+        // multichannel planes.
+        if r.pos < r.buf.len() {
+            let n = r.u16()? as usize;
+            let mut table = Vec::with_capacity(n);
+            for _ in 0..n {
+                table.push((r.u8()?, r.u8()?, r.u8()?));
+            }
+            doc.color_table = table;
+            if r.u8()? != 0 {
+                let ink_count = r.u8()? as usize;
+                let mut inks = Vec::with_capacity(ink_count);
+                for _ in 0..ink_count {
+                    let color = (r.u8()?, r.u8()?, r.u8()?);
+                    let curve_bytes = r.take(256)?;
+                    let mut curve = [0u8; 256];
+                    curve.copy_from_slice(curve_bytes);
+                    inks.push(crate::document::DuotoneInk { color, curve });
+                }
+                doc.duotone = Some(crate::document::DuotoneSpec { inks });
+            }
+            if r.pos < r.buf.len() {
+                for ch in &mut doc.alphas {
+                    if r.pos < r.buf.len() {
+                        ch.masked = r.u8()? != 0;
+                    }
+                }
+            }
+            let planes = r.u8()? as usize;
+            for _ in 0..planes {
+                let name = read_str6(&mut r)?;
+                let color = (r.u8()?, r.u8()?, r.u8()?);
+                let len = r.u32()? as usize;
+                let mut plane = Vec::with_capacity(len);
+                for _ in 0..len {
+                    plane.push(r.u16()?);
+                }
+                doc.multi_channels
+                    .push(crate::document::MultiChannelInfo { name, color });
+                doc.multi_planes.push(plane);
+            }
+            // Phase 6.5 Batch 6: shape arrowhead flags.
+            if r.pos < r.buf.len() {
+                let n = r.u16()? as usize;
+                for _ in 0..n {
+                    let li = r.u16()? as usize;
+                    let flags = r.u8()?;
+                    if let Some(sp) = doc.layers.get_mut(li).and_then(|l| l.shape.as_mut()) {
+                        sp.arrow_start = flags & 1 != 0;
+                        sp.arrow_end = flags & 2 != 0;
+                    }
+                }
+            }
+            // Phase 6.5 Batch 6: File Info fields.
+            if r.pos < r.buf.len() {
+                doc.info_title = read_str6(&mut r)?;
+                doc.info_caption = read_str6(&mut r)?;
+                doc.info_keywords = read_str6(&mut r)?;
+                doc.info_copyright = read_str6(&mut r)?;
+                doc.info_credit = read_str6(&mut r)?;
+            }
         }
     }
     Ok(())

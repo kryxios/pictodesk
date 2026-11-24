@@ -526,6 +526,46 @@ fn rgb_filter_rect(
         write_ink_region(doc, layer, &back, sel);
         return;
     }
+    if doc.mode == ColorMode::Lab {
+        // Lab (Phase 6.5): decode slots to RGB, filter, encode
+        // back — the same round-trip as the CMYK path above.
+        let raw = read_region(doc, layer, rect);
+        let rgb = Region {
+            x: raw.x,
+            y: raw.y,
+            w: raw.w,
+            h: raw.h,
+            px: raw
+                .px
+                .iter()
+                .map(|p| {
+                    let (r, g, b, a) = p.to_f32s();
+                    let (l, la, lb) = crate::color::slots_to_lab(r, g, b);
+                    let (r, g, b) = crate::color::lab_to_rgb(l, la, lb);
+                    Pixel16::from_f32s(r, g, b, a)
+                })
+                .collect(),
+        };
+        let out = f(&rgb);
+        let back = Region {
+            x: out.x,
+            y: out.y,
+            w: out.w,
+            h: out.h,
+            px: out
+                .px
+                .iter()
+                .map(|p| {
+                    let (r, g, b, a) = p.to_f32s();
+                    let (l, la, lb) = crate::color::rgb_to_lab(r, g, b);
+                    let (sr, sg, sb) = crate::color::lab_to_slots(l, la, lb);
+                    Pixel16::from_f32s(sr, sg, sb, a)
+                })
+                .collect(),
+        };
+        write_region(doc, layer, &back, sel);
+        return;
+    }
     let src = read_region(doc, layer, rect);
     let out = f(&src);
     write_region(doc, layer, &out, sel);
@@ -2089,6 +2129,2575 @@ pub fn extract(doc: &mut Document, layer: usize, highlight: &[u8], filled: &[u8]
     for (x, y, p) in writes {
         l.set_pixel(x, y, p);
     }
+}
+
+// ----------------------------------------------------------------
+// Phase 6.5 Batch 1a: the remaining Stylize / Pixelate / Blur /
+// Video gallery filters. All deterministic (seeded hashes), all
+// implemented once over RGB regions via `rgb_filter`.
+
+/// Filter > Stylize > Extrude: the image breaks into blocks
+/// (kind 0) or pyramids (kind 1) that jut toward the viewer by
+/// a hashed depth per block. `size` is the block edge in
+/// pixels, `depth` the maximum extrusion (era: 1..=255 levels
+/// of it). A block's front face is its average color; the rim
+/// the depth exposes is shaded by which side it belongs to.
+pub fn extrude(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    size: u32,
+    depth: u32,
+    kind: u8,
+    seed: u64,
+) {
+    let cell = size.max(2) as i32;
+    rgb_filter(doc, layer, sel, |src| {
+        let mut out = blank_like(src);
+        let (w, h) = (src.w as i32, src.h as i32);
+        let (bw, bh) = ((w + cell - 1) / cell, (h + cell - 1) / cell);
+        // Per-block average color and extrusion depth.
+        let mut avg = vec![(0.0f32, 0.0f32, 0.0f32, 0.0f32); (bw * bh) as usize];
+        let mut cnt = vec![0u32; (bw * bh) as usize];
+        for yy in 0..h {
+            for xx in 0..w {
+                let bi = ((yy / cell) * bw + xx / cell) as usize;
+                let p = src.at(xx, yy).to_f32s();
+                let a = &mut avg[bi];
+                a.0 += p.0;
+                a.1 += p.1;
+                a.2 += p.2;
+                a.3 += p.3;
+                cnt[bi] += 1;
+            }
+        }
+        for (a, &n) in avg.iter_mut().zip(cnt.iter()) {
+            if n > 0 {
+                let n = n as f32;
+                a.0 /= n;
+                a.1 /= n;
+                a.2 /= n;
+                a.3 /= n;
+            }
+        }
+        for yy in 0..h {
+            for xx in 0..w {
+                let (bx, by) = (xx / cell, yy / cell);
+                let bi = (by * bw + bx) as usize;
+                let a = avg[bi];
+                let (pw, ph) = ((w - bx * cell).min(cell), (h - by * cell).min(cell));
+                let (lx, ly) = (xx - bx * cell, yy - by * cell);
+                let dep = hash_unit(seed, bx, by, 71) * depth as f32;
+                let inset = (dep / (depth as f32 + 24.0)) * (cell as f32 * 0.5);
+                let edges = [ly, lx, pw - 1 - lx, ph - 1 - ly];
+                let e = edges.iter().copied().fold(i32::MAX, i32::min) as f32;
+                let side = edges.iter().position(|&v| v as f32 == e).unwrap_or(0);
+                let px = if e >= inset {
+                    a
+                } else if kind == 1 {
+                    // Pyramid: facets brighten toward the apex.
+                    let t = if inset > 0.0 { e / inset } else { 1.0 };
+                    let side_tint = [1.05, 0.95, 0.88, 0.78][side];
+                    let s = (0.45 + 0.55 * t) * side_tint;
+                    (a.0 * s, a.1 * s, a.2 * s, a.3)
+                } else {
+                    let s = [1.10, 0.95, 0.85, 0.70][side];
+                    (a.0 * s, a.1 * s, a.2 * s, a.3)
+                };
+                out.px[(yy as u32 * src.w + xx as u32) as usize] =
+                    Pixel16::from_f32s(px.0, px.1, px.2, px.3);
+            }
+        }
+        out
+    });
+}
+
+/// Filter > Stylize > Trace Contour: pixels become white
+/// except where the luma crosses `level` (0.0..=1.0) between a
+/// pixel and its right/down neighbor — those keep their color,
+/// drawing the contour lines. `upper` selects which side of
+/// the crossing is traced (era: Lower / Upper Edge).
+pub fn trace_contour(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    level: f32,
+    upper: bool,
+) {
+    rgb_filter(doc, layer, sel, |src| {
+        let mut out = blank_like(src);
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let p = src.at(xx, yy).to_f32s();
+                let l = luma(p);
+                let mut mark = false;
+                for (nx, ny) in [(xx + 1, yy), (xx, yy + 1)] {
+                    let ln = luma(src.at(nx, ny).to_f32s());
+                    if (l < level) != (ln < level) && upper == (l >= level) {
+                        mark = true;
+                    }
+                }
+                out.px[(yy as u32 * src.w + xx as u32) as usize] = if mark {
+                    src.at(xx, yy)
+                } else {
+                    Pixel16::from_f32s(1.0, 1.0, 1.0, p.3)
+                };
+            }
+        }
+        out
+    });
+}
+
+/// Filter > Pixelate > Color Halftone: each RGB channel is
+/// screened through its own rotated dot grid (15 / 75 / 45
+/// degrees, the classic screen angles). A channel's dot grows
+/// with the channel's average value inside the cell, up to
+/// `max_radius`.
+pub fn color_halftone(doc: &mut Document, layer: usize, sel: Option<&Selection>, max_radius: u32) {
+    let max_r = max_radius.max(1) as f32;
+    let pitch = (max_r * 2.0).max(2.0);
+    rgb_filter(doc, layer, sel, |src| {
+        let mut out = blank_like(src);
+        let angles = [15.0f32, 75.0, 45.0];
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let mut rgb = (0.0f32, 0.0f32, 0.0f32);
+                for (ch, ang) in angles.iter().enumerate() {
+                    let (sin, cos) = ang.to_radians().sin_cos();
+                    // Rotate the point into screen space.
+                    let rx = xx as f32 * cos + yy as f32 * sin;
+                    let ry = -xx as f32 * sin + yy as f32 * cos;
+                    let cx = (rx / pitch).floor() * pitch + pitch * 0.5;
+                    let cy = (ry / pitch).floor() * pitch + pitch * 0.5;
+                    let d = ((rx - cx).powi(2) + (ry - cy).powi(2)).sqrt();
+                    // Back to document space for the cell sample.
+                    let dx = cx * cos - cy * sin;
+                    let dy = cx * sin + cy * cos;
+                    // Average the channel over a small patch at
+                    // the cell center (the cell's tone).
+                    let mut v = 0.0f32;
+                    for oy in -1..=1 {
+                        for ox in -1..=1 {
+                            let p = src
+                                .at(dx.round() as i32 + ox, dy.round() as i32 + oy)
+                                .to_f32s();
+                            v += [p.0, p.1, p.2][ch];
+                        }
+                    }
+                    v /= 9.0;
+                    let on = if d <= max_r * v { 1.0 } else { 0.0 };
+                    match ch {
+                        0 => rgb.0 = on,
+                        1 => rgb.1 = on,
+                        _ => rgb.2 = on,
+                    }
+                }
+                let a = src.at(xx, yy).to_f32s().3;
+                out.px[(yy as u32 * src.w + xx as u32) as usize] =
+                    Pixel16::from_f32s(rgb.0, rgb.1, rgb.2, a);
+            }
+        }
+        out
+    });
+}
+
+/// Filter > Pixelate > Crystallize: a Voronoi mosaic — seed
+/// points sit on a jittered grid of `cell` pixels and every
+/// pixel takes the color of its nearest seed point.
+pub fn crystallize(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    cell: u32,
+    seed: u64,
+) {
+    let cs = cell.max(2) as i32;
+    rgb_filter(doc, layer, sel, |src| {
+        let mut out = blank_like(src);
+        let seed_at = |gx: i32, gy: i32| -> (f32, f32) {
+            (
+                gx as f32 * cs as f32 + hash_unit(seed, gx, gy, 81) * cs as f32,
+                gy as f32 * cs as f32 + hash_unit(seed, gx, gy, 82) * cs as f32,
+            )
+        };
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let (gx, gy) = (xx / cs, yy / cs);
+                let mut best = (f32::MAX, 0.0f32, 0.0f32);
+                for oy in -1..=1 {
+                    for ox in -1..=1 {
+                        let (sx, sy) = seed_at(gx + ox, gy + oy);
+                        let d = (xx as f32 - sx).powi(2) + (yy as f32 - sy).powi(2);
+                        if d < best.0 {
+                            best = (d, sx, sy);
+                        }
+                    }
+                }
+                out.px[(yy as u32 * src.w + xx as u32) as usize] =
+                    src.at(best.1.round() as i32, best.2.round() as i32);
+            }
+        }
+        out
+    });
+}
+
+/// Filter > Pixelate > Pointillize: dots of each cell's
+/// average color on the background color, one jittered dot per
+/// `cell`-sized square (era: the dots land on the Background
+/// color).
+pub fn pointillize(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    cell: u32,
+    bg: Pixel16,
+    seed: u64,
+) {
+    let cs = cell.max(3) as i32;
+    rgb_filter(doc, layer, sel, |src| {
+        let (w, h) = (src.w as i32, src.h as i32);
+        let bgf = bg.to_f32s();
+        let mut out = blank_like(src);
+        for p in out.px.iter_mut() {
+            let a = p.to_f32s().3;
+            *p = Pixel16::from_f32s(bgf.0, bgf.1, bgf.2, a);
+        }
+        let center = |gx: i32, gy: i32| -> (f32, f32) {
+            (
+                gx as f32 * cs as f32
+                    + cs as f32 * 0.5
+                    + (hash_unit(seed, gx, gy, 91) - 0.5) * cs as f32 * 0.5,
+                gy as f32 * cs as f32
+                    + cs as f32 * 0.5
+                    + (hash_unit(seed, gx, gy, 92) - 0.5) * cs as f32 * 0.5,
+            )
+        };
+        let radius = cs as f32 * 0.55;
+        for yy in 0..h {
+            for xx in 0..w {
+                let (gx, gy) = (xx / cs, yy / cs);
+                let mut best: Option<(f32, Pixel16)> = None;
+                for oy in -1..=1 {
+                    for ox in -1..=1 {
+                        let (cx, cy) = center(gx + ox, gy + oy);
+                        let d = ((xx as f32 - cx).powi(2) + (yy as f32 - cy).powi(2)).sqrt();
+                        if d <= radius && best.map(|(bd, _)| d < bd).unwrap_or(true) {
+                            best = Some((d, src.at(cx.round() as i32, cy.round() as i32)));
+                        }
+                    }
+                }
+                if let Some((_, c)) = best {
+                    let a = src.at(xx, yy).to_f32s().3;
+                    let cf = c.to_f32s();
+                    out.px[(yy as u32 * src.w + xx as u32) as usize] =
+                        Pixel16::from_f32s(cf.0, cf.1, cf.2, a);
+                }
+            }
+        }
+        out
+    });
+}
+
+/// Filter > Blur > Smart Blur: averages only the neighbors
+/// whose luma is within `threshold` (0..=100, era scale) of the
+/// center pixel, so edges survive the blur. `edge_only`
+/// renders the era Edge Only mode: white edges on black.
+pub fn smart_blur(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    radius: f32,
+    threshold: f32,
+    edge_only: bool,
+) {
+    let r = (radius.round() as i32).clamp(1, 12);
+    let th = (threshold / 100.0).max(0.0);
+    rgb_filter(doc, layer, sel, |src| {
+        let mut out = blank_like(src);
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let c = src.at(xx, yy).to_f32s();
+                let lc = luma(c);
+                let mut acc = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+                let mut n = 0.0f32;
+                let mut edge = false;
+                for oy in -r..=r {
+                    for ox in -r..=r {
+                        let p = src.at(xx + ox, yy + oy).to_f32s();
+                        if (luma(p) - lc).abs() <= th {
+                            acc.0 += p.0;
+                            acc.1 += p.1;
+                            acc.2 += p.2;
+                            acc.3 += p.3;
+                            n += 1.0;
+                        } else {
+                            edge = true;
+                        }
+                    }
+                }
+                out.px[(yy as u32 * src.w + xx as u32) as usize] = if edge_only {
+                    let v = if edge { 1.0 } else { 0.0 };
+                    Pixel16::from_f32s(v, v, v, c.3)
+                } else if n > 0.0 {
+                    Pixel16::from_f32s(acc.0 / n, acc.1 / n, acc.2 / n, acc.3 / n)
+                } else {
+                    src.at(xx, yy)
+                };
+            }
+        }
+        out
+    });
+}
+
+/// Filter > Video > De-Interlace: rebuilds one field's rows
+/// from the other field — by duplication (`interpolate`
+/// false) or by averaging the rows above and below.
+pub fn deinterlace(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    eliminate_even: bool,
+    interpolate: bool,
+) {
+    rgb_filter(doc, layer, sel, |src| {
+        let mut out = blank_like(src);
+        let target = if eliminate_even { 1 } else { 0 };
+        for yy in 0..src.h as i32 {
+            // Field parity follows the document row, not the
+            // (possibly selection-clipped) region row.
+            if (src.y + yy) % 2 != target {
+                continue;
+            }
+            for xx in 0..src.w as i32 {
+                let v = if interpolate {
+                    let a = src.at(xx, yy - 1).to_f32s();
+                    let b = src.at(xx, yy + 1).to_f32s();
+                    Pixel16::from_f32s(
+                        (a.0 + b.0) * 0.5,
+                        (a.1 + b.1) * 0.5,
+                        (a.2 + b.2) * 0.5,
+                        (a.3 + b.3) * 0.5,
+                    )
+                } else if yy > 0 {
+                    src.at(xx, yy - 1)
+                } else {
+                    src.at(xx, yy + 1)
+                };
+                out.px[(yy as u32 * src.w + xx as u32) as usize] = v;
+            }
+        }
+        out
+    });
+}
+
+/// Filter > Video > NTSC Colors: pulls out-of-gamut colors
+/// back inside the NTSC-safe range by scaling chroma (in YIQ)
+/// down until the RGB result fits, leaving in-gamut colors
+/// untouched.
+pub fn ntsc_colors(doc: &mut Document, layer: usize, sel: Option<&Selection>) {
+    rgb_filter(doc, layer, sel, |src| {
+        let mut out = blank_like(src);
+        for (i, p) in src.px.iter().enumerate() {
+            let (r, g, b, a) = p.to_f32s();
+            let y = 0.299 * r + 0.587 * g + 0.114 * b;
+            let mut ci = 0.596 * r - 0.274 * g - 0.322 * b;
+            let mut cq = 0.211 * r - 0.523 * g + 0.312 * b;
+            let mut rgb = (r, g, b);
+            for _ in 0..12 {
+                rgb = (
+                    y + 0.956 * ci + 0.619 * cq,
+                    y - 0.272 * ci - 0.647 * cq,
+                    y - 1.106 * ci + 1.703 * cq,
+                );
+                if (0.0..=1.0).contains(&rgb.0)
+                    && (0.0..=1.0).contains(&rgb.1)
+                    && (0.0..=1.0).contains(&rgb.2)
+                {
+                    break;
+                }
+                ci *= 0.85;
+                cq *= 0.85;
+            }
+            out.px[i] = Pixel16::from_f32s(rgb.0, rgb.1, rgb.2, a);
+        }
+        out
+    });
+}
+
+/// Filter > Sharpen > Sharpen More: the fixed, stronger
+/// sibling of Sharpen (center-weighted kernel, weights sum
+/// to 1 so flat areas are unchanged).
+pub fn sharpen_more(doc: &mut Document, layer: usize, sel: Option<&Selection>) {
+    rgb_filter(doc, layer, sel, |src| {
+        let mut out = blank_like(src);
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let c = src.at(xx, yy).to_f32s();
+                let mut acc = (c.0 * 9.0, c.1 * 9.0, c.2 * 9.0);
+                for (nx, ny) in [(xx - 1, yy), (xx + 1, yy), (xx, yy - 1), (xx, yy + 1)] {
+                    let p = src.at(nx, ny).to_f32s();
+                    acc.0 -= 2.0 * p.0;
+                    acc.1 -= 2.0 * p.1;
+                    acc.2 -= 2.0 * p.2;
+                }
+                out.px[(yy as u32 * src.w + xx as u32) as usize] =
+                    Pixel16::from_f32s(acc.0, acc.1, acc.2, c.3);
+            }
+        }
+        out
+    });
+}
+
+// ----------------------------------------------------------------
+// Phase 6.5 Batch 1b: Render + the remaining Distort filters.
+
+/// Smooth value noise: bilinear interpolation (with smoothstep
+/// easing) over a hashed integer lattice.
+fn noise2(seed: u64, x: f32, y: f32, ch: u64) -> f32 {
+    let (x0, y0) = (x.floor(), y.floor());
+    let (tx, ty) = (x - x0, y - y0);
+    let sx = tx * tx * (3.0 - 2.0 * tx);
+    let sy = ty * ty * (3.0 - 2.0 * ty);
+    let g = |ix: f32, iy: f32| hash_unit(seed, ix as i32, iy as i32, ch);
+    let (a, b, c, d) = (
+        g(x0, y0),
+        g(x0 + 1.0, y0),
+        g(x0, y0 + 1.0),
+        g(x0 + 1.0, y0 + 1.0),
+    );
+    a + (b - a) * sx + (c - a) * sy + (a - b - c + d) * sx * sy
+}
+
+/// Bilinear sample with wrapped (tiling) coordinates.
+fn sample_bilinear_wrap(src: &Region, fx: f32, fy: f32) -> (f32, f32, f32, f32) {
+    let (w, h) = (src.w as f32, src.h as f32);
+    let wx = ((fx % w) + w) % w;
+    let wy = ((fy % h) + h) % h;
+    sample_bilinear(src, wx.min(w - 1.0), wy.min(h - 1.0))
+}
+
+/// Filter > Distort > Wave: the image is displaced by a sum
+/// of sinusoidal generators (era: 1..=999 of them; the field
+/// here sums `generators` waves with hashed directions,
+/// wavelengths and amplitudes around the slider centers).
+/// `wave_type`: 0 Sine, 1 Triangle, 2 Square. `wrap` selects
+/// the era Undefined Areas behaviour (Wrap Around vs Repeat
+/// Edge Pixels).
+#[allow(clippy::too_many_arguments)]
+pub fn wave(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    generators: u32,
+    wavelength: f32,
+    amplitude: f32,
+    h_scale: f32,
+    v_scale: f32,
+    wave_type: u8,
+    wrap: bool,
+    seed: u64,
+) {
+    let gens: Vec<(f32, f32, f32, f32, f32)> = (0..generators.max(1))
+        .map(|g| {
+            let g = g as i32;
+            let theta = hash_unit(seed, g, 0, 41) * std::f32::consts::TAU;
+            let lam = wavelength.max(4.0) * (0.6 + 0.8 * hash_unit(seed, g, 0, 42));
+            let amp = amplitude * (0.5 + hash_unit(seed, g, 0, 43));
+            let phase = hash_unit(seed, g, 0, 44) * std::f32::consts::TAU;
+            (theta.cos(), theta.sin(), lam, amp, phase)
+        })
+        .collect();
+    rgb_filter(doc, layer, sel, |src| {
+        let mut out = blank_like(src);
+        let shape = |t: f32| -> f32 {
+            let s = (std::f32::consts::TAU * t).sin();
+            match wave_type {
+                1 => (2.0 / std::f32::consts::PI) * s.asin(),
+                2 => {
+                    if s > 0.0 {
+                        1.0
+                    } else if s < 0.0 {
+                        -1.0
+                    } else {
+                        0.0
+                    }
+                }
+                _ => s,
+            }
+        };
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let (mut dx, mut dy) = (0.0f32, 0.0f32);
+                for &(ct, st, lam, amp, phase) in &gens {
+                    let t = (xx as f32 * ct + yy as f32 * st) / lam + phase / std::f32::consts::TAU;
+                    let v = shape(t) * amp;
+                    dx += ct * v;
+                    dy += st * v;
+                }
+                dx *= h_scale / 100.0;
+                dy *= v_scale / 100.0;
+                let p = if wrap {
+                    sample_bilinear_wrap(src, xx as f32 - dx, yy as f32 - dy)
+                } else {
+                    sample_bilinear(src, xx as f32 - dx, yy as f32 - dy)
+                };
+                out.px[(yy as u32 * src.w + xx as u32) as usize] =
+                    Pixel16::from_f32s(p.0, p.1, p.2, p.3);
+            }
+        }
+        out
+    });
+}
+
+/// Filter > Distort > Glass: the image seen through frosted
+/// glass — a smooth noise field displaces the sampling,
+/// `distortion` sets how far, `smoothness` the lump size,
+/// `scaling` zooms the texture.
+pub fn glass(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    distortion: f32,
+    smoothness: f32,
+    scaling: f32,
+    seed: u64,
+) {
+    let cell = (2.0 + smoothness * 1.5) * (scaling / 100.0);
+    rgb_filter(doc, layer, sel, |src| {
+        let mut out = blank_like(src);
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let nx = noise2(seed, xx as f32 / cell, yy as f32 / cell, 51);
+                let ny = noise2(seed, xx as f32 / cell, yy as f32 / cell, 52);
+                let dx = (nx - 0.5) * distortion * 4.0;
+                let dy = (ny - 0.5) * distortion * 4.0;
+                let p = sample_bilinear(src, xx as f32 + dx, yy as f32 + dy);
+                out.px[(yy as u32 * src.w + xx as u32) as usize] =
+                    Pixel16::from_f32s(p.0, p.1, p.2, p.3);
+            }
+        }
+        out
+    });
+}
+
+/// Filter > Distort > Diffuse Glow: highlights bleed into a
+/// soft glow (a blurred copy of the bright areas is added
+/// back), with film grain over the result. `clear` sets how
+/// much of the tonal range counts as highlight.
+pub fn diffuse_glow(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    graininess: f32,
+    glow: f32,
+    clear: f32,
+    seed: u64,
+) {
+    rgb_filter(doc, layer, sel, |src| {
+        let blurred = blur_region(src, 3.0);
+        let mut out = blank_like(src);
+        let t = 1.0 - (clear / 20.0).clamp(0.0, 1.0) * 0.6;
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let i = (yy as u32 * src.w + xx as u32) as usize;
+                let p = src.px[i].to_f32s();
+                let g = blurred.px[i].to_f32s();
+                // The mask reads the BLURRED luma so the glow
+                // bleeds into the darker surroundings of a
+                // highlight, not just inside it.
+                let l = luma(g);
+                let m = ((l - t) / (1.0 - t + 0.001)).clamp(0.0, 1.0);
+                let grain = (hash_unit(seed, xx, yy, 33) - 0.5) * graininess * 0.05;
+                let k = m * (glow / 10.0);
+                out.px[i] = Pixel16::from_f32s(
+                    p.0 + g.0 * k + grain,
+                    p.1 + g.1 * k + grain,
+                    p.2 + g.2 * k + grain,
+                    p.3,
+                );
+            }
+        }
+        out
+    });
+}
+
+/// Filter > Distort > Displace: pixels shift by a
+/// displacement map — the map's red channel drives the
+/// horizontal shift, green the vertical (a grayscale map
+/// therefore shifts both together, as in the classic
+/// behaviour). `map` holds interleaved (R, G) pairs over an
+/// mw x mh plane; scales are percents (100% = 128 px at full
+/// deflection). `tile` tiles the map instead of stretching
+/// it; `wrap` wraps the displaced sampling at the edges.
+#[allow(clippy::too_many_arguments)]
+pub fn displace(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    map: &[f32],
+    mw: u32,
+    mh: u32,
+    h_scale: f32,
+    v_scale: f32,
+    tile: bool,
+    wrap: bool,
+) {
+    if mw == 0 || mh == 0 || map.len() < (mw * mh * 2) as usize {
+        return;
+    }
+    let map_at = |mx: f32, my: f32| -> (f32, f32) {
+        let x = (mx.round() as i32).clamp(0, mw as i32 - 1) as u32;
+        let y = (my.round() as i32).clamp(0, mh as i32 - 1) as u32;
+        let i = ((y * mw + x) * 2) as usize;
+        (map[i], map[i + 1])
+    };
+    rgb_filter(doc, layer, sel, |src| {
+        let mut out = blank_like(src);
+        let (w, h) = (src.w as f32, src.h as f32);
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let (mvx, mvy) = if tile {
+                    map_at((xx % mw as i32) as f32, (yy % mh as i32) as f32)
+                } else {
+                    map_at(
+                        xx as f32 * (mw as f32 - 1.0) / (w - 1.0).max(1.0),
+                        yy as f32 * (mh as f32 - 1.0) / (h - 1.0).max(1.0),
+                    )
+                };
+                let dx = (mvx - 0.5) * 2.0 * (h_scale / 100.0) * 128.0;
+                let dy = (mvy - 0.5) * 2.0 * (v_scale / 100.0) * 128.0;
+                let p = if wrap {
+                    sample_bilinear_wrap(src, xx as f32 - dx, yy as f32 - dy)
+                } else {
+                    sample_bilinear(src, xx as f32 - dx, yy as f32 - dy)
+                };
+                out.px[(yy as u32 * src.w + xx as u32) as usize] =
+                    Pixel16::from_f32s(p.0, p.1, p.2, p.3);
+            }
+        }
+        out
+    });
+}
+
+/// Filter > Render > Lens Flare: a bright glow at (cx, cy)
+/// (document coordinates), a halo ring, and the chain of
+/// ghost reflections along the axis through the image
+/// center. `lens`: 0 = 50-300mm Zoom, 1 = 35mm Prime,
+/// 2 = 105mm Prime (each with its own ghost set). Brightness
+/// is the era percent (10..=300).
+pub fn lens_flare(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    brightness: f32,
+    cx: f32,
+    cy: f32,
+    lens: u8,
+) {
+    rgb_filter(doc, layer, sel, |src| {
+        let mut out = blank_like(src);
+        let (fx, fy) = (cx - src.x as f32, cy - src.y as f32);
+        let (w, h) = (src.w as f32, src.h as f32);
+        let mind = w.min(h);
+        let b = brightness / 100.0;
+        let r_glow = (mind * 0.45).max(1.0);
+        // Ghosts: (position along the flare->center axis,
+        // radius as a fraction of the smaller dimension,
+        // color, strength).
+        type Ghost = (f32, f32, (f32, f32, f32), f32);
+        let ghosts: &[Ghost] = match lens {
+            1 => &[
+                (0.5, 0.08, (0.55, 0.65, 1.0), 0.35),
+                (1.0, 0.03, (1.0, 1.0, 1.0), 0.50),
+                (1.6, 0.12, (1.0, 0.75, 0.45), 0.30),
+            ],
+            2 => &[
+                (0.25, 0.02, (0.7, 0.8, 1.0), 0.60),
+                (0.9, 0.05, (0.9, 0.6, 1.0), 0.45),
+                (1.2, 0.025, (1.0, 1.0, 1.0), 0.50),
+                (2.0, 0.07, (0.5, 0.9, 1.0), 0.30),
+            ],
+            _ => &[
+                (0.3, 0.03, (0.55, 0.65, 1.0), 0.50),
+                (0.7, 0.06, (0.85, 0.6, 1.0), 0.40),
+                (1.0, 0.02, (1.0, 1.0, 1.0), 0.60),
+                (1.4, 0.09, (1.0, 0.72, 0.4), 0.35),
+                (1.8, 0.04, (0.5, 0.9, 1.0), 0.40),
+            ],
+        };
+        let (ccx, ccy) = (w * 0.5, h * 0.5);
+        let (ax, ay) = (ccx - fx, ccy - fy);
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let (px, py) = (xx as f32, yy as f32);
+                let d = ((px - fx).powi(2) + (py - fy).powi(2)).sqrt();
+                let mut add = (0.0f32, 0.0f32, 0.0f32);
+                let glow = (-(d / r_glow).powi(2) * 2.2).exp() * 0.85 * b;
+                add.0 += glow;
+                add.1 += glow * 0.97;
+                add.2 += glow * 0.92;
+                let ring_r = r_glow * 0.55;
+                let ring = (-((d - ring_r) / (r_glow * 0.06 + 1.0)).powi(2)).exp() * 0.25 * b;
+                add.0 += ring * 0.65;
+                add.1 += ring * 0.75;
+                add.2 += ring;
+                for &(t, rf, col, s) in ghosts {
+                    let (gx, gy) = (fx + ax * t, fy + ay * t);
+                    let gd = ((px - gx).powi(2) + (py - gy).powi(2)).sqrt();
+                    let gr = (mind * rf).max(1.0);
+                    let gv = (-(gd / gr).powi(2)).exp() * s * b;
+                    add.0 += gv * col.0;
+                    add.1 += gv * col.1;
+                    add.2 += gv * col.2;
+                }
+                let p = src.at(xx, yy).to_f32s();
+                out.px[(yy as u32 * src.w + xx as u32) as usize] =
+                    Pixel16::from_f32s(p.0 + add.0, p.1 + add.1, p.2 + add.2, p.3);
+            }
+        }
+        out
+    });
+}
+
+/// Filter > Render > Lighting Effects (single-light form):
+/// a spotlight or point light at (lx, ly) (document
+/// coordinates) shades the image by distance, with an
+/// ambient floor so shadows keep detail. `focus` tightens
+/// the spotlight's falloff; `texture` embosses the shading
+/// with the image's own luma as a height field; `exposure`
+/// scales the result (-100..=100).
+#[allow(clippy::too_many_arguments)]
+pub fn lighting(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    intensity: f32,
+    focus: f32,
+    lx: f32,
+    ly: f32,
+    exposure: f32,
+    spot: bool,
+    texture: bool,
+) {
+    rgb_filter(doc, layer, sel, |src| {
+        let mut out = blank_like(src);
+        let (fx, fy) = (lx - src.x as f32, ly - src.y as f32);
+        let (w, h) = (src.w as f32, src.h as f32);
+        let maxd = (w * w + h * h).sqrt().max(1.0);
+        let inten = intensity / 100.0;
+        let exp = 1.0 + exposure / 100.0;
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let (px, py) = (xx as f32, yy as f32);
+                let d = ((px - fx).powi(2) + (py - fy).powi(2)).sqrt();
+                let fall = if spot {
+                    (1.0 - d / maxd)
+                        .clamp(0.0, 1.0)
+                        .powf(1.0 + (100.0 - focus) / 25.0)
+                } else {
+                    1.0 / (1.0 + d / (maxd * 0.5))
+                };
+                let mut shade = (0.25 + inten * 1.6 * fall) * exp;
+                if texture && d > 0.5 {
+                    let gx =
+                        luma(src.at(xx + 1, yy).to_f32s()) - luma(src.at(xx - 1, yy).to_f32s());
+                    let gy =
+                        luma(src.at(xx, yy + 1).to_f32s()) - luma(src.at(xx, yy - 1).to_f32s());
+                    let emboss = (gx * (fx - px) / d + gy * (fy - py) / d) * 2.0;
+                    shade *= 1.0 + emboss * 0.8;
+                }
+                let spec = fall.powi(8) * inten * 0.3;
+                let p = src.at(xx, yy).to_f32s();
+                out.px[(yy as u32 * src.w + xx as u32) as usize] = Pixel16::from_f32s(
+                    p.0 * shade + spec,
+                    p.1 * shade + spec,
+                    p.2 * shade + spec,
+                    p.3,
+                );
+            }
+        }
+        out
+    });
+}
+
+/// Filter > Render > Texture Fill: the layer is filled with
+/// a grayscale texture (a luma plane), tiled to cover.
+/// Alpha is preserved from the source.
+pub fn texture_fill(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    tex: &[f32],
+    tw: u32,
+    th: u32,
+) {
+    if tw == 0 || th == 0 || tex.len() < (tw * th) as usize {
+        return;
+    }
+    rgb_filter(doc, layer, sel, |src| {
+        let mut out = blank_like(src);
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let tx = ((src.x + xx) % tw as i32 + tw as i32) % tw as i32;
+                let ty = ((src.y + yy) % th as i32 + th as i32) % th as i32;
+                let v = tex[(ty as u32 * tw + tx as u32) as usize];
+                let a = src.at(xx, yy).to_f32s().3;
+                out.px[(yy as u32 * src.w + xx as u32) as usize] = Pixel16::from_f32s(v, v, v, a);
+            }
+        }
+        out
+    });
+}
+
+// ----------------------------------------------------------------
+// Phase 6.5 Batch 1c: the Artistic gallery. These are
+// painterly approximations in the spirit of the originals —
+// deterministic, seeded, and parameter-faithful.
+
+/// Per-cell running sums for the daub filters.
+type CellSums = std::collections::HashMap<(i32, i32), (f32, f32, f32, f32, u32)>;
+
+fn luma_at(src: &Region, x: i32, y: i32) -> f32 {
+    luma(src.at(x, y).to_f32s())
+}
+
+fn grad_mag(src: &Region, x: i32, y: i32) -> f32 {
+    let gx = luma_at(src, x + 1, y) - luma_at(src, x - 1, y);
+    let gy = luma_at(src, x, y + 1) - luma_at(src, x, y - 1);
+    (gx * gx + gy * gy).sqrt()
+}
+
+/// Axis-aligned block averages (the daub / knife / sponge
+/// base): every block of cw x ch pixels becomes its mean.
+fn cell_avg(src: &Region, cw: i32, chh: i32) -> Region {
+    let (cw, chh) = (cw.max(1), chh.max(1));
+    let gw = (src.w as i32 + cw - 1) / cw;
+    let gh = (src.h as i32 + chh - 1) / chh;
+    let mut sums = vec![(0.0f32, 0.0f32, 0.0f32, 0.0f32, 0u32); (gw * gh) as usize];
+    for y in 0..src.h as i32 {
+        for x in 0..src.w as i32 {
+            let p = src.at(x, y).to_f32s();
+            let c = &mut sums[((y / chh) * gw + (x / cw)) as usize];
+            c.0 += p.0;
+            c.1 += p.1;
+            c.2 += p.2;
+            c.3 += p.3;
+            c.4 += 1;
+        }
+    }
+    let mut out = blank_like(src);
+    for y in 0..src.h as i32 {
+        for x in 0..src.w as i32 {
+            let c = sums[((y / chh) * gw + (x / cw)) as usize];
+            let n = c.4 as f32;
+            out.px[(y as u32 * src.w + x as u32) as usize] =
+                Pixel16::from_f32s(c.0 / n, c.1 / n, c.2 / n, c.3 / n);
+        }
+    }
+    out
+}
+
+/// Procedural stand-ins for the era's loaded texture files:
+/// 0 Canvas, 1 Burlap, 2 Brick, 3 Sandstone. Returns a
+/// brightness factor field in roughly 0.2..=0.8.
+fn texture_pattern(kind: u8, x: i32, y: i32, scaling: f32) -> f32 {
+    let sc = scaling / 100.0;
+    let (fx, fy) = (x as f32 * sc, y as f32 * sc);
+    match kind {
+        0 => {
+            let checker = ((fx as i32 + fy as i32) % 2 + 2) % 2;
+            0.45 + checker as f32 * 0.1 + (noise2(1, fx * 0.5, fy * 0.5, 91) - 0.5) * 0.2
+        }
+        1 => 0.5 + 0.25 * (fx * 1.9).sin() * (fy * 1.9).sin(),
+        2 => {
+            let row = (fy / 8.0).floor();
+            let off = (row as i32 % 2 + 2) % 2 * 16;
+            if (fy % 8.0) < 1.0 || ((fx + off as f32) % 32.0) < 1.0 {
+                0.25
+            } else {
+                0.6 + (noise2(3, fx * 0.2, fy * 0.2, 93) - 0.5) * 0.12
+            }
+        }
+        _ => noise2(2, fx * 0.08, fy * 0.08, 92) * 0.7 + 0.15,
+    }
+}
+
+/// Artistic > Colored Pencil: bright flat areas fall back to
+/// the paper color; edges pick up dark hatched pencil
+/// strokes.
+pub fn colored_pencil(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    width: f32,
+    pressure: f32,
+    paper: f32,
+    seed: u64,
+) {
+    rgb_filter(doc, layer, sel, |src| {
+        let mut out = blank_like(src);
+        let paper_v = paper / 50.0;
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let i = (yy as u32 * src.w + xx as u32) as usize;
+                let p = src.px[i].to_f32s();
+                let l = luma(p);
+                let show = l * l * (1.0 - pressure / 15.0 * 0.75) * 0.8;
+                let mut base = (
+                    p.0 + (paper_v - p.0) * show,
+                    p.1 + (paper_v - p.1) * show,
+                    p.2 + (paper_v - p.2) * show,
+                );
+                let hatch = noise2(seed, xx as f32 * 0.35, yy as f32 * 0.06, 61) * 0.5
+                    + noise2(seed, xx as f32 * 0.06, yy as f32 * 0.35, 62) * 0.5;
+                let e = grad_mag(src, xx, yy);
+                let dark = (e * width * 0.22).min(0.75) * (0.55 + 0.45 * hatch);
+                base.0 *= 1.0 - dark;
+                base.1 *= 1.0 - dark;
+                base.2 *= 1.0 - dark;
+                out.px[i] = Pixel16::from_f32s(base.0, base.1, base.2, p.3);
+            }
+        }
+        out
+    });
+}
+
+/// Artistic > Cutout: flat posterized shapes — smooth first
+/// (Edge Simplicity), quantize to `levels`, then let Edge
+/// Fidelity pull some of the original detail back.
+pub fn cutout(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    levels: f32,
+    simplicity: f32,
+    fidelity: f32,
+) {
+    rgb_filter(doc, layer, sel, |src| {
+        let sm = blur_region(src, simplicity * 0.7 + 0.001);
+        let lv = levels.max(2.0);
+        let q = |v: f32| (v * (lv - 1.0)).round() / (lv - 1.0);
+        let f = (fidelity - 1.0) / 2.0 * 0.6;
+        let mut out = blank_like(src);
+        for i in 0..src.px.len() {
+            let a = sm.px[i].to_f32s();
+            let b = src.px[i].to_f32s();
+            out.px[i] = Pixel16::from_f32s(
+                q(a.0) + (q(b.0) - q(a.0)) * f,
+                q(a.1) + (q(b.1) - q(a.1)) * f,
+                q(a.2) + (q(b.2) - q(a.2)) * f,
+                a.3,
+            );
+        }
+        out
+    });
+}
+
+/// Artistic > Dry Brush: a nearly-dry brush drags color —
+/// smoothed shapes, detail pulled back, a whisper of grain.
+pub fn dry_brush(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    size: f32,
+    detail: f32,
+    texture: f32,
+    seed: u64,
+) {
+    rgb_filter(doc, layer, sel, |src| {
+        let sm = blur_region(src, size * 0.45 + 0.001);
+        let mut out = blank_like(src);
+        let k = detail / 10.0;
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let i = (yy as u32 * src.w + xx as u32) as usize;
+                let a = sm.px[i].to_f32s();
+                let b = src.px[i].to_f32s();
+                let g = (hash_unit(seed, xx, yy, 63) - 0.5) * texture * 0.03;
+                out.px[i] = Pixel16::from_f32s(
+                    a.0 + (b.0 - a.0) * k + g,
+                    a.1 + (b.1 - a.1) * k + g,
+                    a.2 + (b.2 - a.2) * k + g,
+                    b.3,
+                );
+            }
+        }
+        out
+    });
+}
+
+/// Artistic > Film Grain: monochrome grain that lives
+/// mostly in the highlights; `highlight` sets how far down
+/// the tones it reaches, `intensity` its contrast.
+pub fn film_grain(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    grain: f32,
+    highlight: f32,
+    intensity: f32,
+    seed: u64,
+) {
+    rgb_filter(doc, layer, sel, |src| {
+        let mut out = blank_like(src);
+        let t = 1.0 - highlight / 10.0;
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let i = (yy as u32 * src.w + xx as u32) as usize;
+                let p = src.px[i].to_f32s();
+                let l = luma(p);
+                let w = if highlight <= 0.0 {
+                    l
+                } else {
+                    ((l - t) / (1.0 - t + 0.001)).clamp(0.0, 1.0)
+                };
+                let n = (hash_unit(seed, xx, yy, 71) - 0.5)
+                    * grain
+                    * 0.055
+                    * (0.3 + w * (0.4 + intensity / 10.0));
+                out.px[i] = Pixel16::from_f32s(p.0 + n, p.1 + n, p.2 + n, p.3);
+            }
+        }
+        out
+    });
+}
+
+/// Artistic > Fresco: plaster-wall painting — coarser and
+/// darker than Dry Brush, colors slightly intensified,
+/// mineral grain over the top.
+pub fn fresco(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    size: f32,
+    detail: f32,
+    texture: f32,
+    seed: u64,
+) {
+    rgb_filter(doc, layer, sel, |src| {
+        let sm = blur_region(src, size * 0.6 + 0.001);
+        let mut out = blank_like(src);
+        let k = detail / 10.0 * 0.8;
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let i = (yy as u32 * src.w + xx as u32) as usize;
+                let a = sm.px[i].to_f32s();
+                let b = src.px[i].to_f32s();
+                let mut m = (
+                    a.0 + (b.0 - a.0) * k,
+                    a.1 + (b.1 - a.1) * k,
+                    a.2 + (b.2 - a.2) * k,
+                );
+                let l = 0.299 * m.0 + 0.587 * m.1 + 0.114 * m.2;
+                m.0 = (l + (m.0 - l) * 1.15) * 0.94;
+                m.1 = (l + (m.1 - l) * 1.15) * 0.94;
+                m.2 = (l + (m.2 - l) * 1.15) * 0.94;
+                let g = (hash_unit(seed, xx, yy, 64) - 0.5) * texture * 0.045;
+                out.px[i] = Pixel16::from_f32s(m.0 + g, m.1 + g, m.2 + g, b.3);
+            }
+        }
+        out
+    });
+}
+
+/// Artistic > Neon Glow: the image dims and its edges light
+/// up in the glow color (the foreground color, as in the
+/// original's color well).
+pub fn neon_glow(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    size: f32,
+    brightness: f32,
+    color: Pixel16,
+) {
+    rgb_filter(doc, layer, sel, |src| {
+        let bl = blur_region(src, (size * 0.3).max(0.5));
+        let c = color.to_f32s();
+        let mut out = blank_like(src);
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let i = (yy as u32 * src.w + xx as u32) as usize;
+                let p = src.px[i].to_f32s();
+                let e = grad_mag(&bl, xx, yy);
+                let glow = (e * 2.2).clamp(0.0, 1.0) * (brightness / 50.0) * 1.4;
+                out.px[i] = Pixel16::from_f32s(
+                    p.0 * 0.55 + c.0 * glow,
+                    p.1 * 0.55 + c.1 * glow,
+                    p.2 * 0.55 + c.2 * glow,
+                    p.3,
+                );
+            }
+        }
+        out
+    });
+}
+
+/// Artistic > Paint Daubs: jittered daub cells painted with
+/// their average color. Brush types: 0 Simple, 1 Rough
+/// (per-daub value jitter), 2 Sparkle (bright flecks).
+/// Sharpness pulls original edge detail back in.
+pub fn paint_daubs(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    size: f32,
+    sharpness: f32,
+    brush_type: u8,
+    seed: u64,
+) {
+    rgb_filter(doc, layer, sel, |src| {
+        let cs = (size.max(2.0)) as i32;
+        let center = |gx: i32, gy: i32| -> (f32, f32) {
+            (
+                gx as f32 * cs as f32
+                    + cs as f32 * 0.5
+                    + (hash_unit(seed, gx, gy, 91) - 0.5) * cs as f32 * 0.5,
+                gy as f32 * cs as f32
+                    + cs as f32 * 0.5
+                    + (hash_unit(seed, gx, gy, 92) - 0.5) * cs as f32 * 0.5,
+            )
+        };
+        let cell_of = |x: i32, y: i32| -> (i32, i32) {
+            let (gx, gy) = (x.div_euclid(cs), y.div_euclid(cs));
+            let mut best = (gx, gy);
+            let mut bd = f32::MAX;
+            for cy in (gy - 1)..=(gy + 1) {
+                for cx in (gx - 1)..=(gx + 1) {
+                    let (px, py) = center(cx, cy);
+                    let d = (x as f32 - px).powi(2) + (y as f32 - py).powi(2);
+                    if d < bd {
+                        bd = d;
+                        best = (cx, cy);
+                    }
+                }
+            }
+            best
+        };
+        let mut sums: CellSums = std::collections::HashMap::new();
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let p = src.at(xx, yy).to_f32s();
+                let e = sums.entry(cell_of(xx, yy)).or_default();
+                e.0 += p.0;
+                e.1 += p.1;
+                e.2 += p.2;
+                e.3 += p.3;
+                e.4 += 1;
+            }
+        }
+        let mut out = blank_like(src);
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let i = (yy as u32 * src.w + xx as u32) as usize;
+                let cell = cell_of(xx, yy);
+                let s = sums[&cell];
+                let n = s.4 as f32;
+                let mut m = (s.0 / n, s.1 / n, s.2 / n, s.3 / n);
+                match brush_type {
+                    1 => {
+                        let j = 0.92 + hash_unit(seed, cell.0, cell.1, 81) * 0.16;
+                        m.0 *= j;
+                        m.1 *= j;
+                        m.2 *= j;
+                    }
+                    2 if hash_unit(seed, xx, yy, 82) > 0.995 => {
+                        m.0 += 0.3;
+                        m.1 += 0.3;
+                        m.2 += 0.3;
+                    }
+                    _ => {}
+                }
+                let e = grad_mag(src, xx, yy).clamp(0.0, 1.0);
+                let p = src.px[i].to_f32s();
+                let k = (sharpness / 40.0) * e * 0.8;
+                out.px[i] = Pixel16::from_f32s(
+                    m.0 + (p.0 - m.0) * k,
+                    m.1 + (p.1 - m.1) * k,
+                    m.2 + (p.2 - m.2) * k,
+                    m.3,
+                );
+            }
+        }
+        out
+    });
+}
+
+/// Artistic > Palette Knife: wide flat smears — rectangular
+/// block averages, softened; Detail restores a little of
+/// the original.
+pub fn palette_knife(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    size: f32,
+    detail: f32,
+    softness: f32,
+) {
+    rgb_filter(doc, layer, sel, |src| {
+        let blocks = cell_avg(src, (size * 2.0) as i32, size as i32);
+        let soft = if softness > 0.0 {
+            blur_region(&blocks, softness * 0.35)
+        } else {
+            blocks
+        };
+        let f = (detail - 1.0) / 2.0 * 0.25;
+        let mut out = blank_like(src);
+        for i in 0..src.px.len() {
+            let a = soft.px[i].to_f32s();
+            let b = src.px[i].to_f32s();
+            out.px[i] = Pixel16::from_f32s(
+                a.0 + (b.0 - a.0) * f,
+                a.1 + (b.1 - a.1) * f,
+                a.2 + (b.2 - a.2) * f,
+                a.3,
+            );
+        }
+        out
+    });
+}
+
+/// Artistic > Plastic Wrap: a specular sheen from the
+/// image's own height field, as if shrink-wrapped. Detail
+/// sets the height field's resolution; Smoothness softens
+/// the sheen.
+pub fn plastic_wrap(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    strength: f32,
+    detail: f32,
+    smoothness: f32,
+) {
+    rgb_filter(doc, layer, sel, |src| {
+        let hgt = blur_region(src, ((16.0 - detail) * 0.25 + 0.3).max(0.3));
+        let mut out = blank_like(src);
+        let k = strength / 15.0;
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let i = (yy as u32 * src.w + xx as u32) as usize;
+                let p = src.px[i].to_f32s();
+                let gx = luma_at(&hgt, xx + 1, yy) - luma_at(&hgt, xx - 1, yy);
+                let gy = luma_at(&hgt, xx, yy + 1) - luma_at(&hgt, xx, yy - 1);
+                let shade = gx * -0.707 + gy * -0.707;
+                let spec = (shade * 3.0).clamp(0.0, 1.0) * k;
+                let dark = (-shade * 1.5).clamp(0.0, 0.6) * k * 0.5;
+                out.px[i] = Pixel16::from_f32s(
+                    p.0 * (1.0 - dark) + spec,
+                    p.1 * (1.0 - dark) + spec,
+                    p.2 * (1.0 - dark) + spec,
+                    p.3,
+                );
+            }
+        }
+        if smoothness > 1.0 {
+            let soft = blur_region(&out, smoothness * 0.15);
+            for i in 0..out.px.len() {
+                let a = out.px[i].to_f32s();
+                let b = soft.px[i].to_f32s();
+                out.px[i] = Pixel16::from_f32s(
+                    a.0 + (b.0 - a.0) * 0.5,
+                    a.1 + (b.1 - a.1) * 0.5,
+                    a.2 + (b.2 - a.2) * 0.5,
+                    a.3,
+                );
+            }
+        }
+        out
+    });
+}
+
+/// Artistic > Poster Edges: posterized fills with black
+/// inked edges.
+pub fn poster_edges(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    thickness: f32,
+    intensity: f32,
+    posterization: f32,
+) {
+    rgb_filter(doc, layer, sel, |src| {
+        let lv = (8.0 - posterization).max(2.0);
+        let q = |v: f32| (v * (lv - 1.0)).round() / (lv - 1.0);
+        let mut out = blank_like(src);
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let i = (yy as u32 * src.w + xx as u32) as usize;
+                let p = src.px[i].to_f32s();
+                let e = grad_mag(src, xx, yy);
+                let edge = (e * (0.2 + intensity * 0.3)).clamp(0.0, 1.0) * (thickness / 10.0);
+                let keep = 1.0 - edge;
+                out.px[i] = Pixel16::from_f32s(q(p.0) * keep, q(p.1) * keep, q(p.2) * keep, p.3);
+            }
+        }
+        out
+    });
+}
+
+/// Artistic > Rough Pastels: chalky block strokes over a
+/// textured ground (Canvas / Burlap / Brick / Sandstone),
+/// the texture's Relief embossing the result.
+#[allow(clippy::too_many_arguments)]
+pub fn rough_pastels(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    length: f32,
+    detail: f32,
+    scaling: f32,
+    relief: f32,
+    texture_kind: u8,
+) {
+    rgb_filter(doc, layer, sel, |src| {
+        let cw = length.max(2.0) as i32;
+        let blocks = cell_avg(src, cw, (cw / 2).max(1));
+        let mut out = blank_like(src);
+        let dk = detail / 20.0 * 0.25;
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let i = (yy as u32 * src.w + xx as u32) as usize;
+                let a = blocks.px[i].to_f32s();
+                let b = src.px[i].to_f32s();
+                let pat = texture_pattern(texture_kind, src.x + xx, src.y + yy, scaling);
+                let emb = 1.0 + (pat - 0.5) * (relief / 50.0) * 0.7;
+                out.px[i] = Pixel16::from_f32s(
+                    (a.0 + (b.0 - a.0) * dk) * emb,
+                    (a.1 + (b.1 - a.1) * dk) * emb,
+                    (a.2 + (b.2 - a.2) * dk) * emb,
+                    a.3,
+                );
+            }
+        }
+        out
+    });
+}
+
+/// Artistic > Smudge Stick: short smearing strokes; the
+/// Highlight Area keeps bright passages crisp while the
+/// shadows smear.
+pub fn smudge_stick(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    length: f32,
+    highlight: f32,
+    intensity: f32,
+) {
+    rgb_filter(doc, layer, sel, |src| {
+        let bl = blur_region(src, length * 0.5 + 0.3);
+        let mut out = blank_like(src);
+        let t = 1.0 - highlight / 20.0;
+        for i in 0..src.px.len() {
+            let p = src.px[i].to_f32s();
+            let b = bl.px[i].to_f32s();
+            let l = luma(p);
+            let keep = if highlight <= 0.0 {
+                0.0
+            } else {
+                ((l - t) / (1.0 - t + 0.001)).clamp(0.0, 1.0) * 0.75
+            };
+            let k = (intensity / 10.0) * (1.0 - keep);
+            out.px[i] = Pixel16::from_f32s(
+                p.0 + (b.0 - p.0) * k,
+                p.1 + (b.1 - p.1) * k,
+                p.2 + (b.2 - p.2) * k,
+                p.3,
+            );
+        }
+        out
+    });
+}
+
+/// Artistic > Sponge: dabbed color — cell averages pushed
+/// around by a per-dab value jitter; Definition sets the
+/// dab contrast, Smoothness blends the dabs together.
+pub fn sponge(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    size: f32,
+    definition: f32,
+    smoothness: f32,
+    seed: u64,
+) {
+    rgb_filter(doc, layer, sel, |src| {
+        let cell = (size * 3.0).max(3.0) as i32;
+        let avg = cell_avg(src, cell, cell);
+        let mut out = blank_like(src);
+        let def = definition / 25.0;
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let i = (yy as u32 * src.w + xx as u32) as usize;
+                let p = src.px[i].to_f32s();
+                let a = avg.px[i].to_f32s();
+                let dab = 0.82 + hash_unit(seed, xx / cell, yy / cell, 95) * 0.36;
+                let m = (
+                    p.0 + (a.0 - p.0) * 0.55,
+                    p.1 + (a.1 - p.1) * 0.55,
+                    p.2 + (a.2 - p.2) * 0.55,
+                );
+                let j = 1.0 + (dab - 1.0) * (0.3 + def * 0.7);
+                out.px[i] = Pixel16::from_f32s(m.0 * j, m.1 * j, m.2 * j, p.3);
+            }
+        }
+        if smoothness > 1.0 {
+            let soft = blur_region(&out, smoothness * 0.15);
+            for i in 0..out.px.len() {
+                let a = out.px[i].to_f32s();
+                let b = soft.px[i].to_f32s();
+                out.px[i] = Pixel16::from_f32s(
+                    a.0 + (b.0 - a.0) * 0.4,
+                    a.1 + (b.1 - a.1) * 0.4,
+                    a.2 + (b.2 - a.2) * 0.4,
+                    a.3,
+                );
+            }
+        }
+        out
+    });
+}
+
+/// Artistic > Underpainting: broad blocky underpainting
+/// with a texture ground showing through — Coverage sets
+/// how strongly the ground asserts itself, Relief its
+/// emboss depth.
+#[allow(clippy::too_many_arguments)]
+pub fn underpainting(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    size: f32,
+    coverage: f32,
+    scaling: f32,
+    relief: f32,
+    texture_kind: u8,
+) {
+    rgb_filter(doc, layer, sel, |src| {
+        let cw = size.max(2.0) as i32;
+        let blocks = cell_avg(src, cw, cw);
+        let mut out = blank_like(src);
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let i = (yy as u32 * src.w + xx as u32) as usize;
+                let a = blocks.px[i].to_f32s();
+                let b = src.px[i].to_f32s();
+                let pat = texture_pattern(texture_kind, src.x + xx, src.y + yy, scaling);
+                let tex = (pat - 0.5) * (coverage / 40.0) * (relief / 50.0) * 1.2;
+                let base = (
+                    a.0 + (b.0 - a.0) * 0.15,
+                    a.1 + (b.1 - a.1) * 0.15,
+                    a.2 + (b.2 - a.2) * 0.15,
+                );
+                out.px[i] = Pixel16::from_f32s(
+                    base.0 * (1.0 + tex),
+                    base.1 * (1.0 + tex),
+                    base.2 * (1.0 + tex),
+                    a.3,
+                );
+            }
+        }
+        out
+    });
+}
+
+/// Artistic > Watercolor: soft washes (Detail sets how
+/// much structure survives), pigment pooling dark at the
+/// edges (Shadow Intensity), paper grain over the top.
+pub fn watercolor(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    detail: f32,
+    shadow: f32,
+    texture: f32,
+    seed: u64,
+) {
+    rgb_filter(doc, layer, sel, |src| {
+        let wash = blur_region(src, ((15.0 - detail) * 0.22 + 0.3).max(0.3));
+        let mut out = blank_like(src);
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let i = (yy as u32 * src.w + xx as u32) as usize;
+                let p = wash.px[i].to_f32s();
+                let e = grad_mag(src, xx, yy);
+                let pool = (e * shadow * 0.35).clamp(0.0, 0.65);
+                let l = luma(p);
+                let desat = |c: f32| l + (c - l) * 0.9;
+                let g = (hash_unit(seed, xx, yy, 66) - 0.5) * texture * 0.02;
+                out.px[i] = Pixel16::from_f32s(
+                    desat(p.0) * (1.0 - pool) + g,
+                    desat(p.1) * (1.0 - pool) + g,
+                    desat(p.2) * (1.0 - pool) + g,
+                    p.3,
+                );
+            }
+        }
+        out
+    });
+}
+
+// ----------------------------------------------------------------
+// Phase 6.5 Batch 1d: the Brush Strokes gallery.
+
+/// Brush Strokes > Accented Edges: edges are pushed bright
+/// or dark (Brightness above/below the midpoint decides),
+/// over a smoothed read of the image.
+pub fn accented_edges(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    width: f32,
+    brightness: f32,
+    smoothness: f32,
+) {
+    rgb_filter(doc, layer, sel, |src| {
+        let sm = blur_region(src, smoothness * 0.2 + 0.2);
+        let d = (width / 2.0).max(1.0) as i32;
+        let mut out = blank_like(src);
+        let accent = (brightness - 25.0) / 25.0;
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let i = (yy as u32 * src.w + xx as u32) as usize;
+                let p = src.px[i].to_f32s();
+                let gx = luma_at(&sm, xx + d, yy) - luma_at(&sm, xx - d, yy);
+                let gy = luma_at(&sm, xx, yy + d) - luma_at(&sm, xx, yy - d);
+                let e = (gx * gx + gy * gy).sqrt();
+                let delta = e * accent * 1.1;
+                out.px[i] = Pixel16::from_f32s(p.0 + delta, p.1 + delta, p.2 + delta, p.3);
+            }
+        }
+        out
+    });
+}
+
+/// Brush Strokes > Angled Strokes: a directional smear that
+/// follows the image's own gradient direction, biased
+/// toward a fixed diagonal by Direction Balance.
+pub fn angled_strokes(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    balance: f32,
+    length: f32,
+    sharpness: f32,
+    seed: u64,
+) {
+    rgb_filter(doc, layer, sel, |src| {
+        let mut out = blank_like(src);
+        let b = balance / 100.0;
+        let (fx, fy) = (
+            -std::f32::consts::FRAC_PI_4.cos(),
+            -std::f32::consts::FRAC_PI_4.sin(),
+        );
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let i = (yy as u32 * src.w + xx as u32) as usize;
+                let gx = luma_at(src, xx + 1, yy) - luma_at(src, xx - 1, yy);
+                let gy = luma_at(src, xx, yy + 1) - luma_at(src, xx, yy - 1);
+                let ang = gy.atan2(gx) + std::f32::consts::FRAC_PI_2;
+                let (mut vx, mut vy) = (ang.cos(), ang.sin());
+                vx = vx * (1.0 - b) + fx * b;
+                vy = vy * (1.0 - b) + fy * b;
+                let vl = (vx * vx + vy * vy).sqrt().max(0.001);
+                let (vx, vy) = (vx / vl, vy / vl);
+                let mut acc = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+                for k in -3..=3i32 {
+                    let off = k as f32 / 3.0 * length * 0.5;
+                    let j = (hash_unit(seed, xx, yy, 100 + (k + 3) as u64) - 0.5) * 1.5;
+                    let p = sample_bilinear(
+                        src,
+                        xx as f32 + vx * off - vy * j,
+                        yy as f32 + vy * off + vx * j,
+                    );
+                    acc.0 += p.0;
+                    acc.1 += p.1;
+                    acc.2 += p.2;
+                    acc.3 += p.3;
+                }
+                let base = (acc.0 / 7.0, acc.1 / 7.0, acc.2 / 7.0, acc.3 / 7.0);
+                let p = src.px[i].to_f32s();
+                let e = grad_mag(src, xx, yy).clamp(0.0, 1.0);
+                let kk = (sharpness / 10.0) * e * 0.6;
+                out.px[i] = Pixel16::from_f32s(
+                    base.0 + (p.0 - base.0) * kk,
+                    base.1 + (p.1 - base.1) * kk,
+                    base.2 + (p.2 - base.2) * kk,
+                    p.3,
+                );
+            }
+        }
+        out
+    });
+}
+
+/// Brush Strokes > Crosshatch: pencil hatching in up to
+/// three directions, each layer appearing only below its
+/// tonal threshold; Strength (1..=3) arms the layers.
+pub fn crosshatch(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    length: f32,
+    sharpness: f32,
+    strength: f32,
+) {
+    rgb_filter(doc, layer, sel, |src| {
+        let spacing = (length * 0.35).max(2.0);
+        let layers: [(f32, f32); 3] = [(0.785, 0.78), (-0.785, 0.55), (0.0, 0.34)];
+        let mut out = blank_like(src);
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let i = (yy as u32 * src.w + xx as u32) as usize;
+                let p = src.px[i].to_f32s();
+                let l = luma(p);
+                let mut m = 1.0f32;
+                for (li, (ang, th)) in layers.iter().enumerate() {
+                    let f = (strength - li as f32).clamp(0.0, 1.0);
+                    if f <= 0.0 || l >= *th {
+                        continue;
+                    }
+                    let proj = xx as f32 * ang.cos() + yy as f32 * ang.sin();
+                    let line = ((proj % spacing) + spacing) % spacing;
+                    if line < spacing * 0.38 {
+                        m *= 1.0 - 0.28 * f * ((th - l) / th + 0.3).min(1.0);
+                    }
+                }
+                let e = grad_mag(src, xx, yy).clamp(0.0, 1.0);
+                let kk = (sharpness / 10.0) * e * 0.4;
+                let dark = (p.0 * m, p.1 * m, p.2 * m);
+                out.px[i] = Pixel16::from_f32s(
+                    dark.0 + (p.0 - dark.0) * kk,
+                    dark.1 + (p.1 - dark.1) * kk,
+                    dark.2 + (p.2 - dark.2) * kk,
+                    p.3,
+                );
+            }
+        }
+        out
+    });
+}
+
+/// Brush Strokes > Dark Strokes: shadows are dragged into
+/// long dark strokes, highlights kept short and lifted.
+pub fn dark_strokes(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    balance: f32,
+    black: f32,
+    white: f32,
+) {
+    rgb_filter(doc, layer, sel, |src| {
+        let sm = blur_region(src, 1.5 + balance * 0.4);
+        let mut out = blank_like(src);
+        for i in 0..src.px.len() {
+            let p = src.px[i].to_f32s();
+            let b = sm.px[i].to_f32s();
+            let l = luma(p);
+            let darkw = ((balance / 10.0 + 0.25 - l) / 0.5).clamp(0.0, 1.0);
+            let mut m = (
+                p.0 + (b.0 - p.0) * darkw * 0.7,
+                p.1 + (b.1 - p.1) * darkw * 0.7,
+                p.2 + (b.2 - p.2) * darkw * 0.7,
+            );
+            let dk = 1.0 - darkw * (black / 10.0) * 0.45;
+            m.0 *= dk;
+            m.1 *= dk;
+            m.2 *= dk;
+            let whitew = ((l - 0.65) / 0.35).clamp(0.0, 1.0) * (white / 10.0) * 0.5;
+            out.px[i] = Pixel16::from_f32s(
+                m.0 + (1.0 - m.0) * whitew,
+                m.1 + (1.0 - m.1) * whitew,
+                m.2 + (1.0 - m.2) * whitew,
+                p.3,
+            );
+        }
+        out
+    });
+}
+
+/// Brush Strokes > Ink Outlines: flat areas lift toward
+/// paper white; every edge is inked dark, longer strokes
+/// reaching further from the contour.
+pub fn ink_outlines(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    length: f32,
+    dark: f32,
+    light: f32,
+) {
+    rgb_filter(doc, layer, sel, |src| {
+        let mut out = blank_like(src);
+        let paper = 1.0 + (light / 50.0) * 0.25;
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let i = (yy as u32 * src.w + xx as u32) as usize;
+                let p = src.px[i].to_f32s();
+                let e = grad_mag(src, xx, yy) * (0.5 + length / 25.0);
+                let ink = e.clamp(0.0, 1.0) * (dark / 50.0);
+                let k = paper * (1.0 - ink * 0.9);
+                out.px[i] = Pixel16::from_f32s(p.0 * k, p.1 * k, p.2 * k, p.3);
+            }
+        }
+        out
+    });
+}
+
+/// Brush Strokes > Spatter: the image sampled through a
+/// speckled screen — clumped noise displaces the read,
+/// Smoothness setting the clump size.
+pub fn spatter(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    radius: f32,
+    smoothness: f32,
+    seed: u64,
+) {
+    let sc = 1.5 + smoothness * 0.8;
+    rgb_filter(doc, layer, sel, |src| {
+        let mut out = blank_like(src);
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let dx = (noise2(seed, xx as f32 / sc, yy as f32 / sc, 101) - 0.5) * radius * 3.0;
+                let dy = (noise2(seed, xx as f32 / sc, yy as f32 / sc, 102) - 0.5) * radius * 3.0;
+                let p = sample_bilinear(src, xx as f32 + dx, yy as f32 + dy);
+                out.px[(yy as u32 * src.w + xx as u32) as usize] =
+                    Pixel16::from_f32s(p.0, p.1, p.2, p.3);
+            }
+        }
+        out
+    });
+}
+
+/// Brush Strokes > Sprayed Strokes: color sprayed along a
+/// diagonal — samples averaged along the stroke direction
+/// with a seeded spray jitter across it. Direction:
+/// 0 Right Diagonal, 1 Left Diagonal.
+pub fn sprayed_strokes(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    length: f32,
+    radius: f32,
+    direction: u8,
+    seed: u64,
+) {
+    let dir = if direction == 0 {
+        (
+            std::f32::consts::FRAC_1_SQRT_2,
+            std::f32::consts::FRAC_1_SQRT_2,
+        )
+    } else {
+        (
+            std::f32::consts::FRAC_1_SQRT_2,
+            -std::f32::consts::FRAC_1_SQRT_2,
+        )
+    };
+    rgb_filter(doc, layer, sel, |src| {
+        let mut out = blank_like(src);
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let mut acc = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+                for k in 0..7i32 {
+                    let t = (k as f32 / 6.0 - 0.5) * length;
+                    let jx = (hash_unit(seed, xx, yy, 110 + k as u64) - 0.5) * radius;
+                    let jy = (hash_unit(seed, xx, yy, 120 + k as u64) - 0.5) * radius;
+                    let p = sample_bilinear(
+                        src,
+                        xx as f32 + dir.0 * t + jx,
+                        yy as f32 + dir.1 * t + jy,
+                    );
+                    acc.0 += p.0;
+                    acc.1 += p.1;
+                    acc.2 += p.2;
+                    acc.3 += p.3;
+                }
+                out.px[(yy as u32 * src.w + xx as u32) as usize] =
+                    Pixel16::from_f32s(acc.0 / 7.0, acc.1 / 7.0, acc.2 / 7.0, acc.3 / 7.0);
+            }
+        }
+        out
+    });
+}
+
+/// Brush Strokes > Sumi-e: Japanese ink painting — tones
+/// quantized into a few ink bands (Contrast sets how few),
+/// edges inked by Stroke Pressure.
+pub fn sumi_e(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    width: f32,
+    pressure: f32,
+    contrast: f32,
+) {
+    rgb_filter(doc, layer, sel, |src| {
+        let sm = blur_region(src, width * 0.3 + 0.001);
+        let bands = (3.0 + (45.0 - contrast) / 9.0).max(2.0);
+        let mut out = blank_like(src);
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let i = (yy as u32 * src.w + xx as u32) as usize;
+                let p = sm.px[i].to_f32s();
+                let l = luma(p);
+                let ql = (l * (bands - 1.0)).round() / (bands - 1.0);
+                // Scale the color so its luma lands exactly on
+                // the ink band (hue survives; tone does not).
+                let base = if l > 0.001 {
+                    let sc = ql / l;
+                    (p.0 * sc, p.1 * sc, p.2 * sc)
+                } else {
+                    (ql, ql, ql)
+                };
+                let e = grad_mag(src, xx, yy);
+                let ink = (e * pressure * 0.3).clamp(0.0, 0.85);
+                out.px[i] = Pixel16::from_f32s(
+                    base.0 * (1.0 - ink),
+                    base.1 * (1.0 - ink),
+                    base.2 * (1.0 - ink),
+                    p.3,
+                );
+            }
+        }
+        out
+    });
+}
+
+// ----------------------------------------------------------------
+// Phase 6.5 Batch 1e: the Sketch and Texture galleries.
+// Sketch filters draw in the foreground/background colors
+// (ink and paper), as the originals do.
+
+/// Ink-and-paper mix: v = 1 is paper (bg), v = 0 is ink (fg).
+fn paper_mix(fg: (f32, f32, f32), bg: (f32, f32, f32), v: f32) -> (f32, f32, f32) {
+    (
+        fg.0 + (bg.0 - fg.0) * v,
+        fg.1 + (bg.1 - fg.1) * v,
+        fg.2 + (bg.2 - fg.2) * v,
+    )
+}
+
+fn smoothstep(a: f32, b: f32, x: f32) -> f32 {
+    let t = ((x - a) / (b - a)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Sketch > Chalk & Charcoal: shadows fill with hatched
+/// charcoal (foreground), highlights with chalk
+/// (background), midtones rest on gray paper.
+#[allow(clippy::too_many_arguments)]
+pub fn chalk_charcoal(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    charcoal_area: f32,
+    chalk_area: f32,
+    pressure: f32,
+    fg: Pixel16,
+    bg: Pixel16,
+    seed: u64,
+) {
+    let (fg, bg) = (fg.to_f32s(), bg.to_f32s());
+    let (fg3, bg3) = ((fg.0, fg.1, fg.2), (bg.0, bg.1, bg.2));
+    rgb_filter(doc, layer, sel, |src| {
+        let mut out = blank_like(src);
+        let ct = (charcoal_area / 50.0) * 0.65;
+        let ht = 1.0 - (chalk_area / 50.0) * 0.65;
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let i = (yy as u32 * src.w + xx as u32) as usize;
+                let p = src.px[i].to_f32s();
+                let l = luma(p);
+                let stroke = noise2(seed, xx as f32 * 0.3, yy as f32 * 0.05, 131) * 0.6
+                    + noise2(seed, xx as f32 * 0.05, yy as f32 * 0.3, 132) * 0.4;
+                let paper = paper_mix(fg3, bg3, 0.5 + (l - 0.5) * 0.3);
+                let ink = ((ct - l) / ct.max(0.01)).clamp(0.0, 1.0);
+                let chalk = ((l - ht) / (1.0 - ht).max(0.01)).clamp(0.0, 1.0);
+                let fs = (
+                    fg.0 * (0.8 + 0.2 * stroke * (pressure / 2.5)),
+                    fg.1 * (0.8 + 0.2 * stroke * (pressure / 2.5)),
+                    fg.2 * (0.8 + 0.2 * stroke * (pressure / 2.5)),
+                );
+                let mut c = paper;
+                c.0 += (fs.0 - c.0) * ink;
+                c.1 += (fs.1 - c.1) * ink;
+                c.2 += (fs.2 - c.2) * ink;
+                c.0 += (bg.0 - c.0) * chalk;
+                c.1 += (bg.1 - c.1) * chalk;
+                c.2 += (bg.2 - c.2) * chalk;
+                out.px[i] = Pixel16::from_f32s(c.0, c.1, c.2, p.3);
+            }
+        }
+        out
+    });
+}
+
+/// Sketch > Charcoal: a grayscale charcoal drawing — soft
+/// tones, edges dragged into thick dark strokes.
+pub fn charcoal_fx(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    thickness: f32,
+    detail: f32,
+    balance: f32,
+) {
+    rgb_filter(doc, layer, sel, |src| {
+        let sm = blur_region(src, ((10.0 - detail) * 0.3 + 0.2).max(0.2));
+        let mut out = blank_like(src);
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let i = (yy as u32 * src.w + xx as u32) as usize;
+                let l = luma(sm.px[i].to_f32s());
+                let v = ((l + (50.0 - balance) / 200.0 - 0.125) * (1.0 + detail * 0.12))
+                    .clamp(0.0, 1.0);
+                let e = grad_mag(src, xx, yy);
+                let stroke = (e * thickness * 0.5).clamp(0.0, 0.8);
+                let g = v * (1.0 - stroke);
+                out.px[i] = Pixel16::from_f32s(g, g, g, src.px[i].to_f32s().3);
+            }
+        }
+        out
+    });
+}
+
+/// Sketch > Chrome: liquid metal — the luma height field is
+/// shaded through a repeating specular band.
+pub fn chrome(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    detail: f32,
+    smoothness: f32,
+) {
+    rgb_filter(doc, layer, sel, |src| {
+        let h = blur_region(src, ((10.0 - smoothness) * 0.5 + 0.3).max(0.3));
+        let mut out = blank_like(src);
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let i = (yy as u32 * src.w + xx as u32) as usize;
+                let l = luma(h.px[i].to_f32s());
+                let e = grad_mag(&h, xx, yy);
+                let ph = l * (2.0 + detail) + e * 1.2;
+                let fr = ph.fract();
+                let tri = 1.0 - (2.0 * fr - 1.0).abs();
+                let band = tri.powf(1.2);
+                let v = band + (l - band) * (smoothness / 10.0) * 0.3;
+                out.px[i] = Pixel16::from_f32s(v, v, v, src.px[i].to_f32s().3);
+            }
+        }
+        out
+    });
+}
+
+/// Sketch > Conte Crayon: the image redrawn in two crayon
+/// colors over a textured ground.
+#[allow(clippy::too_many_arguments)]
+pub fn conte_crayon(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    fg_level: f32,
+    bg_level: f32,
+    scaling: f32,
+    relief: f32,
+    texture_kind: u8,
+    fg: Pixel16,
+    bg: Pixel16,
+) {
+    let (fg, bg) = (fg.to_f32s(), bg.to_f32s());
+    let (fg3, bg3) = ((fg.0, fg.1, fg.2), (bg.0, bg.1, bg.2));
+    rgb_filter(doc, layer, sel, |src| {
+        let mut out = blank_like(src);
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let i = (yy as u32 * src.w + xx as u32) as usize;
+                let p = src.px[i].to_f32s();
+                let l = luma(p);
+                let v = l.powf(1.0 + (fg_level - bg_level) / 150.0).clamp(0.0, 1.0);
+                let pat = texture_pattern(texture_kind, src.x + xx, src.y + yy, scaling);
+                let emb = 1.0 + (pat - 0.5) * (relief / 50.0) * 0.8;
+                let c = paper_mix(fg3, bg3, v);
+                out.px[i] = Pixel16::from_f32s(c.0 * emb, c.1 * emb, c.2 * emb, p.3);
+            }
+        }
+        out
+    });
+}
+
+/// Sketch > Graphic Pen: black-and-white pen hatching —
+/// line density follows the tone. Direction: 0 Right
+/// Diagonal, 1 Left Diagonal, 2 Vertical, 3 Horizontal.
+#[allow(clippy::too_many_arguments)]
+pub fn graphic_pen(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    length: f32,
+    balance: f32,
+    direction: u8,
+    fg: Pixel16,
+    bg: Pixel16,
+) {
+    let (fg, bg) = (fg.to_f32s(), bg.to_f32s());
+    let (fg3, bg3) = ((fg.0, fg.1, fg.2), (bg.0, bg.1, bg.2));
+    rgb_filter(doc, layer, sel, |src| {
+        let sm = blur_region(src, 0.8);
+        let spacing = (length * 0.3).max(1.5);
+        let mut out = blank_like(src);
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let i = (yy as u32 * src.w + xx as u32) as usize;
+                let l = luma(sm.px[i].to_f32s());
+                let proj = match direction {
+                    0 => (xx + yy) as f32 * std::f32::consts::FRAC_1_SQRT_2,
+                    1 => (xx - yy) as f32 * std::f32::consts::FRAC_1_SQRT_2,
+                    2 => xx as f32,
+                    _ => yy as f32,
+                };
+                let density = (1.0 - l) * (0.35 + balance / 100.0);
+                let line = ((proj % spacing) + spacing) % spacing / spacing;
+                let ink = 1.0 - smoothstep(density - 0.06, density + 0.06, line);
+                let c = paper_mix(fg3, bg3, 1.0 - ink);
+                out.px[i] = Pixel16::from_f32s(c.0, c.1, c.2, src.px[i].to_f32s().3);
+            }
+        }
+        out
+    });
+}
+
+/// Sketch > Halftone Pattern: a press screen — Circle,
+/// Dot (square) or Line patterns thresholded by the local
+/// tone.
+pub fn halftone_pattern(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    size: f32,
+    contrast: f32,
+    kind: u8,
+) {
+    rgb_filter(doc, layer, sel, |src| {
+        let cell = size + 2.0;
+        let tone = blur_region(src, cell * 0.5);
+        let mut out = blank_like(src);
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let i = (yy as u32 * src.w + xx as u32) as usize;
+                let mut t = luma(tone.px[i].to_f32s());
+                t = ((t - 0.5) * (1.0 + contrast / 50.0) + 0.5).clamp(0.0, 1.0);
+                let cx = ((xx as f32 % cell) / cell) - 0.5;
+                let cy = ((yy as f32 % cell) / cell) - 0.5;
+                let ink = match kind {
+                    0 => (cx * cx + cy * cy).sqrt() * 1.414 < (1.0 - t) * 1.05,
+                    1 => cx.abs().max(cy.abs()) * 2.0 < (1.0 - t) * 1.15,
+                    _ => cy + 0.5 < 1.0 - t,
+                };
+                let v = if ink { 0.0 } else { 1.0 };
+                out.px[i] = Pixel16::from_f32s(v, v, v, src.px[i].to_f32s().3);
+            }
+        }
+        out
+    });
+}
+
+/// Sketch > Note Paper: the image embossed into textured
+/// paper — darks stay as image, lights rise into grainy
+/// paper.
+pub fn note_paper(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    balance: f32,
+    graininess: f32,
+    relief: f32,
+    seed: u64,
+) {
+    rgb_filter(doc, layer, sel, |src| {
+        let sm = blur_region(src, 1.0);
+        let mut out = blank_like(src);
+        let mid = balance / 50.0;
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let i = (yy as u32 * src.w + xx as u32) as usize;
+                let l = luma(sm.px[i].to_f32s());
+                let raised = smoothstep(mid - 0.15, mid + 0.15, l);
+                let emb =
+                    (luma_at(&sm, xx - 1, yy - 1) - luma_at(&sm, xx + 1, yy + 1)) * relief * 0.15;
+                let grain = (hash_unit(seed, xx, yy, 161) - 0.5) * graininess * 0.03;
+                let v = l * (1.0 - raised) + (0.93 + emb + grain) * raised;
+                out.px[i] = Pixel16::from_f32s(v, v, v, src.px[i].to_f32s().3);
+            }
+        }
+        out
+    });
+}
+
+/// Sketch > Photocopy: a tired office copy — near-binary
+/// tones, speckle dirt in the whites.
+pub fn photocopy(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    detail: f32,
+    darkness: f32,
+    seed: u64,
+) {
+    rgb_filter(doc, layer, sel, |src| {
+        let lb = blur_region(src, ((25.0 - detail) * 0.12 + 0.2).max(0.2));
+        let mut out = blank_like(src);
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let i = (yy as u32 * src.w + xx as u32) as usize;
+                let l = luma(lb.px[i].to_f32s());
+                let mut v = smoothstep(0.32, 0.68, l);
+                if v > 0.9 && hash_unit(seed, xx, yy, 171) > 0.997 {
+                    v = 0.4; // copier dirt
+                }
+                let g = v * (1.05 - darkness / 50.0 * 0.55);
+                out.px[i] = Pixel16::from_f32s(g, g, g, src.px[i].to_f32s().3);
+            }
+        }
+        out
+    });
+}
+
+/// Sketch > Plaster: the image cast in plaster — tones wash
+/// toward plaster white and the relief shading of a chosen
+/// light direction does the drawing. Light: 0 Top,
+/// 1 Bottom, 2 Left, 3 Right.
+pub fn plaster(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    balance: f32,
+    smoothness: f32,
+    light_dir: u8,
+) {
+    rgb_filter(doc, layer, sel, |src| {
+        let sm = blur_region(src, (smoothness * 0.35).max(0.3));
+        let lv: (f32, f32) = match light_dir {
+            0 => (0.0, -1.0),
+            1 => (0.0, 1.0),
+            2 => (-1.0, 0.0),
+            _ => (1.0, 0.0),
+        };
+        let mut out = blank_like(src);
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let i = (yy as u32 * src.w + xx as u32) as usize;
+                let l = luma(sm.px[i].to_f32s());
+                let gx = luma_at(&sm, xx + 1, yy) - luma_at(&sm, xx - 1, yy);
+                let gy = luma_at(&sm, xx, yy + 1) - luma_at(&sm, xx, yy - 1);
+                let shade = (gx * lv.0 + gy * lv.1) * 2.2;
+                let base = l + (0.88 - l) * (balance / 50.0) * 0.7;
+                let v = (base + shade * (0.4 + balance / 50.0 * 0.4)).clamp(0.0, 1.0);
+                out.px[i] = Pixel16::from_f32s(v, v, v, src.px[i].to_f32s().3);
+            }
+        }
+        out
+    });
+}
+
+/// Sketch > Reticulation: heat-wrinkled emulsion — tones
+/// displaced through a coarse cellular field, crack lines
+/// darkened, levels pulled toward the ink/paper poles.
+#[allow(clippy::too_many_arguments)]
+pub fn reticulation(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    density: f32,
+    fg_level: f32,
+    bg_level: f32,
+    fg: Pixel16,
+    bg: Pixel16,
+    seed: u64,
+) {
+    let (fg, bg) = (fg.to_f32s(), bg.to_f32s());
+    let (fg3, bg3) = ((fg.0, fg.1, fg.2), (bg.0, bg.1, bg.2));
+    rgb_filter(doc, layer, sel, |src| {
+        let mut out = blank_like(src);
+        let sc = 0.05 * (0.5 + density / 25.0);
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let i = (yy as u32 * src.w + xx as u32) as usize;
+                let dx = (noise2(seed, xx as f32 * sc, yy as f32 * sc, 141) - 0.5) * 14.0;
+                let dy = (noise2(seed, xx as f32 * sc, yy as f32 * sc, 142) - 0.5) * 14.0;
+                let p = sample_bilinear(src, xx as f32 + dx, yy as f32 + dy);
+                let l = luma(p);
+                let v =
+                    (l * (1.0 + fg_level / 100.0 * 0.3) - bg_level / 100.0 * 0.15).clamp(0.0, 1.0);
+                let n = noise2(seed, xx as f32 * sc * 1.7, yy as f32 * sc * 1.7, 143);
+                let ridge = 1.0 - (2.0 * n - 1.0).abs();
+                let crack = smoothstep(0.92, 1.0, ridge) * (density / 50.0) * 0.5;
+                let c = paper_mix(fg3, bg3, v);
+                let k = 1.0 - crack;
+                out.px[i] = Pixel16::from_f32s(c.0 * k, c.1 * k, c.2 * k, p.3);
+            }
+        }
+        out
+    });
+}
+
+/// Sketch > Torn Edges: black and white with a torn-paper
+/// boundary — the threshold itself is ragged with noise.
+#[allow(clippy::too_many_arguments)]
+pub fn torn_edges(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    balance: f32,
+    smoothness: f32,
+    contrast: f32,
+    fg: Pixel16,
+    bg: Pixel16,
+    seed: u64,
+) {
+    let (fg, bg) = (fg.to_f32s(), bg.to_f32s());
+    let (fg3, bg3) = ((fg.0, fg.1, fg.2), (bg.0, bg.1, bg.2));
+    rgb_filter(doc, layer, sel, |src| {
+        let sm = blur_region(src, (smoothness * 0.3).max(0.3));
+        let mut out = blank_like(src);
+        let sharp = 0.02 + (25.0 - contrast) * 0.004;
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let i = (yy as u32 * src.w + xx as u32) as usize;
+                let l = luma(sm.px[i].to_f32s());
+                let rag = (noise2(seed, xx as f32 * 0.05, yy as f32 * 0.05, 151) - 0.5) * 0.3;
+                let thr = balance / 50.0 + rag;
+                let v = smoothstep(thr - sharp, thr + sharp, l);
+                let c = paper_mix(fg3, bg3, v);
+                out.px[i] = Pixel16::from_f32s(c.0, c.1, c.2, src.px[i].to_f32s().3);
+            }
+        }
+        out
+    });
+}
+
+/// Sketch > Water Paper: fibrous horizontal streaks soften
+/// the image onto tinted paper.
+#[allow(clippy::too_many_arguments)]
+pub fn water_paper(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    fiber: f32,
+    brightness: f32,
+    contrast: f32,
+    fg: Pixel16,
+    bg: Pixel16,
+    seed: u64,
+) {
+    let (fg, bg) = (fg.to_f32s(), bg.to_f32s());
+    let (fg3, bg3) = ((fg.0, fg.1, fg.2), (bg.0, bg.1, bg.2));
+    rgb_filter(doc, layer, sel, |src| {
+        let mut out = blank_like(src);
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let i = (yy as u32 * src.w + xx as u32) as usize;
+                let mut acc = 0.0f32;
+                for k in -2..=2i32 {
+                    let jx = k as f32 * fiber * 0.3;
+                    let jy = (hash_unit(seed, xx, yy, 180 + (k + 2) as u64) - 0.5) * 2.0;
+                    acc += luma(sample_bilinear(src, xx as f32 + jx, yy as f32 + jy));
+                }
+                let l = acc / 5.0;
+                let v = ((l - 0.5) * (0.4 + contrast / 100.0 * 1.2)
+                    + 0.5
+                    + (brightness - 55.0) / 100.0 * 0.4)
+                    .clamp(0.0, 1.0);
+                let c = paper_mix(fg3, bg3, v);
+                let g = (v, v, v);
+                out.px[i] = Pixel16::from_f32s(
+                    g.0 + (c.0 - g.0) * 0.35,
+                    g.1 + (c.1 - g.1) * 0.35,
+                    g.2 + (c.2 - g.2) * 0.35,
+                    src.px[i].to_f32s().3,
+                );
+            }
+        }
+        out
+    });
+}
+
+/// Texture > Craquelure: a crackle network over the image —
+/// Voronoi cell borders crack; Depth sets their strength,
+/// Brightness whether they read dark or light.
+pub fn craquelure(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    spacing: f32,
+    depth: f32,
+    brightness: f32,
+    seed: u64,
+) {
+    rgb_filter(doc, layer, sel, |src| {
+        let cs = spacing.max(3.0);
+        let center = |gx: i32, gy: i32| -> (f32, f32) {
+            (
+                gx as f32 * cs + cs * 0.5 + (hash_unit(seed, gx, gy, 191) - 0.5) * cs * 0.6,
+                gy as f32 * cs + cs * 0.5 + (hash_unit(seed, gx, gy, 192) - 0.5) * cs * 0.6,
+            )
+        };
+        let mut out = blank_like(src);
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let i = (yy as u32 * src.w + xx as u32) as usize;
+                let p = src.px[i].to_f32s();
+                let (gx, gy) = (
+                    (xx as f32 / cs).floor() as i32,
+                    (yy as f32 / cs).floor() as i32,
+                );
+                let (mut f1, mut f2) = (f32::MAX, f32::MAX);
+                for cy in (gy - 1)..=(gy + 1) {
+                    for cx in (gx - 1)..=(gx + 1) {
+                        let (px, py) = center(cx, cy);
+                        let d = ((xx as f32 - px).powi(2) + (yy as f32 - py).powi(2)).sqrt();
+                        if d < f1 {
+                            f2 = f1;
+                            f1 = d;
+                        } else if d < f2 {
+                            f2 = d;
+                        }
+                    }
+                }
+                let crack = 1.0 - ((f2 - f1) / (cs * 0.14)).clamp(0.0, 1.0);
+                let delta = crack * (depth / 10.0) * ((brightness - 5.0) / 5.0) * 0.5;
+                out.px[i] = Pixel16::from_f32s(p.0 + delta, p.1 + delta, p.2 + delta, p.3);
+            }
+        }
+        out
+    });
+}
+
+/// Texture > Grain: luma grain in ten era flavors (kind
+/// cycles): 0 Regular, 1 Soft, 2 Sprinkles, 3 Clumped,
+/// 4 Contrasty, 5 Enlarged, 6 Stippled, 7 Horizontal,
+/// 8 Vertical, 9 Speckle.
+pub fn grain_fx(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    intensity: f32,
+    contrast: f32,
+    kind: u8,
+    seed: u64,
+) {
+    rgb_filter(doc, layer, sel, |src| {
+        let mut out = blank_like(src);
+        let amp = intensity / 100.0 * 0.5;
+        let shape = 0.5 + contrast / 100.0;
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let i = (yy as u32 * src.w + xx as u32) as usize;
+                let p = src.px[i].to_f32s();
+                let n = match kind {
+                    0 => hash_unit(seed, xx, yy, 201),
+                    1 => noise2(seed, xx as f32 * 0.5, yy as f32 * 0.5, 202),
+                    2 => {
+                        let h = hash_unit(seed, xx, yy, 203);
+                        if h > 0.97 {
+                            1.0
+                        } else if h < 0.03 {
+                            0.0
+                        } else {
+                            0.5
+                        }
+                    }
+                    3 => noise2(seed, xx as f32 * 0.08, yy as f32 * 0.08, 204),
+                    4 => {
+                        if hash_unit(seed, xx, yy, 205) > 0.5 {
+                            1.0
+                        } else {
+                            0.0
+                        }
+                    }
+                    5 => hash_unit(seed, xx / 4, yy / 4, 206),
+                    6 => {
+                        if xx % 3 == 0 && yy % 3 == 0 {
+                            hash_unit(seed, xx, yy, 207)
+                        } else {
+                            0.5
+                        }
+                    }
+                    7 => hash_unit(seed, 0, yy, 208),
+                    8 => hash_unit(seed, xx, 0, 209),
+                    _ => {
+                        let h = hash_unit(seed, xx, yy, 210);
+                        if h > 0.995 {
+                            1.0
+                        } else if h < 0.005 {
+                            0.0
+                        } else {
+                            0.5
+                        }
+                    }
+                };
+                let g = (n - 0.5) * shape * amp * 2.0;
+                out.px[i] = Pixel16::from_f32s(p.0 + g, p.1 + g, p.2 + g, p.3);
+            }
+        }
+        out
+    });
+}
+
+/// Texture > Mosaic Tiles: block tiles with a slight
+/// per-tile value jitter and grout lines between them.
+pub fn mosaic_tiles(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    size: f32,
+    grout: f32,
+    lighten: f32,
+    seed: u64,
+) {
+    rgb_filter(doc, layer, sel, |src| {
+        let ts = size.max(2.0) as i32;
+        let blocks = cell_avg(src, ts, ts);
+        let mut out = blank_like(src);
+        let gw = grout.max(1.0) as i32;
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let i = (yy as u32 * src.w + xx as u32) as usize;
+                let a = blocks.px[i].to_f32s();
+                let j = 0.94 + hash_unit(seed, xx / ts, yy / ts, 221) * 0.12;
+                let is_grout = (xx % ts) < gw || (yy % ts) < gw;
+                let m = if is_grout {
+                    0.55 + lighten / 10.0 * 0.5
+                } else {
+                    j
+                };
+                out.px[i] = Pixel16::from_f32s(a.0 * m, a.1 * m, a.2 * m, a.3);
+            }
+        }
+        out
+    });
+}
+
+/// Texture > Stained Glass: Voronoi cells of averaged
+/// color, lead-came borders between them, and light falling
+/// off from each cell's heart.
+pub fn stained_glass(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    size: f32,
+    border: f32,
+    light: f32,
+    seed: u64,
+) {
+    rgb_filter(doc, layer, sel, |src| {
+        let cs = size.max(3.0) as i32;
+        let center = |gx: i32, gy: i32| -> (f32, f32) {
+            (
+                gx as f32 * cs as f32
+                    + cs as f32 * 0.5
+                    + (hash_unit(seed, gx, gy, 231) - 0.5) * cs as f32 * 0.5,
+                gy as f32 * cs as f32
+                    + cs as f32 * 0.5
+                    + (hash_unit(seed, gx, gy, 232) - 0.5) * cs as f32 * 0.5,
+            )
+        };
+        let cell_of = |x: i32, y: i32| -> (i32, i32) {
+            let (gx, gy) = (x.div_euclid(cs), y.div_euclid(cs));
+            let mut best = (gx, gy);
+            let mut bd = f32::MAX;
+            for cy in (gy - 1)..=(gy + 1) {
+                for cx in (gx - 1)..=(gx + 1) {
+                    let (px, py) = center(cx, cy);
+                    let d = (x as f32 - px).powi(2) + (y as f32 - py).powi(2);
+                    if d < bd {
+                        bd = d;
+                        best = (cx, cy);
+                    }
+                }
+            }
+            best
+        };
+        let mut sums: CellSums = std::collections::HashMap::new();
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let p = src.at(xx, yy).to_f32s();
+                let e = sums.entry(cell_of(xx, yy)).or_default();
+                e.0 += p.0;
+                e.1 += p.1;
+                e.2 += p.2;
+                e.3 += p.3;
+                e.4 += 1;
+            }
+        }
+        let bw = border.max(1.0);
+        let mut out = blank_like(src);
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let i = (yy as u32 * src.w + xx as u32) as usize;
+                let cell = cell_of(xx, yy);
+                let s = sums[&cell];
+                let n = s.4 as f32;
+                let mut m = (s.0 / n, s.1 / n, s.2 / n, s.3 / n);
+                // Light falls off from the cell's heart.
+                let (cx, cy) = center(cell.0, cell.1);
+                let d = ((xx as f32 - cx).powi(2) + (yy as f32 - cy).powi(2)).sqrt();
+                let fall = 1.0 + (1.0 - (d / (cs as f32 * 0.9)).min(1.0)) * (light / 10.0) * 0.5;
+                m.0 *= fall;
+                m.1 *= fall;
+                m.2 *= fall;
+                // Lead came: a pixel whose neighbours belong
+                // to another cell sits on the border.
+                let near_border = cell_of(xx + bw as i32, yy) != cell
+                    || cell_of(xx - bw as i32, yy) != cell
+                    || cell_of(xx, yy + bw as i32) != cell
+                    || cell_of(xx, yy - bw as i32) != cell;
+                if near_border {
+                    m.0 *= 0.25;
+                    m.1 *= 0.25;
+                    m.2 *= 0.25;
+                }
+                out.px[i] = Pixel16::from_f32s(m.0, m.1, m.2, m.3);
+            }
+        }
+        out
+    });
+}
+
+/// Texture > Texturizer: the era texture-ground emboss as
+/// a standalone filter — brightness relief from one of the
+/// four procedural grounds under a chosen light.
+#[allow(clippy::too_many_arguments)]
+pub fn texturizer(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    scaling: f32,
+    relief: f32,
+    texture_kind: u8,
+    light_dir: u8,
+) {
+    rgb_filter(doc, layer, sel, |src| {
+        let mut out = blank_like(src);
+        let pat = |x: i32, y: i32| texture_pattern(texture_kind, src.x + x, src.y + y, scaling);
+        for yy in 0..src.h as i32 {
+            for xx in 0..src.w as i32 {
+                let i = (yy as u32 * src.w + xx as u32) as usize;
+                let p = src.px[i].to_f32s();
+                let (gx, gy) = match light_dir {
+                    0 => (0.0, pat(xx, yy - 1) - pat(xx, yy + 1)),
+                    1 => (0.0, pat(xx, yy + 1) - pat(xx, yy - 1)),
+                    2 => (pat(xx - 1, yy) - pat(xx + 1, yy), 0.0),
+                    _ => (pat(xx + 1, yy) - pat(xx - 1, yy), 0.0),
+                };
+                let emb = 1.0 + (gx + gy) * (relief / 50.0) * 1.4;
+                out.px[i] = Pixel16::from_f32s(p.0 * emb, p.1 * emb, p.2 * emb, p.3);
+            }
+        }
+        out
+    });
 }
 
 #[cfg(test)]

@@ -292,3 +292,126 @@ and Color. The dock resizes the canvas; rulers stop at the dock edge.
 Painting with an alpha channel targeted routes brush, pencil,
 eraser, bucket, fill, and clear into that channel's buffer, undoable
 as a whole-document command.
+
+## Phase 6 additions (v0.6.0)
+
+- `effects.rs` grows to the full ten-effect style set: Satin,
+  Color Overlay, Gradient Overlay, Pattern Overlay and Stroke
+  join the original five. Shadows, glows and Bevel carry a
+  `contour` curve (Linear / Cone / Ring / Cove) applied to the
+  falloff, and Bevel carries an optional procedural texture
+  (checker / dots / diagonal lines). Pattern overlays and
+  bevel textures sample the same procedural pattern set.
+- `shapes.rs`: vector shape layers (rectangle, rounded
+  rectangle, ellipse, polygon/star, line, custom) and fill
+  layers (solid, gradient, pattern) are point-sampled at pixel
+  centers by the compositor — the spec stays editable until
+  rasterized. In CMYK documents shape/fill layers fall back to
+  their stored pixels (v1).
+- Advanced blending lives in the compositor: Fill Opacity
+  scales content but not below-effects; Blend If applies hard
+  edges (no split-slider feather); clipping groups clip to the
+  nearest non-clipped visible layer below; Knockout punches
+  to the backdrop (Shallow is treated as Deep in v1);
+  per-channel blend masks restore un-blended channels after
+  compositing. Layer sets are one level deep: set opacity and
+  visibility multiply/hide members; a set's blend mode is
+  stored, with Pass Through honored.
+- `liquify.rs`: a document-sized displacement field with
+  brush stamps (warp, twirl both ways, pucker, bloat, shift,
+  reflection) honoring a frozen mask, four reconstruct modes,
+  and a bilinear bake into the layer.
+- `warp.rs`: the fifteen classic Warp Text styles as a
+  region warp; zero bend is an exact identity for every style.
+- `transform.rs::perspective_crop`: warps the document so a
+  user quad becomes the new rectangular canvas (RGB/grayscale
+  documents; CMYK is refused rather than warped wrong).
+- The `.pdk` extension block appends a Phase 6 section: the
+  new effects, fill opacity, Blend If, knockout, channel
+  mask, group/clipping/locks/color, shape and fill specs,
+  text box/warp fields, layer sets, notes, slices, custom
+  shapes and the global light altitude. Older files load with
+  Phase 6 defaults.
+- Droplets are a shell script + a `.steps` file written next
+  to the document; running the app with `--droplet-run`
+  applies the serialized steps to each image argument and
+  writes `<name>-edited.png`. Only droplet-safe steps
+  serialize; the rest are counted and reported at creation.
+
+## Phase 6.1 additions (v0.6.1)
+
+The full-behavior pass over the Phase 6 surface:
+
+- The compositor's three render loops share one set-group
+  state machine. A layer set with its own blend mode renders
+  its members into an isolated group buffer that is flushed
+  over the backdrop with the set's mode and opacity; a
+  Pass Through set blends its members directly, scaled by
+  the set opacity.
+- Blend If gains split-slider feathering: each of the four
+  thresholds carries a split width (`blend_if_split`,
+  persisted as a trailing `.pdk` block) and the visibility
+  factor ramps linearly across it instead of stepping.
+- Knockout Shallow now stops at the group base (the backdrop
+  accumulated just above the bottom rendered layer, or the
+  empty group buffer inside a set); Deep still punches to
+  transparency.
+- Mask Hides Effects multiplies the below-effects buffer by
+  the layer's mask factor; Transparency Shapes off forces
+  content alpha to 1 inside the layer's painted bounds;
+  Blend Clipped Layers as Group makes clipped layers blend
+  with their base layer's mode. Blend Interior Effects as
+  Group describes the pipeline's standing behavior (interior
+  effects are composited as a group) and defaults on.
+- CMYK documents evaluate shape and fill layers in ink
+  space, and Perspective Crop accepts CMYK documents,
+  resampling all five channels.
+- The brush engine enforces the transparent-pixels lock:
+  paint recolors only pixels that already carry alpha and
+  never changes their alpha; erasers are inert on a
+  transparent-locked layer.
+- Save for Web gains Weighted Optimization
+  (`io::export_weighted_jpeg`): the document is encoded at
+  a high and a low JPEG quality, the two are composited per
+  pixel by a weight map (the first alpha channel), and the
+  composite is re-encoded at the high quality.
+- Notes carry optional audio: a voice annotation stored as
+  WAV bytes (16-bit mono PCM) in a trailing `.pdk` block,
+  recorded and played back in the app through the system
+  audio devices (cpal). Older files load with no audio.
+- The Liquify preview samples the source through the
+  displacement field, so the preview shows the warp as it
+  will bake; the Layers panel renders a folder header row
+  above each run of set members.
+
+## Phase 6.5 additions (v0.6.5)
+
+- The filter gallery is complete for the classic era: 99
+  filters, all parameter dialogs riding one generic
+  preview/commit flow, all recordable as action steps.
+- All eight color modes are real document modes: RGB, CMYK,
+  Grayscale, Lab (CIE D50), Indexed (with color table
+  editing), Bitmap (threshold / pattern / diffusion),
+  Duotone (1–4 inks with curve presets), and Multichannel
+  (separation planes painted directly). Conversions flatten
+  first, as the classic editor did.
+- Channel arithmetic: Apply Image and Calculations composite
+  any document plane (composite, channel, layer, alpha)
+  into the active layer with blend modes, scaling/offset
+  arithmetic, optional masks and per-channel targets; Split
+  and Merge Channels round-trip through grayscale documents.
+- Actions are durable: sets and actions persist between
+  sessions in `~/.pictodesk/actions.txt`, every step kind
+  serializes to one text line (shared with droplets and
+  adjustment-settings files), playback can pause at an
+  inserted Stop and can call any menu command through an
+  inserted Menu Item step, and the panel has a Button Mode.
+- Libraries: the swatch palette and brush preset grid are
+  app state, saved and loaded as `.ACO` swatch files and a
+  compact brush-preset file; adjustment dialogs save and
+  load their settings through the same step-line format.
+- Formats and tail: PCX and Targa export, arbitrary-angle
+  canvas rotation, Fade after any filter, File Info (IPTC)
+  fields stored in the document, Paths exported as an
+  Illustrator-style EPS text file, the Options Bar, and
+  full-screen display modes.

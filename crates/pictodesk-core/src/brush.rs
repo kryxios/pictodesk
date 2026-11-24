@@ -16,12 +16,26 @@ use crate::document::{ColorMode, Document};
 use crate::pixel::Pixel16;
 use crate::selection::Selection;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct BrushTip {
     /// Diameter in pixels.
     pub size: f32,
     /// 0.0 = fully feathered edge, 1.0 = hard edge.
     pub hardness: f32,
+    /// Sampled mask from Define Brush (Phase 6.5): when
+    /// present, the Brush/Pencil/Eraser stamps follow the
+    /// mask instead of the round falloff.
+    pub mask: Option<BrushMask>,
+}
+
+/// A sampled brush mask: grayscale coverage, row-major,
+/// values 0.0..=1.0 (Define Brush captures the selection's
+/// luminance x alpha).
+#[derive(Clone, Debug, PartialEq)]
+pub struct BrushMask {
+    pub w: u32,
+    pub h: u32,
+    pub data: Vec<f32>,
 }
 
 impl BrushTip {
@@ -29,7 +43,45 @@ impl BrushTip {
         BrushTip {
             size: size.max(1.0),
             hardness: hardness.clamp(0.0, 1.0),
+            mask: None,
         }
+    }
+
+    /// A tip with a sampled mask (Define Brush).
+    pub fn with_mask(size: f32, mask: BrushMask) -> Self {
+        BrushTip {
+            size: size.max(1.0),
+            hardness: 1.0,
+            mask: Some(mask),
+        }
+    }
+
+    /// Stamp strength at a pixel: the sampled mask when the
+    /// tip has one (bilinear over the tip bbox), else the
+    /// round falloff at distance `d`.
+    pub fn strength(&self, xx: i32, yy: i32, cx: f32, cy: f32, d: f32) -> f32 {
+        let Some(m) = &self.mask else {
+            return self.falloff(d);
+        };
+        if m.w == 0 || m.h == 0 || self.size <= 0.0 {
+            return 0.0;
+        }
+        let u = (xx as f32 + 0.5 - (cx - self.size / 2.0)) / self.size;
+        let v = (yy as f32 + 0.5 - (cy - self.size / 2.0)) / self.size;
+        if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
+            return 0.0;
+        }
+        let (fx, fy) = (u * m.w as f32 - 0.5, v * m.h as f32 - 0.5);
+        let (x0, y0) = (fx.floor() as i32, fy.floor() as i32);
+        let (tx, ty) = (fx - x0 as f32, fy - y0 as f32);
+        let smp = |x: i32, y: i32| -> f32 {
+            let x = x.clamp(0, m.w as i32 - 1) as usize;
+            let y = y.clamp(0, m.h as i32 - 1) as usize;
+            m.data[y * m.w as usize + x]
+        };
+        let top = smp(x0, y0) + (smp(x0 + 1, y0) - smp(x0, y0)) * tx;
+        let bot = smp(x0, y0 + 1) + (smp(x0 + 1, y0 + 1) - smp(x0, y0 + 1)) * tx;
+        (top + (bot - top) * ty).clamp(0.0, 1.0)
     }
 
     /// Falloff at distance `d` from stamp center: 1 inside the hard
@@ -66,6 +118,14 @@ fn sel_strength(sel: Option<&Selection>, x: i32, y: i32) -> f32 {
     }
 }
 
+/// Lock Transparent Pixels (layer locks bit0): edits may only change
+/// the color of pixels that already have coverage (alpha > 0); a
+/// pixel's alpha must never change, and transparent pixels are
+/// untouchable. Enforced in the stamp funnels below.
+fn tp_lock(doc: &Document, layer: usize) -> bool {
+    doc.layers[layer].locks & 1 != 0
+}
+
 /// Source-over composite of `color` onto the layer pixel at strength.
 /// In a CMYK document the (RGB) color is converted to inks and
 /// deposited in ink space via over_ink.
@@ -79,7 +139,74 @@ fn over_pixel(doc: &mut Document, layer: usize, x: i32, y: i32, color: Pixel16, 
         over_ink(doc, layer, x, y, (ic, im, iy, ik), a, strength);
         return;
     }
+    if doc.mode == ColorMode::Multichannel {
+        // Multichannel (Phase 6.5): painting deposits ink into
+        // the target plane(s) — black paint lays full ink,
+        // white lays none (the channel-view convention).
+        let (r, g, b, a) = color.to_f32s();
+        let sa = a * strength;
+        if sa <= 0.0 {
+            return;
+        }
+        let luma = 0.299 * r + 0.587 * g + 0.114 * b;
+        let amt = (1.0 - luma) * sa;
+        if x < 0 || y < 0 || x >= doc.width as i32 || y >= doc.height as i32 {
+            return;
+        }
+        let i = (y as usize) * doc.width as usize + x as usize;
+        let targets: Vec<usize> = match doc.multi_active {
+            Some(pi) => vec![pi],
+            None => (0..doc.multi_planes.len()).collect(),
+        };
+        for pi in targets {
+            if let Some(plane) = doc.multi_planes.get_mut(pi) {
+                if let Some(v) = plane.get_mut(i) {
+                    let old = *v as f32 / 65535.0;
+                    let out = amt + old * (1.0 - amt);
+                    *v = (out.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
+                }
+            }
+        }
+        return;
+    }
+    if doc.mode == ColorMode::Lab {
+        // Lab (Phase 6.5): composite the brush color over the
+        // pixel in RGB, then store the result re-encoded as
+        // Lab. The write-back below runs on the decoded dst.
+        let raw = doc.layers[layer].get_pixel(x, y).to_f32s();
+        let (l, la, lb) = crate::color::slots_to_lab(raw.0, raw.1, raw.2);
+        let (r, g, b) = crate::color::lab_to_rgb(l, la, lb);
+        let dst_rgb = Pixel16::from_f32s(r, g, b, raw.3);
+        let src = color.to_f32s();
+        let sa = src.3 * strength;
+        let locked = tp_lock(doc, layer);
+        if locked && raw.3 <= 0.0 {
+            return;
+        }
+        let da = raw.3;
+        let out_a = sa + da * (1.0 - sa);
+        if out_a <= 0.0 {
+            return;
+        }
+        let comp = |sc: f32, dc: f32| -> f32 { (sc * sa + dc * da * (1.0 - sa)) / out_a };
+        let (or, og, ob) = (
+            comp(src.0, dst_rgb.to_f32s().0),
+            comp(src.1, dst_rgb.to_f32s().1),
+            comp(src.2, dst_rgb.to_f32s().2),
+        );
+        let (l2, la2, lb2) = crate::color::rgb_to_lab(or, og, ob);
+        let (sr, sg, sb) = crate::color::lab_to_slots(l2, la2, lb2);
+        let write_a = if locked { raw.3 } else { out_a };
+        doc.layers[layer].set_pixel(x, y, Pixel16::from_f32s(sr, sg, sb, write_a));
+        return;
+    }
     let dst = doc.layers[layer].get_pixel(x, y).to_f32s();
+    // Lock Transparent Pixels: transparent pixels are untouchable,
+    // and a covered pixel keeps its original alpha exactly.
+    let locked = tp_lock(doc, layer);
+    if locked && dst.3 <= 0.0 {
+        return;
+    }
     let src = color.to_f32s();
     let sa = src.3 * strength;
     let out_a = sa + dst.3 * (1.0 - sa);
@@ -90,6 +217,7 @@ fn over_pixel(doc: &mut Document, layer: usize, x: i32, y: i32, color: Pixel16, 
             (sc * sa + dc * dst.3 * (1.0 - sa)) / out_a
         }
     };
+    let write_a = if locked { dst.3 } else { out_a };
     doc.layers[layer].set_pixel(
         x,
         y,
@@ -97,7 +225,7 @@ fn over_pixel(doc: &mut Document, layer: usize, x: i32, y: i32, color: Pixel16, 
             comp(src.0, dst.0),
             comp(src.1, dst.1),
             comp(src.2, dst.2),
-            out_a,
+            write_a,
         ),
     );
 }
@@ -119,6 +247,12 @@ fn over_ink(
         return;
     }
     let (dc, dm, dy, dk, da16) = doc.get_cmyk(layer, x, y);
+    // Lock Transparent Pixels: skip uncovered pixels, and write the
+    // original alpha-plane value back exactly.
+    let locked = tp_lock(doc, layer);
+    if locked && da16 == 0 {
+        return;
+    }
     let da = da16 as f32 / 65535.0;
     let out_a = sa + da * (1.0 - sa);
     if out_a <= 0.0 {
@@ -127,6 +261,11 @@ fn over_ink(
     let comp = |sc: f32, dcv: u16| -> u16 {
         let d = dcv as f32 / 65535.0;
         (((sc * sa + d * da * (1.0 - sa)) / out_a).clamp(0.0, 1.0) * 65535.0 + 0.5) as u16
+    };
+    let write_a = if locked {
+        da16
+    } else {
+        (out_a * 65535.0 + 0.5) as u16
     };
     doc.set_cmyk(
         layer,
@@ -137,7 +276,7 @@ fn over_ink(
             comp(ink.1, dm),
             comp(ink.2, dy),
             comp(ink.3, dk),
-            (out_a * 65535.0 + 0.5) as u16,
+            write_a,
         ),
     );
 }
@@ -158,7 +297,7 @@ pub fn stamp_brush(
     for yy in y0..y1 {
         for xx in x0..x1 {
             let d = ((xx as f32 + 0.5 - cx).powi(2) + (yy as f32 + 0.5 - cy).powi(2)).sqrt();
-            let s = tip.falloff(d) * opacity * sel_strength(sel, xx, yy);
+            let s = tip.strength(xx, yy, cx, cy, d) * opacity * sel_strength(sel, xx, yy);
             over_pixel(doc, layer, xx, yy, color, s);
         }
     }
@@ -192,12 +331,45 @@ pub fn stamp_eraser(
     opacity: f32,
 ) -> (i32, i32, i32, i32) {
     let (x0, y0, x1, y1) = tip.bbox(cx, cy);
+    // Lock Transparent Pixels: erasing would change alpha, so the
+    // eraser cannot erase at all.
+    if tp_lock(doc, layer) {
+        return (x0, y0, x1, y1);
+    }
+    if doc.mode == ColorMode::Multichannel {
+        // Erasing in Multichannel lifts ink back off the
+        // target plane(s).
+        for yy in y0..y1 {
+            for xx in x0..x1 {
+                let d = ((xx as f32 + 0.5 - cx).powi(2) + (yy as f32 + 0.5 - cy).powi(2)).sqrt();
+                let s = tip.strength(xx, yy, cx, cy, d) * opacity * sel_strength(sel, xx, yy);
+                if s <= 0.0 || xx < 0 || yy < 0 || xx >= doc.width as i32 || yy >= doc.height as i32
+                {
+                    continue;
+                }
+                let i = (yy as usize) * doc.width as usize + xx as usize;
+                let targets: Vec<usize> = match doc.multi_active {
+                    Some(pi) => vec![pi],
+                    None => (0..doc.multi_planes.len()).collect(),
+                };
+                for pi in targets {
+                    if let Some(plane) = doc.multi_planes.get_mut(pi) {
+                        if let Some(v) = plane.get_mut(i) {
+                            let old = *v as f32 / 65535.0;
+                            *v = ((old * (1.0 - s)).clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
+                        }
+                    }
+                }
+            }
+        }
+        return (x0, y0, x1, y1);
+    }
     if doc.mode == ColorMode::Cmyk {
         // Erasing a CMYK pixel reduces its alpha-plane alpha.
         for yy in y0..y1 {
             for xx in x0..x1 {
                 let d = ((xx as f32 + 0.5 - cx).powi(2) + (yy as f32 + 0.5 - cy).powi(2)).sqrt();
-                let s = tip.falloff(d) * opacity * sel_strength(sel, xx, yy);
+                let s = tip.strength(xx, yy, cx, cy, d) * opacity * sel_strength(sel, xx, yy);
                 if s <= 0.0 {
                     continue;
                 }
@@ -214,7 +386,7 @@ pub fn stamp_eraser(
     for yy in y0..y1 {
         for xx in x0..x1 {
             let d = ((xx as f32 + 0.5 - cx).powi(2) + (yy as f32 + 0.5 - cy).powi(2)).sqrt();
-            let s = tip.falloff(d) * opacity * sel_strength(sel, xx, yy);
+            let s = tip.strength(xx, yy, cx, cy, d) * opacity * sel_strength(sel, xx, yy);
             if s <= 0.0 {
                 continue;
             }
@@ -247,6 +419,11 @@ pub fn stamp_erase_bg(
     tolerance: u8,
 ) -> (i32, i32, i32, i32) {
     let (x0, y0, x1, y1) = tip.bbox(cx, cy);
+    // Lock Transparent Pixels: the background eraser changes alpha
+    // too, so it is a no-op on a locked layer.
+    if tp_lock(doc, layer) {
+        return (x0, y0, x1, y1);
+    }
     let (sr, sg, sb, _) = sample.to_f32s();
     // Tolerance in normalized RGB distance (max possible ~1.73).
     let max_dist = (tolerance as f32 / 255.0) * 1.2;
@@ -256,7 +433,7 @@ pub fn stamp_erase_bg(
     for yy in y0..y1 {
         for xx in x0..x1 {
             let d = ((xx as f32 + 0.5 - cx).powi(2) + (yy as f32 + 0.5 - cy).powi(2)).sqrt();
-            let s0 = tip.falloff(d) * opacity * sel_strength(sel, xx, yy);
+            let s0 = tip.strength(xx, yy, cx, cy, d) * opacity * sel_strength(sel, xx, yy);
             if s0 <= 0.0 {
                 continue;
             }
@@ -423,6 +600,115 @@ pub fn stamp_clone(
     (x0, y0, x1, y1)
 }
 
+/// Clone Stamp with Sample Merged (Phase 6.5): like
+/// `stamp_clone`, but the source is the flattened composite
+/// of all visible layers instead of the active layer alone.
+#[allow(clippy::too_many_arguments)]
+pub fn stamp_clone_merged(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    cx: f32,
+    cy: f32,
+    src_c: (f32, f32),
+    tip: &BrushTip,
+    opacity: f32,
+) -> (i32, i32, i32, i32) {
+    let (x0, y0, x1, y1) = tip.bbox(cx, cy);
+    let (dx, dy) = (src_c.0 - cx, src_c.1 - cy);
+    let mut samples: Vec<(i32, i32, Pixel16)> = Vec::new();
+    for yy in y0..y1 {
+        for xx in x0..x1 {
+            let sx = (xx as f32 + dx).round() as i32;
+            let sy = (yy as f32 + dy).round() as i32;
+            samples.push((xx, yy, doc.render_pixel(sx, sy)));
+        }
+    }
+    for (xx, yy, sp) in samples {
+        if sp.a == 0 {
+            continue;
+        }
+        let d = ((xx as f32 + 0.5 - cx).powi(2) + (yy as f32 + 0.5 - cy).powi(2)).sqrt();
+        let s = tip.falloff(d) * opacity * sel_strength(sel, xx, yy);
+        over_pixel(doc, layer, xx, yy, sp, s);
+    }
+    (x0, y0, x1, y1)
+}
+
+/// Erase to History (Phase 6.5): an eraser stamp that
+/// restores the active layer's pixels from a source document
+/// (the history source state) instead of erasing to
+/// transparency. Strength follows the tip falloff, so a soft
+/// eraser blends back toward the source.
+#[allow(clippy::too_many_arguments)]
+pub fn stamp_erase_to_history(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    cx: f32,
+    cy: f32,
+    tip: &BrushTip,
+    opacity: f32,
+    src: &Document,
+) -> (i32, i32, i32, i32) {
+    let (x0, y0, x1, y1) = tip.bbox(cx, cy);
+    if layer >= doc.layers.len() || layer >= src.layers.len() {
+        return (x0, y0, x1, y1);
+    }
+    if doc.mode == ColorMode::Cmyk {
+        for yy in y0..y1 {
+            for xx in x0..x1 {
+                let d = ((xx as f32 + 0.5 - cx).powi(2) + (yy as f32 + 0.5 - cy).powi(2)).sqrt();
+                let s = tip.falloff(d) * opacity * sel_strength(sel, xx, yy);
+                if s <= 0.0 {
+                    continue;
+                }
+                let cur = doc.get_cmyk(layer, xx, yy);
+                let old = src.get_cmyk(layer, xx, yy);
+                let mix = |a: u16, b: u16| -> u16 {
+                    (a as f32 + (b as f32 - a as f32) * s).round() as u16
+                };
+                doc.set_cmyk(
+                    layer,
+                    xx,
+                    yy,
+                    (
+                        mix(cur.0, old.0),
+                        mix(cur.1, old.1),
+                        mix(cur.2, old.2),
+                        mix(cur.3, old.3),
+                        mix(cur.4, old.4),
+                    ),
+                );
+            }
+        }
+        return (x0, y0, x1, y1);
+    }
+    for yy in y0..y1 {
+        for xx in x0..x1 {
+            let d = ((xx as f32 + 0.5 - cx).powi(2) + (yy as f32 + 0.5 - cy).powi(2)).sqrt();
+            let s = tip.falloff(d) * opacity * sel_strength(sel, xx, yy);
+            if s <= 0.0 {
+                continue;
+            }
+            let cur = doc.layers[layer].get_pixel(xx, yy).to_f32s();
+            let old = src.layers[layer].get_pixel(xx, yy).to_f32s();
+            let mix = |a: f32, b: f32| a + (b - a) * s;
+            doc.layers[layer].set_pixel(
+                xx,
+                yy,
+                Pixel16::from_f32s(
+                    mix(cur.0, old.0),
+                    mix(cur.1, old.1),
+                    mix(cur.2, old.2),
+                    mix(cur.3, old.3),
+                ),
+            );
+        }
+    }
+    (x0, y0, x1, y1)
+}
+
 /// One Blur-tool stamp: blends each pixel toward its 3x3 neighborhood
 /// average. `strength` 0..=1.
 pub fn stamp_blur(
@@ -435,6 +721,9 @@ pub fn stamp_blur(
     strength: f32,
 ) -> (i32, i32, i32, i32) {
     let (x0, y0, x1, y1) = tip.bbox(cx, cy);
+    // Lock Transparent Pixels: writes below preserve alpha already;
+    // transparent destinations must be skipped outright.
+    let locked = tp_lock(doc, layer);
     if doc.mode == ColorMode::Cmyk {
         let mut ink_writes: Vec<(i32, i32, CmykSample)> = Vec::new();
         for yy in y0..y1 {
@@ -455,6 +744,9 @@ pub fn stamp_blur(
                     }
                 }
                 let cur = doc.get_cmyk(layer, xx, yy);
+                if locked && cur.4 == 0 {
+                    continue;
+                }
                 let mix = |c: u16, a: f32| -> u16 {
                     let cf = c as f32 / 65535.0;
                     ((cf + (a / 9.0 - cf) * s).clamp(0.0, 1.0) * 65535.0 + 0.5) as u16
@@ -497,6 +789,9 @@ pub fn stamp_blur(
             }
             let avg = Pixel16::from_f32s(acc.0 / 9.0, acc.1 / 9.0, acc.2 / 9.0, acc.3 / 9.0);
             let cur = doc.layers[layer].get_pixel(xx, yy).to_f32s();
+            if locked && cur.3 <= 0.0 {
+                continue;
+            }
             let mix = |c: f32, a: f32| c + (a - c) * s;
             writes.push((
                 xx,
@@ -529,6 +824,9 @@ pub fn stamp_sharpen(
     strength: f32,
 ) -> (i32, i32, i32, i32) {
     let (x0, y0, x1, y1) = tip.bbox(cx, cy);
+    // Lock Transparent Pixels: same guard as stamp_blur — writes
+    // preserve alpha; transparent destinations are skipped.
+    let locked = tp_lock(doc, layer);
     if doc.mode == ColorMode::Cmyk {
         let mut ink_writes: Vec<(i32, i32, CmykSample)> = Vec::new();
         for yy in y0..y1 {
@@ -549,6 +847,9 @@ pub fn stamp_sharpen(
                     }
                 }
                 let cur = doc.get_cmyk(layer, xx, yy);
+                if locked && cur.4 == 0 {
+                    continue;
+                }
                 let push = |c: u16, a: f32| -> u16 {
                     let cf = c as f32 / 65535.0;
                     ((cf + (cf - a / 9.0) * s).clamp(0.0, 1.0) * 65535.0 + 0.5) as u16
@@ -589,6 +890,9 @@ pub fn stamp_sharpen(
                 }
             }
             let cur = doc.layers[layer].get_pixel(xx, yy).to_f32s();
+            if locked && cur.3 <= 0.0 {
+                continue;
+            }
             let push = |c: f32, a: f32| c + (c - a / 9.0) * s;
             writes.push((
                 xx,
@@ -785,7 +1089,10 @@ pub fn fill_selection(doc: &mut Document, layer: usize, sel: &Selection, color: 
 }
 
 /// Paint Bucket: flood the contiguous (or global) similar-color
-/// region under (x, y) with `color`, classic-style.
+/// region under (x, y) with `color`, classic-style. The fill runs
+/// through `over_pixel`, so on a Lock Transparent Pixels layer only
+/// covered pixels in the region are recolored (alpha preserved)
+/// and transparent pixels in it stay transparent.
 pub fn paint_bucket(
     doc: &mut Document,
     layer: usize,
@@ -1355,6 +1662,90 @@ mod tests {
         assert!(doc.layers[0].get_pixel(97, 2).to_rgba8().0 > 235);
         let mid = doc.layers[0].get_pixel(50, 2).to_rgba8().0;
         assert!((110..=145).contains(&mid), "mid {mid}");
+    }
+
+    #[test]
+    fn locked_brush_recolors_but_preserves_alpha() {
+        let mut doc = blank(20, 20);
+        // A half-covered black pixel; an opaque red stamp at full
+        // strength would normally composite its alpha up to opaque.
+        let before = Pixel16::from_rgba8(0, 0, 0, 128);
+        doc.layers[0].set_pixel(10, 10, before);
+        doc.layers[0].locks = 1;
+        let tip = BrushTip::new(5.0, 1.0);
+        stamp_brush(
+            &mut doc,
+            0,
+            None,
+            10.0,
+            10.0,
+            Pixel16::from_rgba8(255, 0, 0, 255),
+            &tip,
+            1.0,
+        );
+        let after = doc.layers[0].get_pixel(10, 10);
+        assert_eq!(after.a, before.a, "alpha must be preserved exactly");
+        assert_eq!(after.to_rgba8().0, 255, "color must change to red");
+    }
+
+    #[test]
+    fn locked_brush_skips_transparent_pixels() {
+        let mut doc = blank(20, 20);
+        doc.layers[0].locks = 1;
+        let tip = BrushTip::new(9.0, 1.0);
+        stamp_brush(
+            &mut doc,
+            0,
+            None,
+            10.0,
+            10.0,
+            Pixel16::from_rgba8(255, 0, 0, 255),
+            &tip,
+            1.0,
+        );
+        assert_eq!(doc.layers[0].get_pixel(10, 10), Pixel16::TRANSPARENT);
+    }
+
+    #[test]
+    fn locked_eraser_changes_nothing() {
+        let mut doc = blank(20, 20);
+        doc.layers[0].fill_rect(0, 0, 20, 20, Pixel16::from_rgba8(0, 0, 0, 255));
+        doc.layers[0].locks = 1;
+        let tip = BrushTip::new(9.0, 1.0);
+        stamp_eraser(&mut doc, 0, None, 10.0, 10.0, &tip, 1.0);
+        assert_eq!(doc.layers[0].get_pixel(10, 10).to_rgba8().3, 255);
+        stamp_erase_bg(
+            &mut doc,
+            0,
+            None,
+            10.0,
+            10.0,
+            &tip,
+            1.0,
+            Pixel16::from_rgba8(0, 0, 0, 255),
+            255,
+        );
+        assert_eq!(doc.layers[0].get_pixel(10, 10).to_rgba8().3, 255);
+    }
+
+    #[test]
+    fn unlocked_brush_composites_alpha_normally() {
+        let mut doc = blank(20, 20);
+        doc.layers[0].set_pixel(10, 10, Pixel16::from_rgba8(0, 0, 0, 128));
+        let tip = BrushTip::new(5.0, 1.0);
+        stamp_brush(
+            &mut doc,
+            0,
+            None,
+            10.0,
+            10.0,
+            Pixel16::from_rgba8(255, 0, 0, 255),
+            &tip,
+            1.0,
+        );
+        let after = doc.layers[0].get_pixel(10, 10).to_rgba8();
+        assert_eq!(after.3, 255, "opaque stamp over half alpha -> opaque");
+        assert_eq!(after.0, 255);
     }
 
     #[test]

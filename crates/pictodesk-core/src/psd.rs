@@ -475,6 +475,12 @@ pub fn load_psd(bytes: &[u8]) -> Result<(Document, PsdReport), String> {
             ColorMode::Rgb => 3,
             ColorMode::Cmyk => 4,
             ColorMode::Grayscale => 1,
+            // Unreachable via the current PSD mode mapping
+            // (PSD Lab/Indexed/Bitmap files map onto the modes
+            // above); counts kept correct for when it grows.
+            ColorMode::Lab | ColorMode::Indexed => 3,
+            ColorMode::Bitmap | ColorMode::Duotone => 1,
+            ColorMode::Multichannel => 4,
         };
         if file_channels > mode_channels {
             if let Some((_, alpha)) = by_id.iter().find(|(id, _)| *id as usize == mode_channels) {
@@ -647,7 +653,19 @@ fn compose_layer(
             let i = (yy as u32 * w + xx as u32) as usize;
             let a = alpha.map(|_| at(alpha, i)).unwrap_or(65535);
             match mode {
-                ColorMode::Rgb => {
+                ColorMode::Lab => {
+                    if a == 0 {
+                        continue;
+                    }
+                    // PSD Lab planes use the same encoding as
+                    // our Lab slots (L scaled, a/b offset).
+                    layer.set_pixel(
+                        left + xx,
+                        top + yy,
+                        Pixel16::new(at(get(0), i), at(get(1), i), at(get(2), i), a),
+                    );
+                }
+                ColorMode::Rgb | ColorMode::Indexed => {
                     if a == 0 {
                         continue;
                     }
@@ -662,7 +680,17 @@ fn compose_layer(
                     }
                     layer.set_pixel(left + xx, top + yy, Pixel16::new(r, g, b, a));
                 }
-                ColorMode::Grayscale => {
+                ColorMode::Grayscale | ColorMode::Bitmap | ColorMode::Duotone => {
+                    if a == 0 {
+                        continue;
+                    }
+                    let v = at(get(0), i);
+                    layer.set_pixel(left + xx, top + yy, Pixel16::new(v, v, v, a));
+                }
+                ColorMode::Multichannel => {
+                    // Approximation for a case the current
+                    // mapping never produces: first plane as
+                    // a grayscale image.
                     if a == 0 {
                         continue;
                     }

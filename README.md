@@ -3,11 +3,11 @@
 An open-source desktop photo and image editor — local files, no cloud,
 no account, no subscription. Built feature by feature, in the open.
 
-**Status: v0.5.0 — Phase 5: the professional tier. A full History palette with snapshots and a History Brush, editable type layers, layer effects, the complete classic filter gallery, PSD export, color management, Automate, printing, and Save for Web. Public 1.0 feature set.**
+**Status: v0.6.5 — Phase 6.5 "the long tail": the classic filter gallery completed (99 filters), all eight color modes (RGB, CMYK, Grayscale, Lab, Indexed, Bitmap, Duotone, Multichannel), Apply Image and Calculations, Selective Color, Replace Color and Variations, full Print Options and Color Settings, the Options Bar and full-screen display modes, Fade and Last Filter, File Info, Preferences, PCX and Targa export, swatch (.ACO) and brush (.ABR) libraries, adjustment settings save/load, Actions that persist between sessions with Button Mode, Insert Stop and Insert Menu Item, and Paths export to Illustrator format. Phase 6 (v0.6.0/v0.6.1) is included: the full ten layer-style effects, shape and fill layers, layer sets, advanced blending, Liquify, slices, annotations, Warp Text, the Preset Manager and droplets.
 The UI follows the classic early-90s editor design: a File / Edit /
 Image / Mode / Filter / Select / Window menu bar, a compact
 two-column toolbox, modal dialogs with live preview, docked tabbed
-palettes — and, for now, a single level of Undo.
+palettes, and a History panel with snapshots.
 
 What exists today:
 

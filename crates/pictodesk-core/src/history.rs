@@ -131,6 +131,29 @@ pub fn run_tile_edit(
     hist.push(Box::new(cmd));
 }
 
+/// Like `run_tile_edit`, but also returns the command so the
+/// caller can keep its tile changes (Edit > Fade blends the
+/// last operation's before/after tiles; Phase 6.5).
+pub fn run_tile_edit_captured(
+    doc: &mut Document,
+    hist: &mut History,
+    label: impl Into<String>,
+    layer: usize,
+    tiles: &[TileCoord],
+    edit: impl FnOnce(&mut Document),
+) -> TileEditCommand {
+    let mut cmd = TileEditCommand::new(label);
+    for &c in tiles {
+        cmd.capture_before(doc, layer, c);
+    }
+    edit(doc);
+    for &c in tiles {
+        cmd.capture_after(doc, layer, c);
+    }
+    hist.push(Box::new(cmd.clone()));
+    cmd
+}
+
 /// A whole-document before/after command — for structural edits
 /// (resize, rotate, crop, canvas size) where tile deltas don't fit.
 /// Memory-heavy on huge documents; correct first, optimized later.

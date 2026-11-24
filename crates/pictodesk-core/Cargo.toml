@@ -8,4 +8,4 @@ description = "PictoDesk core engine: tiled document model, color pipeline, hist
 [dependencies]
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 moxcms = "0.7"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tiff", "bmp", "gif"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tiff", "bmp", "gif", "tga"] }

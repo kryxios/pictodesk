@@ -290,6 +290,30 @@ impl Selection {
         out
     }
 
+    /// Union with another selection (Load Selection "Add"):
+    /// per-pixel max, the soft-mask OR.
+    pub fn union_with(&mut self, other: &Selection) {
+        for (a, b) in self.mask.iter_mut().zip(other.mask.iter()) {
+            *a = (*a).max(*b);
+        }
+    }
+
+    /// Subtract another selection (Load Selection
+    /// "Subtract"): per-pixel saturating difference.
+    pub fn subtract(&mut self, other: &Selection) {
+        for (a, b) in self.mask.iter_mut().zip(other.mask.iter()) {
+            *a = a.saturating_sub(*b);
+        }
+    }
+
+    /// Intersect with another selection (Load Selection
+    /// "Intersect"): per-pixel min, the soft-mask AND.
+    pub fn intersect(&mut self, other: &Selection) {
+        for (a, b) in self.mask.iter_mut().zip(other.mask.iter()) {
+            *a = (*a).min(*b);
+        }
+    }
+
     pub fn invert(&mut self) {
         for v in &mut self.mask {
             *v = 255 - *v;

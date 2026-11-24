@@ -48,6 +48,60 @@ pub struct Layer {
     /// pixels are a rendering of this text spec, and the spec is
     /// what gets edited. Rendering lives in the app.
     pub text: Option<crate::text::TextSpec>,
+    // ---- Phase 6 fields.
+    /// Fill opacity (Blending Options): scales the layer's own
+    /// pixels but NOT its effects. 0.0..=1.0.
+    pub fill_opacity: f32,
+    /// Blend If ranges (Blending Options): [this_lo, this_hi,
+    /// under_lo, under_hi] as 0..=255 luminance bounds — these
+    /// are the INNER thresholds; `blend_if_split` feathers
+    /// outward from them.
+    pub blend_if: [u8; 4],
+    /// Blend If split-slider feather widths (v0.6.1):
+    /// [this_lo, this_hi, under_lo, under_hi] — how far beyond
+    /// each inner threshold the range feathers to fully
+    /// excluded. All zero = hard edges (the pre-0.6.1 behavior).
+    pub blend_if_split: [u8; 4],
+    /// Knockout: 0 None, 1 Shallow, 2 Deep. Shallow punches
+    /// down to the layer's set base (or the bottom layer when
+    /// the layer is in no set); Deep punches to transparency.
+    pub knockout: u8,
+    /// Per-channel blending switches (bit0 R/C, bit1 G/M,
+    /// bit2 B/Y, bit3 K). A cleared channel keeps the backdrop's
+    /// value for that channel.
+    pub blend_channels: u8,
+    /// Advanced blending toggles. The compositor honors
+    /// blend_clipped_group (clipped members take the base
+    /// layer's mode when set), transparency_shapes (off: the
+    /// layer blends across its painted bounds at full
+    /// strength) and mask_hides_effects (the mask also masks
+    /// the below-layer effects). blend_interior_group: the
+    /// pipeline always blends interior effects with the layer
+    /// as a group, which is the ON behavior; the OFF path
+    /// (effects blending separately from the layer) is not a
+    /// separate compositor path.
+    pub blend_clipped_group: bool,
+    pub blend_interior_group: bool,
+    pub transparency_shapes: bool,
+    pub mask_hides_effects: bool,
+    /// Layer set membership: 0 = none, else index+1 into
+    /// `Document.sets` (Phase 6; sets are one level deep).
+    pub group: u16,
+    /// Clipping group member: this layer's content is clipped
+    /// to the alpha of the nearest non-clipped layer below.
+    pub clipped: bool,
+    /// Layer locks bitmask: bit0 lock transparent pixels,
+    /// bit1 lock image pixels, bit2 lock position, bit3 lock all.
+    pub locks: u8,
+    /// Layer color coding (Layer Properties): 0 None, 1 Red,
+    /// 2 Orange, 3 Yellow, 4 Green, 5 Blue, 6 Violet, 7 Gray.
+    pub color: u8,
+    /// Vector shape payload (Phase 6): when present, the
+    /// layer's content is rendered from this shape spec.
+    pub shape: Option<crate::shapes::ShapeSpec>,
+    /// Fill-layer payload (Phase 6): solid / gradient / pattern
+    /// content rendered over the whole document.
+    pub fill: Option<crate::shapes::FillSpec>,
 }
 
 impl Layer {
@@ -67,6 +121,21 @@ impl Layer {
             adjustment: None,
             effects: None,
             text: None,
+            fill_opacity: 1.0,
+            blend_if: [0, 255, 0, 255],
+            blend_if_split: [0, 0, 0, 0],
+            knockout: 0,
+            blend_channels: 0xF,
+            blend_clipped_group: true,
+            blend_interior_group: true,
+            transparency_shapes: true,
+            mask_hides_effects: false,
+            group: 0,
+            clipped: false,
+            locks: 0,
+            color: 0,
+            shape: None,
+            fill: None,
         }
     }
 

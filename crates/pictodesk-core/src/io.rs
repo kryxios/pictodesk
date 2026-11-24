@@ -24,6 +24,8 @@ pub enum ExportFormat {
     Tiff,
     Bmp,
     Gif,
+    Pcx,
+    Tga,
 }
 
 impl ExportFormat {
@@ -33,6 +35,8 @@ impl ExportFormat {
             "jpg" | "jpeg" => Some(ExportFormat::Jpeg),
             "tif" | "tiff" => Some(ExportFormat::Tiff),
             "bmp" => Some(ExportFormat::Bmp),
+            "pcx" => Some(ExportFormat::Pcx),
+            "tga" => Some(ExportFormat::Tga),
             "gif" => Some(ExportFormat::Gif),
             _ => None,
         }
@@ -80,11 +84,155 @@ fn embedded_icc(bytes: &[u8], format: CrateFormat) -> Option<Vec<u8>> {
 
 /// Decode image bytes (any supported format) into a document with a
 /// single layer named "Background", like opening a flat photo.
+/// PCX (ZSoft) decode: 24-bit (3 planes x 8 bits) and 8-bit
+/// palette images, RLE compressed. Returns RGBA8 pixels.
+/// Phase 6.5: the `image` crate has no PCX codec, so the
+/// format is handled here directly.
+pub fn decode_pcx(bytes: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    if bytes.len() < 128 || bytes[0] != 0x0A || bytes[2] > 1 {
+        return None;
+    }
+    let bpp = bytes[3] as usize;
+    let xmin = u16::from_le_bytes([bytes[4], bytes[5]]) as i32;
+    let ymin = u16::from_le_bytes([bytes[6], bytes[7]]) as i32;
+    let xmax = u16::from_le_bytes([bytes[8], bytes[9]]) as i32;
+    let ymax = u16::from_le_bytes([bytes[10], bytes[11]]) as i32;
+    let w = (xmax - xmin + 1).max(0) as usize;
+    let h = (ymax - ymin + 1).max(0) as usize;
+    let planes = bytes[65] as usize;
+    let bpl = u16::from_le_bytes([bytes[66], bytes[67]]) as usize;
+    if w == 0 || h == 0 || bpp != 8 || !(planes == 1 || planes == 3) || bpl < w {
+        return None;
+    }
+    let mut data = &bytes[128..];
+    // Optional trailing 256-color palette (0x0C marker).
+    let mut palette: Option<&[u8]> = None;
+    if planes == 1 && bytes.len() >= 769 && bytes[bytes.len() - 769] == 0x0C {
+        palette = Some(&bytes[bytes.len() - 768..]);
+        data = &bytes[128..bytes.len() - 769];
+    }
+    let row_len = bpl * planes;
+    let mut raw = vec![0u8; row_len * h];
+    let mut pos = 0usize;
+    let mut out_i = 0usize;
+    while out_i < raw.len() && pos < data.len() {
+        let b = data[pos];
+        pos += 1;
+        if bytes[2] == 1 && (b & 0xC0) == 0xC0 {
+            let count = (b & 0x3F) as usize;
+            if pos >= data.len() {
+                break;
+            }
+            let v = data[pos];
+            pos += 1;
+            for _ in 0..count {
+                if out_i < raw.len() {
+                    raw[out_i] = v;
+                    out_i += 1;
+                }
+            }
+        } else {
+            raw[out_i] = b;
+            out_i += 1;
+        }
+    }
+    let mut rgba = vec![0u8; w * h * 4];
+    for y in 0..h {
+        for x in 0..w {
+            let o = (y * w + x) * 4;
+            if planes == 3 {
+                rgba[o] = raw[y * row_len + x];
+                rgba[o + 1] = raw[y * row_len + bpl + x];
+                rgba[o + 2] = raw[y * row_len + 2 * bpl + x];
+            } else if let Some(pal) = palette {
+                let idx = raw[y * row_len + x] as usize * 3;
+                rgba[o] = pal[idx];
+                rgba[o + 1] = pal[idx + 1];
+                rgba[o + 2] = pal[idx + 2];
+            } else {
+                let v = raw[y * row_len + x];
+                rgba[o] = v;
+                rgba[o + 1] = v;
+                rgba[o + 2] = v;
+            }
+            rgba[o + 3] = 255;
+        }
+    }
+    Some((w as u32, h as u32, rgba))
+}
+
+/// PCX encode: 24-bit planes, RLE, alpha flattened over
+/// black (the format has no alpha channel).
+pub fn encode_pcx(rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
+    let mut out = vec![0u8; 128];
+    out[0] = 0x0A;
+    out[1] = 5;
+    out[2] = 1;
+    out[3] = 8;
+    let xmax = (w - 1) as u16;
+    let ymax = (h - 1) as u16;
+    out[8..10].copy_from_slice(&xmax.to_le_bytes());
+    out[10..12].copy_from_slice(&ymax.to_le_bytes());
+    out[12..14].copy_from_slice(&72u16.to_le_bytes());
+    out[14..16].copy_from_slice(&72u16.to_le_bytes());
+    out[65] = 3;
+    let bpl = (w + (w & 1)) as u16;
+    out[66..68].copy_from_slice(&bpl.to_le_bytes());
+    let bpl = bpl as usize;
+    let mut row = vec![0u8; bpl];
+    for y in 0..h as usize {
+        for plane in 0..3usize {
+            row.iter_mut().for_each(|v| *v = 0);
+            for x in 0..w as usize {
+                row[x] = rgba[(y * w as usize + x) * 4 + plane];
+            }
+            // RLE encode this plane row.
+            let mut i = 0usize;
+            while i < bpl {
+                let v = row[i];
+                let mut run = 1usize;
+                while i + run < bpl && row[i + run] == v && run < 63 {
+                    run += 1;
+                }
+                if run > 1 || (v & 0xC0) == 0xC0 {
+                    out.push(0xC0 | run as u8);
+                    out.push(v);
+                } else {
+                    out.push(v);
+                }
+                i += run;
+            }
+        }
+    }
+    out
+}
+
 pub fn import_image(bytes: &[u8]) -> Result<Document, IoError> {
-    let format = image::guess_format(bytes).map_err(|e| IoError::Decode(e.to_string()))?;
+    // PCX has no magic the image crate knows; route it first.
+    if bytes.first() == Some(&0x0A) {
+        if let Some((w, h, rgba)) = decode_pcx(bytes) {
+            // Re-encode as PNG and take the normal path
+            // (lossless; keeps one import pipeline).
+            let mut png = Vec::new();
+            let enc = image::codecs::png::PngEncoder::new(&mut png);
+            use image::ImageEncoder;
+            if enc
+                .write_image(&rgba, w, h, image::ExtendedColorType::Rgba8)
+                .is_ok()
+            {
+                return import_image(&png);
+            }
+        }
+    }
+    // TGA has no magic bytes for guess_format; fall back to
+    // an explicit TGA decode when detection fails.
+    let format = image::guess_format(bytes).unwrap_or(image::ImageFormat::Tga);
     let icc = embedded_icc(bytes, format);
-    let img: DynamicImage =
-        image::load_from_memory(bytes).map_err(|e| IoError::Decode(e.to_string()))?;
+    let img: DynamicImage = match image::load_from_memory(bytes) {
+        Ok(i) => i,
+        Err(_) => image::load_from_memory_with_format(bytes, image::ImageFormat::Tga)
+            .map_err(|e| IoError::Decode(e.to_string()))?,
+    };
     let (w, h) = (img.width(), img.height());
     // 16-bit sources keep their full precision end to end (Phase 2:
     // 16-bit/channel editing exposed), including color management:
@@ -257,6 +405,14 @@ pub fn export_image(
             enc.write_image(&rgba, w, h, image::ExtendedColorType::Rgba8)
                 .map_err(|e| IoError::Encode(e.to_string()))?;
         }
+        ExportFormat::Pcx => {
+            out = encode_pcx(&rgba, w, h);
+        }
+        ExportFormat::Tga => {
+            let enc = image::codecs::tga::TgaEncoder::new(&mut out);
+            enc.write_image(&rgba, w, h, image::ExtendedColorType::Rgba8)
+                .map_err(|e| IoError::Encode(e.to_string()))?;
+        }
     }
     Ok(out)
 }
@@ -273,6 +429,40 @@ pub fn load_file(path: &Path) -> Result<Document, IoError> {
         return Ok(doc);
     }
     import_image(&bytes)
+}
+
+/// Weighted Optimization (Save for Web; v0.6.1): encode the
+/// flattened image as JPEG at `q_hi` and at `q_lo`, decode
+/// both, composite per pixel by `weights` (255 keeps the
+/// high-quality pixel, 0 the low-quality one), then encode
+/// the composite at `q_hi`. The weights normally come from an
+/// alpha channel: detailed areas ride at high quality while
+/// backgrounds compress hard. Returns None on any failure.
+pub fn export_weighted_jpeg(doc: &Document, q_hi: u8, q_lo: u8, weights: &[u8]) -> Option<Vec<u8>> {
+    let (w, h) = (doc.width, doc.height);
+    if w == 0 || h == 0 || weights.len() < (w * h) as usize {
+        return None;
+    }
+    let hi = export_image(doc, ExportFormat::Jpeg, q_hi).ok()?;
+    let lo = export_image(doc, ExportFormat::Jpeg, q_lo).ok()?;
+    let hi_px = image::load_from_memory(&hi).ok()?.to_rgb8().into_raw();
+    let lo_px = image::load_from_memory(&lo).ok()?.to_rgb8().into_raw();
+    if hi_px.len() != lo_px.len() || hi_px.len() < (w * h * 3) as usize {
+        return None;
+    }
+    let mut out_rgb = vec![0u8; hi_px.len()];
+    for (p, &wv) in weights.iter().enumerate().take((w * h) as usize) {
+        let t = wv as u32;
+        for c in 0..3 {
+            let i = p * 3 + c;
+            out_rgb[i] = ((hi_px[i] as u32 * t + lo_px[i] as u32 * (255 - t)) / 255) as u8;
+        }
+    }
+    let mut out = Vec::new();
+    let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, q_hi);
+    enc.write_image(&out_rgb, w, h, image::ExtendedColorType::Rgb8)
+        .ok()?;
+    Some(out)
 }
 
 pub fn save_file(path: &Path, doc: &Document, jpeg_quality: u8) -> Result<(), IoError> {
@@ -580,6 +770,23 @@ mod tests {
             (px.0 as i32 - 30).abs() <= 4 && (px.2 as i32 - 200).abs() <= 6,
             "jpeg px {px:?}"
         );
+    }
+
+    #[test]
+    fn weighted_jpeg_uses_the_weight_map() {
+        let doc = sample_doc();
+        let n = (doc.width * doc.height) as usize;
+        // All weights high: output tracks the plain q95 encode.
+        let all_hi = vec![255u8; n];
+        let w_hi = export_weighted_jpeg(&doc, 95, 20, &all_hi).expect("weighted hi");
+        assert_eq!(&w_hi[0..2], &[0xFF, 0xD8], "JPEG SOI");
+        // All weights low: the composite comes from the q20
+        // encode, so the result must differ from all-high.
+        let all_lo = vec![0u8; n];
+        let w_lo = export_weighted_jpeg(&doc, 95, 20, &all_lo).expect("weighted lo");
+        assert_ne!(w_hi, w_lo, "weight map must change the output");
+        // A short weight map is refused.
+        assert!(export_weighted_jpeg(&doc, 95, 20, &[0u8; 4]).is_none());
     }
 
     #[test]

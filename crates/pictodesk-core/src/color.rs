@@ -176,6 +176,127 @@ pub fn cmyk_to_rgb(c: f32, m: f32, y: f32, k: f32) -> (f32, f32, f32) {
     )
 }
 
+// ----------------------------------------------------------------
+// CIE L*a*b* (Phase 6.5): sRGB <-> Lab under D50, the classic
+// editor's Lab white point, via Bradford chromatic adaptation
+// from the sRGB D65 white. L is 0..=100, a/b roughly
+// -128..=127.
+
+const D65_WHITE: (f32, f32, f32) = (0.95047, 1.0, 1.08883);
+const D50_WHITE: (f32, f32, f32) = (0.96422, 1.0, 0.82521);
+
+/// Bradford chromatic adaptation of an XYZ triple between
+/// white points: cone responses (Bradford matrix) are scaled
+/// by the ratio of the whites' cone responses. Derived from
+/// the defining matrices rather than a recalled constant
+/// matrix, so source white always lands exactly on dest
+/// white.
+fn bradford_adapt(
+    xyz: (f32, f32, f32),
+    from: (f32, f32, f32),
+    to: (f32, f32, f32),
+) -> (f32, f32, f32) {
+    let bfd = Mat3 {
+        m: [
+            [0.8951, 0.2664, -0.1614],
+            [-0.7502, 1.7135, 0.0367],
+            [0.0389, -0.0685, 1.0296],
+        ],
+    };
+    let src = bfd.mul_vec(from);
+    let dst = bfd.mul_vec(to);
+    let cone = bfd.mul_vec(xyz);
+    let scaled = (
+        cone.0 * dst.0 / src.0,
+        cone.1 * dst.1 / src.1,
+        cone.2 * dst.2 / src.2,
+    );
+    bfd.inverse().mul_vec(scaled)
+}
+
+fn srgb_to_linear(c: f32) -> f32 {
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn linear_to_srgb(c: f32) -> f32 {
+    if c <= 0.0031308 {
+        c * 12.92
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+fn lab_f(t: f32) -> f32 {
+    let d = 6.0f32 / 29.0;
+    if t > d * d * d {
+        t.cbrt()
+    } else {
+        t / (3.0 * d * d) + 4.0 / 29.0
+    }
+}
+
+fn lab_f_inv(t: f32) -> f32 {
+    let d = 6.0f32 / 29.0;
+    if t > d {
+        t * t * t
+    } else {
+        3.0 * d * d * (t - 4.0 / 29.0)
+    }
+}
+
+/// RGB (0..=1, sRGB) -> (L 0..=100, a, b) in CIE Lab (D50).
+pub fn rgb_to_lab(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
+    let (rl, gl, bl) = (srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b));
+    // Linear sRGB -> XYZ (D65).
+    let x = 0.4123908 * rl + 0.3575843 * gl + 0.1804808 * bl;
+    let y = 0.212639 * rl + 0.7151687 * gl + 0.0721923 * bl;
+    let z = 0.0193308 * rl + 0.1191948 * gl + 0.9505322 * bl;
+    // Bradford chromatic adaptation D65 -> D50.
+    let (x50, y50, z50) = bradford_adapt((x, y, z), D65_WHITE, D50_WHITE);
+    let (fx, fy, fz) = (lab_f(x50 / 0.96422), lab_f(y50), lab_f(z50 / 0.82521));
+    (116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz))
+}
+
+/// CIE Lab (D50) -> RGB (0..=1, sRGB), clamped to gamut.
+pub fn lab_to_rgb(l: f32, a: f32, b: f32) -> (f32, f32, f32) {
+    let fy = (l + 16.0) / 116.0;
+    let fx = fy + a / 500.0;
+    let fz = fy - b / 200.0;
+    let x50 = 0.96422 * lab_f_inv(fx);
+    let y50 = lab_f_inv(fy);
+    let z50 = 0.82521 * lab_f_inv(fz);
+    // Bradford chromatic adaptation D50 -> D65.
+    let (x, y, z) = bradford_adapt((x50, y50, z50), D50_WHITE, D65_WHITE);
+    let rl = 3.2404542 * x - 1.5371385 * y - 0.4985314 * z;
+    let gl = -0.969266 * x + 1.8760108 * y + 0.0415560 * z;
+    let bl = 0.0556434 * x - 0.2040259 * y + 1.0572252 * z;
+    (
+        linear_to_srgb(rl).clamp(0.0, 1.0),
+        linear_to_srgb(gl).clamp(0.0, 1.0),
+        linear_to_srgb(bl).clamp(0.0, 1.0),
+    )
+}
+
+/// Encode a Lab triple into layer tile slots (the Lab-mode
+/// storage layout): r = L/100, g = (a + 128)/255,
+/// b = (b + 128)/255.
+pub fn lab_to_slots(l: f32, a: f32, b: f32) -> (f32, f32, f32) {
+    (
+        (l / 100.0).clamp(0.0, 1.0),
+        ((a + 128.0) / 255.0).clamp(0.0, 1.0),
+        ((b + 128.0) / 255.0).clamp(0.0, 1.0),
+    )
+}
+
+/// Decode layer tile slots back to a Lab triple.
+pub fn slots_to_lab(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
+    (r * 100.0, g * 255.0 - 128.0, b * 255.0 - 128.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
