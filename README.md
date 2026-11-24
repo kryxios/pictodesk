@@ -3,7 +3,7 @@
 An open-source desktop photo and image editor — local files, no cloud,
 no account, no subscription. Built feature by feature, in the open.
 
-**Status: v0.4.5 — Phase 4 plus the gap pass: the full classic blend-mode set, Dodge/Burn/Sponge, Color Range and selection Modify, Equalize, twelve more filters, Copy Merged / Paste Into. First public alpha.**
+**Status: v0.5.0 — Phase 5: the professional tier. A full History palette with snapshots and a History Brush, editable type layers, layer effects, the complete classic filter gallery, PSD export, color management, Automate, printing, and Save for Web. Public 1.0 feature set.**
 The UI follows the classic early-90s editor design: a File / Edit /
 Image / Mode / Filter / Select / Window menu bar, a compact
 two-column toolbox, modal dialogs with live preview, docked tabbed
@@ -97,10 +97,34 @@ What exists today:
   Merged and Paste Into; and Bring to Front / Send to Back
   completing Layer > Arrange. Every new filter records and
   replays in Actions like the rest.
+- Phase 5 (the professional tier): a History palette with
+  multiple undo/redo, snapshots, a History Brush and Art
+  History Brush, Fill with History, and Erase to History;
+  editable type layers (system fonts, real text shaping,
+  per-range styling, horizontal and vertical type) that stay
+  editable forever; layer effects — Drop Shadow, Inner Shadow,
+  Outer Glow, Inner Glow, Bevel and Emboss — live on the layer
+  with copy/paste and a shared global light angle; the rest of
+  the classic toolbox (Polygonal and Magnetic Lasso, Freeform
+  and Magnetic Pen, Pattern Stamp, Magic and Background
+  Erasers, Color Sampler, Measure tool, Info palette); the
+  filter gallery completed — the Distort family (Pinch,
+  Spherize, Twirl, Ripple, Ocean Ripple, Shear, ZigZag, Polar
+  Coordinates), 3D Transform, Extract, and the remaining
+  Noise/Pixelate/Sketch/Stylize/Texture filters; full Free
+  Transform with Distort and Perspective corner drags,
+  Transform Selection, and Transform Again; Channel Mixer and
+  hue-range Hue/Saturation; working-space color management
+  (Assign/Convert Profile, CMYK soft proofing, the web-safe
+  color warning); Actions organized into sets; File > Automate
+  (Batch, Conditional Mode Change, Contact Sheet II, Fit Image,
+  Picture Package, Web Photo Gallery); layered PSD export and
+  EPS DCS 2.0 separations; Page Setup and printing; and Save
+  for Web with live encoded sizes (JPEG/PNG/GIF).
 - A desktop shell (`apps/pictodesk-app`): the classic 1990-era workbench
   — platinum menu bar and toolbox, rulers, docked tabbed palettes
   (Channels/Paths, Brushes, Histogram, Color), modal dialogs with
-  live preview, one level of Undo.
+  live preview, and a History palette with multiple undo.
   Open a file with `pictodesk-app photo.png`, or drag a file onto the
   window. Verify the UI headlessly with
   `cargo run -p pictodesk-app -- --shot out.ppm [--menu N] [--dialog levels]`.

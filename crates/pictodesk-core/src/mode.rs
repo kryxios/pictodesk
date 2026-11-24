@@ -6,9 +6,34 @@
 //! RGB pixels. Converting to Grayscale desaturates for real.
 
 use crate::adjust;
-use crate::color::{cmyk_to_rgb, rgb_to_cmyk};
+use crate::color::{cmyk_to_rgb, rgb_to_cmyk, WorkingSpace};
 use crate::document::{ColorMode, Document};
 use crate::pixel::Pixel16;
+
+/// Convert the document's RGB data from its current working
+/// space to `to` (Image > Mode > Convert to Profile, Phase 5):
+/// every painted pixel is re-encoded through XYZ, so the image
+/// looks the same while its numbers change. CMYK documents keep
+/// their inks — only the RGB interpretation space changes.
+pub fn convert_working_space(doc: &mut Document, to: WorkingSpace) {
+    let from = doc.working_space;
+    if from == to {
+        return;
+    }
+    if doc.mode != ColorMode::Cmyk {
+        for li in 0..doc.layers.len() {
+            if doc.layers[li].adjustment.is_some() {
+                continue;
+            }
+            adjust::map_layer_pixels(doc, li, None, |p| {
+                let (r, g, b, a) = p.to_f32s();
+                let (nr, ng, nb) = from.convert_rgb((r, g, b), to);
+                Pixel16::from_f32s(nr, ng, nb, a)
+            });
+        }
+    }
+    doc.working_space = to;
+}
 
 pub fn convert_mode(doc: &mut Document, to: ColorMode) {
     if doc.mode == to {

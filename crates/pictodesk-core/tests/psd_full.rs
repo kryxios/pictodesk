@@ -127,7 +127,7 @@ fn psd_zip_channels() {
         buf: Vec::new(),
         psb: false,
     };
-    rec.buf.extend_from_slice(&1i32.to_be_bytes());
+    rec.buf.extend_from_slice(&1i16.to_be_bytes());
     record(
         &mut rec,
         "Zip",
@@ -164,7 +164,7 @@ fn psd_zip_prediction() {
         buf: Vec::new(),
         psb: false,
     };
-    rec.buf.extend_from_slice(&1i32.to_be_bytes());
+    rec.buf.extend_from_slice(&1i16.to_be_bytes());
     record(
         &mut rec,
         "Pred",
@@ -209,7 +209,7 @@ fn psd_16bit_layers() {
         buf: Vec::new(),
         psb: false,
     };
-    rec.buf.extend_from_slice(&1i32.to_be_bytes());
+    rec.buf.extend_from_slice(&1i16.to_be_bytes());
     record(
         &mut rec,
         "Deep",
@@ -263,7 +263,7 @@ fn psd_indexed_and_mask_and_psb() {
         buf: Vec::new(),
         psb: false,
     };
-    rec.buf.extend_from_slice(&1i32.to_be_bytes());
+    rec.buf.extend_from_slice(&1i16.to_be_bytes());
     record(
         &mut rec,
         "Masked",
@@ -296,7 +296,7 @@ fn psd_indexed_and_mask_and_psb() {
         buf: Vec::new(),
         psb: true,
     };
-    rec.buf.extend_from_slice(&1i32.to_be_bytes());
+    rec.buf.extend_from_slice(&1i16.to_be_bytes());
     record(
         &mut rec,
         "Base",

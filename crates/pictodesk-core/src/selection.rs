@@ -36,6 +36,18 @@ impl Selection {
         }
     }
 
+    /// Build a selection directly from a mask buffer (row-major,
+    /// one byte per pixel) — the Type Mask tools' route from a
+    /// rendered type layer's alpha.
+    pub fn from_mask(width: u32, height: u32, mask: Vec<u8>) -> Self {
+        debug_assert_eq!(mask.len(), (width * height) as usize);
+        Selection {
+            width,
+            height,
+            mask,
+        }
+    }
+
     pub fn rect(width: u32, height: u32, x: i32, y: i32, w: u32, h: u32) -> Self {
         let mut s = Selection::none(width, height);
         for yy in y.max(0)..(y + h as i32).min(height as i32) {

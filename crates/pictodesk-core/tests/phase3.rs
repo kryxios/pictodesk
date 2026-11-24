@@ -262,7 +262,7 @@ fn sample_psd() -> Vec<u8> {
     let section_start = b.buf.len();
     b.u32(0); // layer info length (patched below)
     let info_start = b.buf.len();
-    b.buf.extend_from_slice(&2i32.to_be_bytes()); // 2 layers
+    b.buf.extend_from_slice(&2i16.to_be_bytes()); // 2 layers
 
     let record = |b: &mut PsdBuilder, name: &str, key: &[u8; 4], opacity: u8, npx: usize| {
         b.u32(0); // top

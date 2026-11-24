@@ -340,7 +340,12 @@ pub fn load_psd(bytes: &[u8]) -> Result<(Document, PsdReport), String> {
     if section_len > 0 {
         let layer_info_len = r.len64()?;
         if layer_info_len > 0 {
-            let count = r.i32()?.unsigned_abs() as usize;
+            // Per the PSD spec the layer count is a signed 16-bit
+            // value (negative = absolute count, first alpha holds
+            // merged transparency). An earlier build of this reader
+            // read 32 bits, which only ever agreed with its own
+            // test fixtures — real files were misparsed by 2 bytes.
+            let count = r.i16()?.unsigned_abs() as usize;
             for _ in 0..count {
                 let top = r.i32()?;
                 let left = r.i32()?;
@@ -677,4 +682,366 @@ fn compose_layer(
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// PSD export (Phase 5, v1): 8-bit RGB PSD with real layer records.
+// Written honestly: the report lists everything that could not be
+// represented, and the flattened composite always matches what
+// the user sees (effects, adjustments, and type render into it).
+// ---------------------------------------------------------------------------
+
+/// What the exporter had to leave behind, in plain words.
+pub struct PsdExportReport {
+    pub warnings: Vec<String>,
+}
+
+fn blend_to_key(mode: BlendMode) -> &'static [u8; 4] {
+    match mode {
+        BlendMode::Normal => b"norm",
+        BlendMode::Multiply => b"mul ",
+        BlendMode::Screen => b"scrn",
+        BlendMode::Overlay => b"over",
+        BlendMode::SoftLight => b"sLit",
+        BlendMode::Darken => b"dark",
+        BlendMode::Lighten => b"lite",
+        BlendMode::Difference => b"diff",
+        BlendMode::Dissolve => b"diss",
+        BlendMode::HardLight => b"hLit",
+        BlendMode::ColorDodge => b"divn",
+        BlendMode::ColorBurn => b"idiv",
+        BlendMode::Exclusion => b"excl",
+        BlendMode::Hue => b"hue ",
+        BlendMode::Saturation => b"sat ",
+        BlendMode::Color => b"colr",
+        BlendMode::Luminosity => b"lum ",
+    }
+}
+
+struct W {
+    buf: Vec<u8>,
+}
+
+impl W {
+    fn u8(&mut self, v: u8) {
+        self.buf.push(v);
+    }
+    fn u16(&mut self, v: u16) {
+        self.buf.extend_from_slice(&v.to_be_bytes());
+    }
+    fn i16(&mut self, v: i16) {
+        self.buf.extend_from_slice(&v.to_be_bytes());
+    }
+    fn u32(&mut self, v: u32) {
+        self.buf.extend_from_slice(&v.to_be_bytes());
+    }
+    fn i32(&mut self, v: i32) {
+        self.buf.extend_from_slice(&v.to_be_bytes());
+    }
+    fn bytes(&mut self, b: &[u8]) {
+        self.buf.extend_from_slice(b);
+    }
+}
+
+/// PackBits-encode one row as literal runs (valid, uncompressed-
+/// leaning RLE: correctness first).
+fn packbits_encode_row(row: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(row.len() + row.len() / 127 + 1);
+    for chunk in row.chunks(127) {
+        out.push((chunk.len() - 1) as u8);
+        out.extend_from_slice(chunk);
+    }
+    if row.is_empty() {
+        out.push(0);
+        out.push(0);
+    }
+    out
+}
+
+/// RLE channel data block: compression flag + row-count table +
+/// packed rows. `rows` are the channel's bytes, one Vec per row.
+fn rle_channel(rows: &[Vec<u8>]) -> Vec<u8> {
+    let mut w = W { buf: Vec::new() };
+    w.u16(1);
+    let packed: Vec<Vec<u8>> = rows.iter().map(|r| packbits_encode_row(r)).collect();
+    for p in &packed {
+        w.u16(p.len() as u16);
+    }
+    for p in &packed {
+        w.bytes(p);
+    }
+    w.buf
+}
+
+/// Export the document as an 8-bit RGB PSD (version 1 format).
+pub fn save_psd(doc: &Document) -> (Vec<u8>, PsdExportReport) {
+    let mut warnings: Vec<String> = Vec::new();
+    if doc.mode != ColorMode::Rgb {
+        warnings.push(format!(
+            "Color mode {:?} was converted to RGB for PSD (PSD stores our CMYK inverted-ink model differently); the .pdk file keeps the original.",
+            doc.mode
+        ));
+    }
+    // Per-layer RGBA8 pixels in document space (top layer first,
+    // as PSD records are stored).
+    struct OutMask {
+        rect: (i32, i32, i32, i32), // top, left, bottom, right
+        fill: u8,
+        enabled: bool,
+    }
+    struct Out {
+        name: String,
+        rect: (i32, i32, i32, i32),
+        channels: Vec<(i16, Vec<u8>)>, // id, full channel-data block
+        key: &'static [u8; 4],
+        opacity: u8,
+        visible: bool,
+        mask: Option<OutMask>,
+    }
+    let mut outs: Vec<Out> = Vec::new();
+    for layer in doc.layers.iter() {
+        if layer.adjustment.is_some() {
+            warnings.push(format!(
+                "Adjustment layer '{}' exported as an empty layer (PSD adjustment parameters are not written in v1).",
+                layer.name
+            ));
+            outs.push(Out {
+                name: layer.name.clone(),
+                rect: (0, 0, 0, 0),
+                channels: Vec::new(),
+                key: b"norm",
+                opacity: (layer.opacity * 255.0) as u8,
+                visible: layer.visible,
+                mask: None,
+            });
+            continue;
+        }
+        if layer.text.is_some() {
+            warnings.push(format!(
+                "Type layer '{}' exported as rendered pixels (editable text is not written in v1).",
+                layer.name
+            ));
+        }
+        if layer.effects.map(|e| e.any_enabled()).unwrap_or(false) {
+            warnings.push(format!(
+                "Layer '{}' has effects: they are baked into the flattened preview but not stored as PSD layer styles in v1.",
+                layer.name
+            ));
+        }
+        let bounds = crate::transform::layer_painted_bounds(layer);
+        let (rect, channels) = match bounds {
+            None => ((0, 0, 0, 0), Vec::new()),
+            Some((x0, y0, x1, y1)) => {
+                let (lw, lh) = ((x1 - x0) as usize, (y1 - y0) as usize);
+                let mut planes: [Vec<Vec<u8>>; 4] =
+                    [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+                for yy in 0..lh {
+                    let mut rows: [Vec<u8>; 4] = [
+                        Vec::with_capacity(lw),
+                        Vec::with_capacity(lw),
+                        Vec::with_capacity(lw),
+                        Vec::with_capacity(lw),
+                    ];
+                    for xx in 0..lw {
+                        let (dx, dy) = (x0 + xx as i32, y0 + yy as i32);
+                        let p = match doc.mode {
+                            ColorMode::Cmyk => {
+                                let (c, m, y, k, a) = doc.get_cmyk(
+                                    doc.layers
+                                        .iter()
+                                        .position(|l| std::ptr::eq(l, layer))
+                                        .unwrap(),
+                                    dx,
+                                    dy,
+                                );
+                                let bf = |v: u16| v as f32 / 65535.0;
+                                let (r, g, b) =
+                                    crate::color::cmyk_to_rgb(bf(c), bf(m), bf(y), bf(k));
+                                (r, g, b, bf(a))
+                            }
+                            _ => {
+                                let p = layer.get_pixel(dx, dy).to_f32s();
+                                (p.0, p.1, p.2, p.3)
+                            }
+                        };
+                        let e = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
+                        rows[0].push(e(p.0));
+                        rows[1].push(e(p.1));
+                        rows[2].push(e(p.2));
+                        rows[3].push(e(p.3));
+                    }
+                    for c in 0..4 {
+                        planes[c].push(rows[c].clone());
+                    }
+                }
+                let ids = [0i16, 1, 2, -1];
+                let mut chs = Vec::new();
+                for c in 0..4 {
+                    chs.push((ids[c], rle_channel(&planes[c])));
+                }
+                ((y0, x0, y1, x1), chs)
+            }
+        };
+        // Layer mask as channel -2 plus its mask-data block.
+        let mask = layer.mask.as_ref().map(|_| {
+            let (mut mx0, mut my0, mut mx1, mut my1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+            // Mask bounds: use the layer's painted bounds expanded
+            // to any mask tile; fall back to the layer rect.
+            if let Some(m) = &layer.mask {
+                for coord in m.keys() {
+                    mx0 = mx0.min(coord.0 * 256 + layer.offset.0);
+                    my0 = my0.min(coord.1 * 256 + layer.offset.1);
+                    mx1 = mx1.max(coord.0 * 256 + 256 + layer.offset.0);
+                    my1 = my1.max(coord.1 * 256 + 256 + layer.offset.1);
+                }
+            }
+            if mx0 == i32::MAX {
+                (mx0, my0, mx1, my1) = (0, 0, 0, 0);
+            }
+            let (mw, mh) = (((mx1 - mx0).max(0)) as usize, ((my1 - my0).max(0)) as usize);
+            let mut rows = Vec::new();
+            for yy in 0..mh {
+                let mut row = Vec::with_capacity(mw);
+                for xx in 0..mw {
+                    row.push(layer.mask_value(mx0 + xx as i32, my0 + yy as i32));
+                }
+                rows.push(row);
+            }
+            (
+                (my0, mx0, my1, mx1),
+                layer.mask_fill,
+                layer.mask_enabled,
+                rle_channel(&rows),
+            )
+        });
+        let mut channels = channels;
+        if let Some((_, _, _, data)) = &mask {
+            channels.push((-2, data.clone()));
+        }
+        outs.push(Out {
+            name: layer.name.clone(),
+            rect,
+            channels,
+            key: blend_to_key(layer.blend_mode),
+            opacity: (layer.opacity.clamp(0.0, 1.0) * 255.0) as u8,
+            visible: layer.visible,
+            mask: mask.map(|(r, fill, enabled, _)| OutMask {
+                rect: r,
+                fill,
+                enabled,
+            }),
+        });
+    }
+    outs.reverse(); // PSD stores the top layer first.
+
+    // Layer records + channel data.
+    let mut layer_info = W { buf: Vec::new() };
+    layer_info.i16(outs.len() as i16);
+    let mut channel_data = W { buf: Vec::new() };
+    for o in &outs {
+        layer_info.i32(o.rect.0);
+        layer_info.i32(o.rect.1);
+        layer_info.i32(o.rect.2);
+        layer_info.i32(o.rect.3);
+        layer_info.u16(o.channels.len() as u16);
+        for (id, data) in &o.channels {
+            layer_info.i16(*id);
+            layer_info.u32(data.len() as u32);
+        }
+        layer_info.bytes(b"8BIM");
+        layer_info.bytes(o.key);
+        layer_info.u8(o.opacity);
+        layer_info.u8(0); // clipping
+        layer_info.u8(if o.visible { 0 } else { 2 }); // flags: bit1 = hidden
+        layer_info.u8(0); // filler
+                          // Extra data: mask block + blending ranges + name.
+        let mut extra = W { buf: Vec::new() };
+        match &o.mask {
+            None => extra.u32(0),
+            Some(m) => {
+                extra.u32(20);
+                extra.i32(m.rect.0);
+                extra.i32(m.rect.1);
+                extra.i32(m.rect.2);
+                extra.i32(m.rect.3);
+                extra.u8(m.fill);
+                extra.u8(if m.enabled { 0 } else { 2 });
+                extra.u16(0);
+            }
+        }
+        extra.u32(0); // layer blending ranges
+        let name_bytes = o.name.as_bytes();
+        let mut pascal = Vec::with_capacity(name_bytes.len() + 1);
+        pascal.push(name_bytes.len().min(255) as u8);
+        pascal.extend_from_slice(&name_bytes[..name_bytes.len().min(255)]);
+        while pascal.len() % 4 != 0 {
+            pascal.push(0);
+        }
+        extra.bytes(&pascal);
+        layer_info.u32(extra.buf.len() as u32);
+        layer_info.bytes(&extra.buf);
+        for (_, data) in &o.channels {
+            channel_data.bytes(data);
+        }
+    }
+    layer_info.bytes(&channel_data.buf);
+
+    let mut layer_section = W { buf: Vec::new() };
+    layer_section.u32(layer_info.buf.len() as u32);
+    layer_section.bytes(&layer_info.buf);
+    layer_section.u32(0); // no global layer mask info
+
+    // Composite (flattened) image data.
+    let flat = doc.render_full_rgba8();
+    let (dw, dh) = (doc.width as usize, doc.height as usize);
+    let mut planes: [Vec<Vec<u8>>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    for yy in 0..dh {
+        let mut rows: [Vec<u8>; 4] = [
+            Vec::with_capacity(dw),
+            Vec::with_capacity(dw),
+            Vec::with_capacity(dw),
+            Vec::with_capacity(dw),
+        ];
+        for xx in 0..dw {
+            let i = (yy * dw + xx) * 4;
+            for c in 0..4 {
+                rows[c].push(flat[i + c]);
+            }
+        }
+        for c in 0..4 {
+            planes[c].push(rows[c].clone());
+        }
+    }
+    let mut composite = W { buf: Vec::new() };
+    composite.u16(1);
+    let packed: Vec<Vec<Vec<u8>>> = planes
+        .iter()
+        .map(|ch| ch.iter().map(|r| packbits_encode_row(r)).collect())
+        .collect();
+    for ch in &packed {
+        for p in ch {
+            composite.u16(p.len() as u16);
+        }
+    }
+    for ch in &packed {
+        for p in ch {
+            composite.bytes(p);
+        }
+    }
+
+    let mut out = W { buf: Vec::new() };
+    out.bytes(b"8BPS");
+    out.u16(1);
+    out.bytes(&[0; 6]);
+    out.u16(4); // channels RGBA
+    out.u32(doc.height);
+    out.u32(doc.width);
+    out.u16(8); // depth
+    out.u16(3); // mode RGB
+    out.u32(0); // color mode data
+    out.u32(0); // image resources
+    out.u32(layer_section.buf.len() as u32);
+    out.bytes(&layer_section.buf);
+    out.bytes(&composite.buf);
+    (out.buf, PsdExportReport { warnings })
 }

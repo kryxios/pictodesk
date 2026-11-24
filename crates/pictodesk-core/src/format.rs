@@ -360,6 +360,115 @@ fn serialize_ext(w: &mut Writer, doc: &Document) {
     for g in &doc.guides_y {
         w.i32(*g);
     }
+    // Phase 5 section (v0.5.0 addition, optional trailing): layer
+    // effects, type-layer specs, then document-level global angle,
+    // samplers, and the defined pattern.
+    fn write_px(w: &mut Writer, p: &Pixel16) {
+        w.u16(p.r);
+        w.u16(p.g);
+        w.u16(p.b);
+        w.u16(p.a);
+    }
+    fn write_shadow(w: &mut Writer, s: &crate::effects::ShadowSpec) {
+        w.u8(s.enabled as u8);
+        w.u8(s.mode.to_id());
+        write_px(w, &s.color);
+        w.f32(s.opacity);
+        w.i32(s.angle);
+        w.u8(s.use_global_angle as u8);
+        w.u32(s.distance);
+        w.u32(s.blur);
+        w.u32(s.intensity);
+    }
+    fn write_glow(w: &mut Writer, g: &crate::effects::GlowSpec) {
+        w.u8(g.enabled as u8);
+        w.u8(g.mode.to_id());
+        write_px(w, &g.color);
+        w.f32(g.opacity);
+        w.u32(g.blur);
+        w.u32(g.intensity);
+        w.u8(g.source_center as u8);
+    }
+    fn write_style(w: &mut Writer, s: &crate::text::CharStyle) {
+        let f = s.font.as_bytes();
+        w.u16(f.len() as u16);
+        w.bytes(f);
+        let st = s.style.as_bytes();
+        w.u16(st.len() as u16);
+        w.bytes(st);
+        w.f32(s.size);
+        w.f32(s.tracking);
+        write_px(w, &s.color);
+        w.u8(s.faux_bold as u8);
+        w.u8(s.faux_italic as u8);
+        w.u8(s.underline as u8);
+        w.f32(s.baseline_shift);
+        w.u8(s.auto_kerning as u8);
+    }
+    for layer in &doc.layers {
+        match &layer.effects {
+            None => w.u8(0),
+            Some(fx) => {
+                w.u8(1);
+                write_shadow(w, &fx.drop_shadow);
+                write_shadow(w, &fx.inner_shadow);
+                write_glow(w, &fx.outer_glow);
+                write_glow(w, &fx.inner_glow);
+                let b = &fx.bevel;
+                w.u8(b.enabled as u8);
+                w.u8(b.style);
+                w.u32(b.depth);
+                w.u8(b.up as u8);
+                w.u8(b.hi_mode.to_id());
+                write_px(w, &b.hi_color);
+                w.f32(b.hi_opacity);
+                w.u8(b.sh_mode.to_id());
+                write_px(w, &b.sh_color);
+                w.f32(b.sh_opacity);
+                w.i32(b.angle);
+                w.u8(b.use_global_angle as u8);
+            }
+        }
+        match &layer.text {
+            None => w.u8(0),
+            Some(t) => {
+                w.u8(1);
+                let tb = t.text.as_bytes();
+                w.u32(tb.len() as u32);
+                w.bytes(tb);
+                w.f32(t.leading);
+                w.u8(t.align);
+                w.u8(t.vertical as u8);
+                write_style(w, &t.default_style);
+                w.u32(t.runs.len() as u32);
+                for run in &t.runs {
+                    w.u32(run.start as u32);
+                    w.u32(run.end as u32);
+                    write_style(w, &run.style);
+                }
+            }
+        }
+    }
+    w.i32(doc.global_angle);
+    w.u32(doc.samplers.len() as u32);
+    for (sx, sy) in &doc.samplers {
+        w.i32(*sx);
+        w.i32(*sy);
+    }
+    match &doc.pattern {
+        None => w.u8(0),
+        Some(p) => {
+            w.u8(1);
+            let n = p.name.as_bytes();
+            w.u16(n.len() as u16);
+            w.bytes(n);
+            w.u32(p.width);
+            w.u32(p.height);
+            for px in &p.px {
+                write_px(w, px);
+            }
+        }
+    }
 }
 
 /// The current (v3) serialization: header + DEFLATE-compressed
@@ -603,6 +712,133 @@ fn parse_ext(payload: &[u8], doc: &mut Document) -> Result<(), FormatError> {
         let ny = r.u32()?;
         for _ in 0..ny {
             doc.guides_y.push(r.i32()?);
+        }
+    }
+    // Optional trailing section: Phase 5 effects, type specs,
+    // global angle, samplers, pattern (v0.5.0).
+    if r.pos < payload.len() {
+        fn read_px(r: &mut Reader) -> Result<Pixel16, FormatError> {
+            Ok(Pixel16::new(r.u16()?, r.u16()?, r.u16()?, r.u16()?))
+        }
+        fn read_mode(r: &mut Reader) -> Result<BlendMode, FormatError> {
+            BlendMode::from_id(r.u8()?).ok_or(FormatError::Corrupt("bad blend mode id"))
+        }
+        fn read_shadow(r: &mut Reader) -> Result<crate::effects::ShadowSpec, FormatError> {
+            Ok(crate::effects::ShadowSpec {
+                enabled: r.u8()? != 0,
+                mode: read_mode(r)?,
+                color: read_px(r)?,
+                opacity: r.f32()?,
+                angle: r.i32()?,
+                use_global_angle: r.u8()? != 0,
+                distance: r.u32()?,
+                blur: r.u32()?,
+                intensity: r.u32()?,
+            })
+        }
+        fn read_glow(r: &mut Reader) -> Result<crate::effects::GlowSpec, FormatError> {
+            Ok(crate::effects::GlowSpec {
+                enabled: r.u8()? != 0,
+                mode: read_mode(r)?,
+                color: read_px(r)?,
+                opacity: r.f32()?,
+                blur: r.u32()?,
+                intensity: r.u32()?,
+                source_center: r.u8()? != 0,
+            })
+        }
+        fn read_str(r: &mut Reader) -> Result<String, FormatError> {
+            let n = r.u16()? as usize;
+            Ok(String::from_utf8_lossy(r.take(n)?).into_owned())
+        }
+        fn read_style(r: &mut Reader) -> Result<crate::text::CharStyle, FormatError> {
+            Ok(crate::text::CharStyle {
+                font: read_str(r)?,
+                style: read_str(r)?,
+                size: r.f32()?,
+                tracking: r.f32()?,
+                color: read_px(r)?,
+                faux_bold: r.u8()? != 0,
+                faux_italic: r.u8()? != 0,
+                underline: r.u8()? != 0,
+                baseline_shift: r.f32()?,
+                auto_kerning: r.u8()? != 0,
+            })
+        }
+        for layer in &mut doc.layers {
+            if r.u8()? != 0 {
+                let drop_shadow = read_shadow(&mut r)?;
+                let inner_shadow = read_shadow(&mut r)?;
+                let outer_glow = read_glow(&mut r)?;
+                let inner_glow = read_glow(&mut r)?;
+                let bevel = crate::effects::BevelSpec {
+                    enabled: r.u8()? != 0,
+                    style: r.u8()?,
+                    depth: r.u32()?,
+                    up: r.u8()? != 0,
+                    hi_mode: read_mode(&mut r)?,
+                    hi_color: read_px(&mut r)?,
+                    hi_opacity: r.f32()?,
+                    sh_mode: read_mode(&mut r)?,
+                    sh_color: read_px(&mut r)?,
+                    sh_opacity: r.f32()?,
+                    angle: r.i32()?,
+                    use_global_angle: r.u8()? != 0,
+                };
+                layer.effects = Some(crate::effects::Effects {
+                    drop_shadow,
+                    inner_shadow,
+                    outer_glow,
+                    inner_glow,
+                    bevel,
+                });
+            }
+            if r.u8()? != 0 {
+                let n = r.u32()? as usize;
+                let text = String::from_utf8_lossy(r.take(n)?).into_owned();
+                let leading = r.f32()?;
+                let align = r.u8()?;
+                let vertical = r.u8()? != 0;
+                let default_style = read_style(&mut r)?;
+                let nr = r.u32()?;
+                let mut runs = Vec::new();
+                for _ in 0..nr {
+                    let start = r.u32()? as usize;
+                    let end = r.u32()? as usize;
+                    let style = read_style(&mut r)?;
+                    runs.push(crate::text::TextRun { start, end, style });
+                }
+                layer.text = Some(crate::text::TextSpec {
+                    text,
+                    runs,
+                    default_style,
+                    leading,
+                    align,
+                    vertical,
+                });
+            }
+        }
+        doc.global_angle = r.i32()?;
+        let ns = r.u32()?;
+        for _ in 0..ns {
+            let sx = r.i32()?;
+            let sy = r.i32()?;
+            doc.samplers.push((sx, sy));
+        }
+        if r.u8()? != 0 {
+            let name = read_str(&mut r)?;
+            let width = r.u32()?;
+            let height = r.u32()?;
+            let mut px = Vec::with_capacity((width * height) as usize);
+            for _ in 0..width * height {
+                px.push(read_px(&mut r)?);
+            }
+            doc.pattern = Some(crate::document::PatternData {
+                name,
+                width,
+                height,
+                px,
+            });
         }
     }
     Ok(())

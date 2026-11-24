@@ -143,6 +143,43 @@ the engine itself is unlimited; later phases raise the cap).
   click/drag panning. Right-click context menus cover the canvas
   and the Layers panel rows.
 
+## Phase 5 additions (v0.5.0)
+
+- `history.rs`: the undo stack becomes a state list with a
+  position cursor — linear branching (push truncates the redo
+  tail) or non-linear insertion, `goto_state`, and
+  `doc_at_state` reconstruction for the History Brush source.
+  Commands store absolute tile states, so jumps land exactly.
+  Snapshots are named full-document clones, session-only.
+- `effects.rs`: the classic five effects render from the
+  layer's alpha — `below_buffer` (Outer Glow, Drop Shadow)
+  composites under the content; `apply_within` (Inner Shadow,
+  Inner Glow, Bevel) modifies the content buffer. The mask is
+  applied to content alpha before effects, so shadows follow
+  the masked shape. Known simplification: a below-effect's
+  blend mode is honored where it meets the layer's own pixels;
+  the merged below-buffer composites under the layer as Normal,
+  so the mode does not reach the backdrop. Effected CMYK
+  documents flatten through the RGB composite (documented
+  approximation in `flatten()`).
+- `text.rs` is spec-only: a type layer stores its `TextSpec`
+  (text, style runs, alignment, vertical flag) and the shell
+  (`typo.rs`) renders it with rustybuzz shaping + fontdue
+  rasterization. The layer's `offset` is the text block origin,
+  so the Move tool carries type like any layer content.
+- `filter.rs` completes the gallery: the Distort family shares
+  an inverse-map driver with clipped (transparent-outside)
+  bilinear sampling; 3D Transform ray-casts cube/sphere/cylinder
+  UVs; Extract mattes a foreground from highlight/fill masks by
+  nearest-color distance with decontamination.
+- `psd.rs` gains export (8-bit layered PSD with honest fidelity
+  warnings) and `io.rs` DCS 2.0 separations. An importer bug
+  was found and fixed in this phase: the layer count is an i16
+  in the spec, not i32 — real-world layered PSDs now parse.
+- Working-space conversion (`mode::convert_working_space`)
+  re-encodes every pixel through XYZ between sRGB, Adobe RGB,
+  and ProPhoto RGB using the published matrices in `color.rs`.
+
 ## Phase 4.5 additions (v0.4.5)
 
 - `blend.rs` grows to the full classic 17 modes. Dissolve is not

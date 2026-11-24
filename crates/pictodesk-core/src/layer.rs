@@ -41,6 +41,13 @@ pub struct Layer {
     /// holds no pixels of its own: the compositor runs the
     /// adjustment over everything below it instead.
     pub adjustment: Option<crate::adjust::Adjustment>,
+    /// Layer effects payload (Phase 5): shadows, glows, bevel —
+    /// rendered by the compositor from the layer's alpha.
+    pub effects: Option<crate::effects::Effects>,
+    /// Type-layer payload (Phase 5): when present, the layer's
+    /// pixels are a rendering of this text spec, and the spec is
+    /// what gets edited. Rendering lives in the app.
+    pub text: Option<crate::text::TextSpec>,
 }
 
 impl Layer {
@@ -58,6 +65,8 @@ impl Layer {
             mask_enabled: true,
             mask_fill: 255,
             adjustment: None,
+            effects: None,
+            text: None,
         }
     }
 

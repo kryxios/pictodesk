@@ -217,15 +217,41 @@ impl Command for MoveLayerCommand {
     }
 }
 
-/// The undo/redo stacks.
+/// What a snapshot froze (Phase 5): the whole document, the
+/// document flattened to one layer, or a single layer's state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapKind {
+    Full,
+    Merged,
+    Layer(usize),
+}
+
+/// A named, frozen copy of a document state (Phase 5 snapshots).
+/// Snapshots are session-only; they are never written to disk.
+#[derive(Clone, Debug)]
+pub struct Snapshot {
+    pub name: String,
+    pub doc: Document,
+    pub kind: SnapKind,
+}
+
+/// The undo/redo state list behind the History panel (Phase 5).
+/// States are commands; `pos` counts how many are currently
+/// applied, so state 0 is the document as opened and state `pos`
+/// is what you see. In linear mode (the classic default) a new
+/// edit made from a middle state discards the states above it;
+/// with non-linear history on, the new state is inserted and the
+/// later states are kept — commands store absolute tile states,
+/// so jumping between divergent states still lands exactly.
 #[derive(Default)]
 pub struct History {
-    undo_stack: Vec<Box<dyn Command>>,
-    redo_stack: Vec<Box<dyn Command>>,
-    /// Cap on undo depth. The 1990 original exposed exactly ONE level of
-    /// undo (Edit > Undo toggled with Redo), so the Phase 1 app sets
-    /// this to 1; the engine itself is unlimited by default.
+    states: Vec<Box<dyn Command>>,
+    pos: usize,
+    /// Cap on the number of remembered states. The 1990 original
+    /// exposed exactly ONE level of undo, so the Phase 1 app set
+    /// this to 1; Phase 5 raises it (the classic default is 20).
     limit: Option<usize>,
+    non_linear: bool,
 }
 
 impl History {
@@ -233,17 +259,30 @@ impl History {
         History::default()
     }
 
-    /// Set a cap on undo depth (None = unlimited). Oldest commands
-    /// fall off the bottom when the cap is exceeded.
+    /// Set a cap on remembered states (None = unlimited). Oldest
+    /// states fall off the bottom when the cap is exceeded.
     pub fn set_limit(&mut self, limit: Option<usize>) {
         self.limit = limit;
         self.trim();
     }
 
+    pub fn limit(&self) -> Option<usize> {
+        self.limit
+    }
+
+    pub fn set_non_linear(&mut self, on: bool) {
+        self.non_linear = on;
+    }
+
+    pub fn non_linear(&self) -> bool {
+        self.non_linear
+    }
+
     fn trim(&mut self) {
         if let Some(limit) = self.limit {
-            while self.undo_stack.len() > limit {
-                self.undo_stack.remove(0);
+            while self.states.len() > limit {
+                self.states.remove(0);
+                self.pos = self.pos.saturating_sub(1);
             }
         }
     }
@@ -251,37 +290,112 @@ impl History {
     /// Record a command that has ALREADY been applied to the document
     /// (the normal painting flow: snapshot, paint, capture, push).
     pub fn push(&mut self, cmd: Box<dyn Command>) {
-        self.undo_stack.push(cmd);
-        self.redo_stack.clear();
+        if self.pos < self.states.len() {
+            if self.non_linear {
+                self.states.insert(self.pos, cmd);
+            } else {
+                self.states.truncate(self.pos);
+                self.states.push(cmd);
+            }
+        } else {
+            self.states.push(cmd);
+        }
+        self.pos += 1;
         self.trim();
     }
 
     pub fn undo(&mut self, doc: &mut Document) -> Option<String> {
-        let mut cmd = self.undo_stack.pop()?;
-        let label = cmd.label().to_string();
-        cmd.revert(doc);
-        self.redo_stack.push(cmd);
+        if self.pos == 0 {
+            return None;
+        }
+        let label = self.states[self.pos - 1].label().to_string();
+        self.states[self.pos - 1].revert(doc);
+        self.pos -= 1;
         Some(label)
     }
 
     pub fn redo(&mut self, doc: &mut Document) -> Option<String> {
-        let mut cmd = self.redo_stack.pop()?;
-        let label = cmd.label().to_string();
-        cmd.apply(doc);
-        self.undo_stack.push(cmd);
+        if self.pos >= self.states.len() {
+            return None;
+        }
+        let label = self.states[self.pos].label().to_string();
+        self.states[self.pos].apply(doc);
+        self.pos += 1;
         Some(label)
     }
 
+    /// Jump straight to a state (0 = as opened). Returns false if
+    /// the target is out of range.
+    pub fn goto_state(&mut self, doc: &mut Document, target: usize) -> bool {
+        if target > self.states.len() {
+            return false;
+        }
+        while self.pos > target {
+            if self.undo(doc).is_none() {
+                break;
+            }
+        }
+        while self.pos < target {
+            if self.redo(doc).is_none() {
+                break;
+            }
+        }
+        true
+    }
+
+    /// Reconstruct the document as it was at `target` WITHOUT
+    /// moving the current position (used to paint from a state
+    /// with the History Brush and to snapshot a state).
+    pub fn doc_at_state(&mut self, doc: &Document, target: usize) -> Option<Document> {
+        if target > self.states.len() {
+            return None;
+        }
+        let mut d = doc.clone();
+        if target < self.pos {
+            for i in (target..self.pos).rev() {
+                self.states[i].revert(&mut d);
+            }
+        } else {
+            for i in self.pos..target {
+                self.states[i].apply(&mut d);
+            }
+        }
+        Some(d)
+    }
+
+    /// Drop every state (the document itself is untouched). This
+    /// is Edit > Purge > Histories / the panel's Clear History.
+    pub fn purge(&mut self) {
+        self.states.clear();
+        self.pos = 0;
+    }
+
     pub fn can_undo(&self) -> bool {
-        !self.undo_stack.is_empty()
+        self.pos > 0
     }
 
     pub fn can_redo(&self) -> bool {
-        !self.redo_stack.is_empty()
+        self.pos < self.states.len()
     }
 
     pub fn undo_depth(&self) -> usize {
-        self.undo_stack.len()
+        self.pos
+    }
+
+    /// Number of remembered states (the panel shows these plus
+    /// the initial "as opened" row).
+    pub fn state_count(&self) -> usize {
+        self.states.len()
+    }
+
+    /// Current position: how many states are applied.
+    pub fn position(&self) -> usize {
+        self.pos
+    }
+
+    /// State labels in order (state 1 first).
+    pub fn labels(&self) -> Vec<String> {
+        self.states.iter().map(|s| s.label().to_string()).collect()
     }
 }
 

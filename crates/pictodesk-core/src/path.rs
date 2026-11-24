@@ -676,6 +676,59 @@ fn fit_closed_contour(pts: &[Pt]) -> Vec<Anchor> {
     anchors
 }
 
+/// Fit an open point chain (a Freeform Pen drag) into anchors:
+/// near-duplicates are dropped, a straight drag stays two corner
+/// anchors, anything else becomes a Schneider fit with smooth
+/// interior joins and free ends.
+pub fn fit_open_contour(pts_in: &[Pt]) -> Vec<Anchor> {
+    let mut pts: Vec<Pt> = Vec::new();
+    for &p in pts_in {
+        if pts.last().is_none_or(|l| dist(*l, p) > 1.5) {
+            pts.push(p);
+        }
+    }
+    if pts.len() < 2 {
+        return pts.iter().map(|p| Anchor::corner(p.0, p.1)).collect();
+    }
+    let (first, last) = (pts[0], pts[pts.len() - 1]);
+    if line_deviation(&pts, first, last) < 0.6 {
+        return vec![
+            Anchor::corner(first.0, first.1),
+            Anchor::corner(last.0, last.1),
+        ];
+    }
+    let k = 3.min(pts.len() - 1);
+    let t1 = unit(sub(pts[k], first));
+    let t2 = unit(sub(last, pts[pts.len() - 1 - k]));
+    let cubics = fit_span(&pts, t1, t2, 1.0);
+    if cubics.is_empty() {
+        return vec![
+            Anchor::corner(first.0, first.1),
+            Anchor::corner(last.0, last.1),
+        ];
+    }
+    let mut anchors = Vec::with_capacity(cubics.len() + 1);
+    anchors.push(Anchor {
+        point: first,
+        in_ctrl: first,
+        out_ctrl: cubics[0].c1,
+    });
+    for (j, c) in cubics.iter().enumerate().take(cubics.len() - 1) {
+        anchors.push(Anchor {
+            point: c.end,
+            in_ctrl: c.c2,
+            out_ctrl: cubics[j + 1].c1,
+        });
+    }
+    let lc = cubics.last().unwrap();
+    anchors.push(Anchor {
+        point: lc.end,
+        in_ctrl: lc.c2,
+        out_ctrl: lc.end,
+    });
+    anchors
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -10,6 +10,7 @@ pub mod blend;
 pub mod brush;
 pub mod color;
 pub mod document;
+pub mod effects;
 pub mod filter;
 pub mod format;
 pub mod histogram;
@@ -22,6 +23,7 @@ pub mod path;
 pub mod pixel;
 pub mod psd;
 pub mod selection;
+pub mod text;
 pub mod tile;
 pub mod transform;
 

@@ -229,6 +229,136 @@ pub fn stamp_eraser(
     (x0, y0, x1, y1)
 }
 
+/// One Background Eraser stamp: erases pixels whose color is
+/// close to `sample` (the background color under the crosshair).
+/// Erasure strength falls off with color distance, so edges
+/// between the background and a differently-colored foreground
+/// survive. `tolerance` 0..=255 widens the accepted distance.
+#[allow(clippy::too_many_arguments)]
+pub fn stamp_erase_bg(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    cx: f32,
+    cy: f32,
+    tip: &BrushTip,
+    opacity: f32,
+    sample: Pixel16,
+    tolerance: u8,
+) -> (i32, i32, i32, i32) {
+    let (x0, y0, x1, y1) = tip.bbox(cx, cy);
+    let (sr, sg, sb, _) = sample.to_f32s();
+    // Tolerance in normalized RGB distance (max possible ~1.73).
+    let max_dist = (tolerance as f32 / 255.0) * 1.2;
+    if max_dist <= 0.0 {
+        return (x0, y0, x1, y1);
+    }
+    for yy in y0..y1 {
+        for xx in x0..x1 {
+            let d = ((xx as f32 + 0.5 - cx).powi(2) + (yy as f32 + 0.5 - cy).powi(2)).sqrt();
+            let s0 = tip.falloff(d) * opacity * sel_strength(sel, xx, yy);
+            if s0 <= 0.0 {
+                continue;
+            }
+            let p = doc.layers[layer].get_pixel(xx, yy);
+            if p.a == 0 {
+                continue;
+            }
+            let (r, g, b, a) = p.to_f32s();
+            let dist = ((r - sr).powi(2) + (g - sg).powi(2) + (b - sb).powi(2)).sqrt();
+            if dist > max_dist {
+                continue;
+            }
+            let closeness = 1.0 - dist / max_dist;
+            let s = s0 * closeness.clamp(0.0, 1.0);
+            if doc.mode == ColorMode::Cmyk {
+                let na = (a * 65535.0 * (1.0 - s) + 0.5) as u16;
+                doc.layers[layer].set_alpha(xx, yy, na);
+            } else {
+                doc.layers[layer].set_pixel(xx, yy, Pixel16::from_f32s(r, g, b, a * (1.0 - s)));
+            }
+        }
+    }
+    (x0, y0, x1, y1)
+}
+
+/// Magic Eraser: erase layer pixels matching the clicked pixel's
+/// color within `tolerance` (0..=255) — the contiguous flood when
+/// `contiguous`, otherwise every matching pixel on the layer.
+/// Returns the affected bbox, or an empty box when the click
+/// landed on transparency.
+pub fn erase_magic(
+    doc: &mut Document,
+    layer: usize,
+    x: i32,
+    y: i32,
+    tolerance: u8,
+    contiguous: bool,
+) -> (i32, i32, i32, i32) {
+    let empty = (0, 0, 0, 0);
+    let target = doc.layers[layer].get_pixel(x, y);
+    if target.a == 0 {
+        return empty;
+    }
+    let (tr, tg, tb, _) = target.to_f32s();
+    let max_dist = (tolerance as f32 / 255.0) * 1.2;
+    let matches = |doc: &Document, xx: i32, yy: i32| -> bool {
+        let p = doc.layers[layer].get_pixel(xx, yy);
+        if p.a == 0 {
+            return false;
+        }
+        let (r, g, b, _) = p.to_f32s();
+        ((r - tr).powi(2) + (g - tg).powi(2) + (b - tb).powi(2)).sqrt() <= max_dist
+    };
+    let (w, h) = (doc.width as i32, doc.height as i32);
+    let mut hits: Vec<(i32, i32)> = Vec::new();
+    if contiguous {
+        let mut seen = vec![false; (w * h) as usize];
+        let mut stack = vec![(x, y)];
+        seen[(y * w + x) as usize] = true;
+        while let Some((cx, cy)) = stack.pop() {
+            if !matches(doc, cx, cy) {
+                continue;
+            }
+            hits.push((cx, cy));
+            for (nx, ny) in [(cx - 1, cy), (cx + 1, cy), (cx, cy - 1), (cx, cy + 1)] {
+                if nx >= 0 && ny >= 0 && nx < w && ny < h && !seen[(ny * w + nx) as usize] {
+                    seen[(ny * w + nx) as usize] = true;
+                    stack.push((nx, ny));
+                }
+            }
+        }
+    } else {
+        for yy in 0..h {
+            for xx in 0..w {
+                if matches(doc, xx, yy) {
+                    hits.push((xx, yy));
+                }
+            }
+        }
+    }
+    if hits.is_empty() {
+        return empty;
+    }
+    let (mut x0, mut y0, mut x1, mut y1) = (i32::MAX, i32::MAX, i32::MIN, i32::MIN);
+    for (hx, hy) in &hits {
+        x0 = x0.min(*hx);
+        y0 = y0.min(*hy);
+        x1 = x1.max(*hx + 1);
+        y1 = y1.max(*hy + 1);
+    }
+    for (hx, hy) in hits {
+        if doc.mode == ColorMode::Cmyk {
+            doc.layers[layer].set_alpha(hx, hy, 0);
+        } else {
+            let p = doc.layers[layer].get_pixel(hx, hy);
+            let (r, g, b, _) = p.to_f32s();
+            doc.layers[layer].set_pixel(hx, hy, Pixel16::from_f32s(r, g, b, 0.0));
+        }
+    }
+    (x0, y0, x1, y1)
+}
+
 /// One Clone Stamp: copies pixels from the same layer, where the
 /// stamp center maps to `src_c` (source center). Aligned mode (the
 /// caller's stroke math) keeps the source glued to the stroke.
@@ -669,7 +799,17 @@ pub fn paint_bucket(
     fill_selection(doc, layer, &region, color);
 }
 
-/// The Gradient tool: linear gradient from `fg` at `from` to `bg` at
+/// Gradient geometry (Phase 5 completes the classic set).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GradientShape {
+    Linear,
+    Radial,
+    Angle,
+    Diamond,
+    Reflected,
+}
+
+/// The Gradient tool: gradient from `fg` at `from` to `bg` at
 /// `to`, drawn through the selection (or whole layer). Pixels beyond
 /// the endpoints clamp to the end colors, as in the classics.
 #[allow(clippy::too_many_arguments)]
@@ -683,12 +823,42 @@ pub fn gradient(
     bg: Pixel16,
     opacity: f32,
 ) {
+    gradient_shaped(
+        doc,
+        layer,
+        sel,
+        from,
+        to,
+        fg,
+        bg,
+        opacity,
+        GradientShape::Linear,
+    );
+}
+
+/// The Gradient tool with a choice of geometry. The drag vector
+/// defines the gradient's frame for every shape: length = the
+/// fg→bg distance (radius for Radial/Diamond), direction = the
+/// starting angle for Angle.
+#[allow(clippy::too_many_arguments)]
+pub fn gradient_shaped(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    from: (f32, f32),
+    to: (f32, f32),
+    fg: Pixel16,
+    bg: Pixel16,
+    opacity: f32,
+    shape: GradientShape,
+) {
     let (ax, ay) = from;
     let (dx, dy) = (to.0 - ax, to.1 - ay);
     let len2 = dx * dx + dy * dy;
     if len2 < 1.0 {
         return;
     }
+    let len = len2.sqrt();
     let bounds = match sel.and_then(|s| s.bounds()) {
         Some(b) => b,
         None => (0, 0, doc.width, doc.height),
@@ -696,7 +866,30 @@ pub fn gradient(
     let (f, b) = (fg.to_f32s(), bg.to_f32s());
     for yy in bounds.1..bounds.1 + bounds.3 as i32 {
         for xx in bounds.0..bounds.0 + bounds.2 as i32 {
-            let t = (((xx as f32 - ax) * dx + (yy as f32 - ay) * dy) / len2).clamp(0.0, 1.0);
+            let proj = ((xx as f32 - ax) * dx + (yy as f32 - ay) * dy) / len2;
+            let t = match shape {
+                GradientShape::Linear => proj.clamp(0.0, 1.0),
+                GradientShape::Reflected => proj.abs().clamp(0.0, 1.0),
+                GradientShape::Radial => {
+                    let d = ((xx as f32 - ax).powi(2) + (yy as f32 - ay).powi(2)).sqrt();
+                    (d / len).clamp(0.0, 1.0)
+                }
+                GradientShape::Diamond => {
+                    // Manhattan distance in the drag frame.
+                    let (ux, uy) = (dx / len, dy / len);
+                    let (vx, vy) = (-uy, ux);
+                    let (px, py) = (xx as f32 - ax, yy as f32 - ay);
+                    let d = (px * ux + py * uy).abs() + (px * vx + py * vy).abs();
+                    (d / len).clamp(0.0, 1.0)
+                }
+                GradientShape::Angle => {
+                    let base = dy.atan2(dx);
+                    let a = (yy as f32 - ay).atan2(xx as f32 - ax);
+                    let mut sweep = (a - base) / (2.0 * std::f32::consts::PI);
+                    sweep -= sweep.floor();
+                    sweep
+                }
+            };
             let c = Pixel16::from_f32s(
                 f.0 + (b.0 - f.0) * t,
                 f.1 + (b.1 - f.1) * t,
@@ -705,6 +898,90 @@ pub fn gradient(
             );
             let s = opacity * sel_strength(sel, xx, yy);
             over_pixel(doc, layer, xx, yy, c, s);
+        }
+    }
+}
+
+/// One stamp whose color comes from a sampler function of the
+/// document coordinates — the shared engine for the History Brush
+/// (sampler reads a frozen state) and the Pattern Stamp (sampler
+/// reads the repeating pattern). Returns the stamp bbox.
+#[allow(clippy::too_many_arguments)]
+pub fn stamp_sample(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    cx: f32,
+    cy: f32,
+    tip: &BrushTip,
+    opacity: f32,
+    sampler: &dyn Fn(i32, i32) -> Pixel16,
+) -> (i32, i32, i32, i32) {
+    let (x0, y0, x1, y1) = tip.bbox(cx, cy);
+    for yy in y0..y1 {
+        for xx in x0..x1 {
+            let d = ((xx as f32 + 0.5 - cx).powi(2) + (yy as f32 + 0.5 - cy).powi(2)).sqrt();
+            let s = tip.falloff(d) * opacity * sel_strength(sel, xx, yy);
+            if s > 0.0 {
+                over_pixel(doc, layer, xx, yy, sampler(xx, yy), s);
+            }
+        }
+    }
+    (x0, y0, x1, y1)
+}
+
+/// One Pattern Stamp: paints the document's defined pattern,
+/// aligned to the document origin so strokes tile seamlessly.
+#[allow(clippy::too_many_arguments)]
+pub fn stamp_pattern(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    cx: f32,
+    cy: f32,
+    tip: &BrushTip,
+    opacity: f32,
+) -> Option<(i32, i32, i32, i32)> {
+    let pat = doc.pattern.clone()?;
+    if pat.width == 0 || pat.height == 0 {
+        return None;
+    }
+    let (w, h) = (pat.width as i32, pat.height as i32);
+    let sampler = |x: i32, y: i32| {
+        let px = ((x % w) + w) % w;
+        let py = ((y % h) + h) % h;
+        pat.px[(py * w + px) as usize]
+    };
+    Some(stamp_sample(
+        doc, layer, sel, cx, cy, tip, opacity, &sampler,
+    ))
+}
+
+/// Fill the selection with another document's flattened image,
+/// sampled at the same coordinates (Edit > Fill > History, and
+/// the History Brush's fill cousin). `opacity` scales the source
+/// alpha; the fill composites over the existing pixels.
+pub fn fill_from_document(
+    doc: &mut Document,
+    layer: usize,
+    sel: &Selection,
+    src: &Document,
+    opacity: f32,
+) {
+    let Some((bx, by, bw, bh)) = sel.bounds() else {
+        return;
+    };
+    for yy in by..by + bh as i32 {
+        for xx in bx..bx + bw as i32 {
+            let s = sel_strength(Some(sel), xx, yy);
+            if s <= 0.0 {
+                continue;
+            }
+            let mut p = src.render_pixel(xx, yy);
+            p.a = ((p.a as f32 * opacity) + 0.5) as u16;
+            if p.a > 0 {
+                over_pixel(doc, layer, xx, yy, p, s);
+            }
         }
     }
 }

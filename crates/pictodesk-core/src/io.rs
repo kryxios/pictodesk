@@ -23,6 +23,7 @@ pub enum ExportFormat {
     Jpeg,
     Tiff,
     Bmp,
+    Gif,
 }
 
 impl ExportFormat {
@@ -32,6 +33,7 @@ impl ExportFormat {
             "jpg" | "jpeg" => Some(ExportFormat::Jpeg),
             "tif" | "tiff" => Some(ExportFormat::Tiff),
             "bmp" => Some(ExportFormat::Bmp),
+            "gif" => Some(ExportFormat::Gif),
             _ => None,
         }
     }
@@ -250,6 +252,11 @@ pub fn export_image(
             enc.write_image(&rgba, w, h, image::ExtendedColorType::Rgba8)
                 .map_err(|e| IoError::Encode(e.to_string()))?;
         }
+        ExportFormat::Gif => {
+            let enc = image::codecs::gif::GifEncoder::new(&mut out);
+            enc.write_image(&rgba, w, h, image::ExtendedColorType::Rgba8)
+                .map_err(|e| IoError::Encode(e.to_string()))?;
+        }
     }
     Ok(out)
 }
@@ -428,6 +435,109 @@ pub fn export_tiff_cmyk(doc: &Document) -> Vec<u8> {
     if let Some(irb) = &irb {
         out.extend_from_slice(irb);
     }
+    out
+}
+
+/// One plate of an EPS separation: PostScript text with hex image
+/// data (grayscale plate, 8-bit).
+fn eps_plate(doc: &Document, title: &str, plate: &[u8]) -> Vec<u8> {
+    let (w, h) = (doc.width, doc.height);
+    let mut s = String::new();
+    s.push_str("%!PS-Adobe-3.0 EPSF-3.0\n");
+    s.push_str("%%Creator: PictoDesk\n");
+    s.push_str(&format!("%%Title: {title}\n"));
+    s.push_str(&format!("%%BoundingBox: 0 0 {w} {h}\n"));
+    s.push_str("%%EndComments\n");
+    s.push_str(&format!("{w} {h} scale\n"));
+    s.push_str(&format!("/picstr {w} string def\n"));
+    s.push_str(&format!(
+        "{w} {h} 8 [{w} 0 0 -{h} 0 {h}] {{ currentfile picstr readhexstring pop }} image\n"
+    ));
+    for (i, b) in plate.iter().enumerate() {
+        if i > 0 && i % 36 == 0 {
+            s.push('\n');
+        }
+        s.push_str(&format!("{b:02x}"));
+    }
+    s.push_str("\nshowpage\n%%EOF\n");
+    s.into_bytes()
+}
+
+/// EPS DCS 2.0 export (Phase 5): a master file with a composite
+/// preview plus one EPS per separation plate — the four process
+/// plates from the composited inks, and one plate per spot
+/// channel. Returns (file name, contents) pairs; the caller
+/// writes them side by side. Plate values are ink amounts
+/// (255 = full ink), the DCS convention.
+pub fn export_dcs(doc: &Document, base: &str) -> Vec<(String, Vec<u8>)> {
+    let (w, h) = (doc.width as usize, doc.height as usize);
+    let mut plates: Vec<Vec<u8>> = vec![vec![0u8; w * h]; 4];
+    let mut spots: Vec<(String, Vec<u8>)> = Vec::new();
+    for ch in &doc.alphas {
+        if ch.spot_color.is_some() {
+            spots.push((ch.name.clone(), vec![0u8; w * h]));
+        }
+    }
+    for y in 0..h as i32 {
+        for x in 0..w as i32 {
+            let (ink, a) = doc.composite_inks(x, y);
+            let i = (y as usize) * w + x as usize;
+            for c in 0..4 {
+                plates[c][i] = (ink[c] * a * 255.0 + 0.5) as u8;
+            }
+        }
+    }
+    // Spot plates come from the spot alpha channels' own data.
+    let mut spot_iter = spots.iter_mut();
+    for ch in &doc.alphas {
+        if ch.spot_color.is_some() {
+            let (_, plate) = spot_iter.next().unwrap();
+            for (i, v) in ch.data.iter().enumerate().take(w * h) {
+                plate[i] = *v;
+            }
+        }
+    }
+    let names = ["Cyan", "Magenta", "Yellow", "Black"];
+    let suffixes = ["C", "M", "Y", "K"];
+    let mut out: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut plate_comments = String::new();
+    for (c, plate) in plates.iter().enumerate() {
+        let fname = format!("{base}.{}.eps", suffixes[c]);
+        plate_comments.push_str(&format!("%%PlateFile: ({fname}) {}\n", names[c]));
+        out.push((
+            fname,
+            eps_plate(doc, &format!("{base} ({})", names[c]), plate),
+        ));
+    }
+    for (name, plate) in &spots {
+        let safe: String = name
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { '_' })
+            .collect();
+        let fname = format!("{base}.{safe}.eps");
+        plate_comments.push_str(&format!("%%PlateFile: ({fname}) {name}\n"));
+        out.push((fname, eps_plate(doc, &format!("{base} ({name})"), plate)));
+    }
+    // Master: composite preview + DCS header comments naming the
+    // plates. Preview is a grayscale EPS of the composite so any
+    // PostScript consumer can place it.
+    let flat = doc.render_full_rgba8();
+    let mut gray = vec![0u8; w * h];
+    for i in 0..w * h {
+        let (r, g, b) = (
+            flat[i * 4] as u32,
+            flat[i * 4 + 1] as u32,
+            flat[i * 4 + 2] as u32,
+        );
+        gray[i] = ((r * 77 + g * 150 + b * 29) >> 8) as u8;
+    }
+    let mut master = String::from_utf8(eps_plate(doc, &format!("{base} (master)"), &gray)).unwrap();
+    let insert_at = master.find("%%EndComments").unwrap();
+    let header = format!(
+        "%%DCSVersion: 2.0\n%%DocumentProcessColors: Cyan Magenta Yellow Black\n{plate_comments}"
+    );
+    master.insert_str(insert_at, &header);
+    out.insert(0, (format!("{base}.eps"), master.into_bytes()));
     out
 }
 

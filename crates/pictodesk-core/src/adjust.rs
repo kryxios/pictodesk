@@ -446,6 +446,58 @@ pub fn hue_saturation(
     map_layer_pixels(doc, layer, sel, |p| map_rgb(p, math));
 }
 
+/// Hue/Saturation restricted to a hue range (Phase 5): the
+/// adjustment's strength falls off with circular distance from
+/// `center_deg`, reaching zero at `falloff_deg`. This is the
+/// Reds/Yellows/.../Magentas editing the classic dialog offers
+/// beside Master.
+#[allow(clippy::too_many_arguments)]
+pub fn hue_saturation_range(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    hue_deg: i32,
+    saturation: i32,
+    lightness: i32,
+    center_deg: f32,
+    falloff_deg: f32,
+) {
+    let adj = Adjustment::HueSaturation {
+        hue: hue_deg,
+        saturation,
+        lightness,
+    };
+    let math = |r: f32, g: f32, b: f32| {
+        // Pixel hue in degrees.
+        let (max, min) = (r.max(g).max(b), r.min(g).min(b));
+        if (max - min).abs() < 1e-6 {
+            return (r, g, b); // grays have no hue to select by
+        }
+        let h = if (max - r).abs() < 1e-6 {
+            60.0 * ((g - b) / (max - min)).rem_euclid(6.0)
+        } else if (max - g).abs() < 1e-6 {
+            60.0 * ((b - r) / (max - min) + 2.0)
+        } else {
+            60.0 * ((r - g) / (max - min) + 4.0)
+        };
+        let mut dist = (h - center_deg).abs() % 360.0;
+        if dist > 180.0 {
+            dist = 360.0 - dist;
+        }
+        let w = (1.0 - dist / falloff_deg.max(1.0)).clamp(0.0, 1.0);
+        if w <= 0.0 {
+            return (r, g, b);
+        }
+        let (ar, ag, ab) = adj.apply(r, g, b);
+        (r + (ar - r) * w, g + (ag - g) * w, b + (ab - b) * w)
+    };
+    if doc.mode == ColorMode::Cmyk {
+        map_layer_inks(doc, layer, sel, |ink| via_rgb(ink, math));
+        return;
+    }
+    map_layer_pixels(doc, layer, sel, |p| map_rgb(p, math));
+}
+
 /// Image > Adjust > Color Balance. Each range is (cyan-red,
 /// magenta-green, yellow-blue) shifts in -100..=100, applied with
 /// Classic luminance weighting per range.
@@ -642,6 +694,78 @@ pub fn equalize(doc: &mut Document, layer: usize, sel: Option<&Selection>) {
             luts[2][b as usize],
             a,
         )
+    });
+}
+
+/// Channel Mixer settings (Phase 5): each output channel is a
+/// weighted sum of the source channels plus a constant. Weights
+/// are fractions (1.0 = 100%). Rows/channels are R, G, B (+ K in
+/// CMYK documents, where the fourth row/column apply). With
+/// `monochrome` set, row 0 drives every output channel.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ChannelMixer {
+    pub rows: [[f32; 4]; 4],
+    pub constant: [f32; 4],
+    pub monochrome: bool,
+}
+
+impl Default for ChannelMixer {
+    fn default() -> Self {
+        let mut rows = [[0f32; 4]; 4];
+        for (i, row) in rows.iter_mut().enumerate() {
+            row[i] = 1.0;
+        }
+        ChannelMixer {
+            rows,
+            constant: [0.0; 4],
+            monochrome: false,
+        }
+    }
+}
+
+/// Image > Adjust > Channel Mixer.
+pub fn channel_mixer(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    mix: &ChannelMixer,
+) {
+    if doc.mode == ColorMode::Cmyk {
+        let rows = mix.rows;
+        let constant = mix.constant;
+        let mono = mix.monochrome;
+        map_layer_inks(doc, layer, sel, |ink| {
+            let mut out = [0f32; 4];
+            for c in 0..4 {
+                let row = if mono { &rows[0] } else { &rows[c] };
+                out[c] = (row[0] * ink[0]
+                    + row[1] * ink[1]
+                    + row[2] * ink[2]
+                    + row[3] * ink[3]
+                    + if mono { constant[0] } else { constant[c] })
+                .clamp(0.0, 1.0);
+            }
+            out
+        });
+        return;
+    }
+    let rows = mix.rows;
+    let constant = mix.constant;
+    let mono = mix.monochrome;
+    map_layer_pixels(doc, layer, sel, |p| {
+        map_rgb(p, |r, g, b| {
+            let src = [r, g, b, 0.0];
+            let mut out = [0f32; 3];
+            for c in 0..3 {
+                let row = if mono { &rows[0] } else { &rows[c] };
+                out[c] = (row[0] * src[0]
+                    + row[1] * src[1]
+                    + row[2] * src[2]
+                    + if mono { constant[0] } else { constant[c] })
+                .clamp(0.0, 1.0);
+            }
+            (out[0], out[1], out[2])
+        })
     });
 }
 

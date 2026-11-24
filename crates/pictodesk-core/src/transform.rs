@@ -269,6 +269,8 @@ pub fn transform_layer(
     out.blend_mode = src.blend_mode;
     out.linked = src.linked;
     out.adjustment = src.adjustment.clone();
+    out.effects = src.effects;
+    out.text = src.text.clone();
     let has_mask = src.mask.is_some();
     if has_mask {
         out.add_mask(src.mask_fill);
@@ -333,6 +335,235 @@ pub fn transform_layer(
         }
     }
     doc.layers[layer] = out;
+}
+
+/// A 3x3 projective mapping (homography) through four point
+/// correspondences — the math behind Distort and Perspective,
+/// where straight lines stay straight but parallels may converge.
+pub struct Homography {
+    pub m: [f32; 9],
+}
+
+impl Homography {
+    /// The homography taking src corners to dst corners (order:
+    /// TL, TR, BR, BL). None when the quad is degenerate.
+    pub fn through(src: [(f32, f32); 4], dst: [(f32, f32); 4]) -> Option<Homography> {
+        // Solve for h (h33 = 1) with dst ~ H * src, 8 equations.
+        let mut a = [[0f32; 9]; 8];
+        for i in 0..4 {
+            let (x, y) = src[i];
+            let (u, v) = dst[i];
+            a[2 * i] = [x, y, 1.0, 0.0, 0.0, 0.0, -u * x, -u * y, u];
+            a[2 * i + 1] = [0.0, 0.0, 0.0, x, y, 1.0, -v * x, -v * y, v];
+        }
+        // Gaussian elimination with partial pivoting.
+        for col in 0..8 {
+            let mut piv = col;
+            for r in col + 1..8 {
+                if a[r][col].abs() > a[piv][col].abs() {
+                    piv = r;
+                }
+            }
+            if a[piv][col].abs() < 1e-9 {
+                return None;
+            }
+            a.swap(col, piv);
+            let d = a[col][col];
+            for v in &mut a[col][col..] {
+                *v /= d;
+            }
+            let prow = a[col];
+            for (r, row) in a.iter_mut().enumerate() {
+                if r != col && row[col] != 0.0 {
+                    let f = row[col];
+                    for (j, v) in row.iter_mut().enumerate().skip(col) {
+                        *v -= f * prow[j];
+                    }
+                }
+            }
+        }
+        let h: Vec<f32> = (0..8).map(|i| a[i][8]).collect();
+        Some(Homography {
+            m: [h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], 1.0],
+        })
+    }
+
+    pub fn apply(&self, x: f32, y: f32) -> (f32, f32) {
+        let w = self.m[6] * x + self.m[7] * y + self.m[8];
+        (
+            (self.m[0] * x + self.m[1] * y + self.m[2]) / w,
+            (self.m[3] * x + self.m[4] * y + self.m[5]) / w,
+        )
+    }
+
+    pub fn inverse(&self) -> Option<Homography> {
+        let m = &self.m;
+        let det = m[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (m[3] * m[8] - m[5] * m[6])
+            + m[2] * (m[3] * m[7] - m[4] * m[6]);
+        if det.abs() < 1e-12 {
+            return None;
+        }
+        let inv = [
+            (m[4] * m[8] - m[5] * m[7]) / det,
+            (m[2] * m[7] - m[1] * m[8]) / det,
+            (m[1] * m[5] - m[2] * m[4]) / det,
+            (m[5] * m[6] - m[3] * m[8]) / det,
+            (m[0] * m[8] - m[2] * m[6]) / det,
+            (m[2] * m[3] - m[0] * m[5]) / det,
+            (m[3] * m[7] - m[4] * m[6]) / det,
+            (m[1] * m[6] - m[0] * m[7]) / det,
+            (m[0] * m[4] - m[1] * m[3]) / det,
+        ];
+        Some(Homography { m: inv })
+    }
+}
+
+/// Free Transform with the four corners dragged freely (Distort /
+/// Perspective): the layer's painted bounds corners land on
+/// `corners` (TL, TR, BR, BL) via a projective warp.
+pub fn transform_layer_quad(doc: &mut Document, layer: usize, corners: [(f32, f32); 4]) {
+    let src = doc.layers[layer].clone();
+    let Some((bx0, by0, bx1, by1)) = layer_painted_bounds(&src) else {
+        return;
+    };
+    let src_corners = [
+        (bx0 as f32, by0 as f32),
+        (bx1 as f32, by0 as f32),
+        (bx1 as f32, by1 as f32),
+        (bx0 as f32, by1 as f32),
+    ];
+    let Some(fwd) = Homography::through(src_corners, corners) else {
+        return;
+    };
+    let Some(inv) = fwd.inverse() else { return };
+    let mut db: Option<(i32, i32, i32, i32)> = None;
+    for (px, py) in corners {
+        grow_bounds(&mut db, px.floor() as i32, py.floor() as i32);
+    }
+    let (dx0, dy0, dx1, dy1) = db.unwrap();
+    let cmyk = doc.mode == crate::document::ColorMode::Cmyk;
+    let mut out = Layer::new(src.name.clone());
+    out.opacity = src.opacity;
+    out.visible = src.visible;
+    out.blend_mode = src.blend_mode;
+    out.linked = src.linked;
+    out.adjustment = src.adjustment.clone();
+    out.effects = src.effects;
+    out.text = src.text.clone();
+    let has_mask = src.mask.is_some();
+    if has_mask {
+        out.add_mask(src.mask_fill);
+        out.mask_enabled = src.mask_enabled;
+    }
+    // The warp only paints inside the destination quad — the
+    // homography extrapolates past its edges, and those pixels
+    // must stay untouched.
+    let in_quad = |px: f32, py: f32| -> bool {
+        let tri = |a: (f32, f32), b: (f32, f32), c: (f32, f32)| -> bool {
+            let s =
+                |p: (f32, f32), q: (f32, f32)| (px - q.0) * (p.1 - q.1) - (p.0 - q.0) * (py - q.1);
+            let d1 = s(a, b);
+            let d2 = s(b, c);
+            let d3 = s(c, a);
+            !(((d1 < 0.0) || (d2 < 0.0) || (d3 < 0.0)) && ((d1 > 0.0) || (d2 > 0.0) || (d3 > 0.0)))
+        };
+        tri(corners[0], corners[1], corners[2]) || tri(corners[0], corners[2], corners[3])
+    };
+    for dy in dy0..dy1 {
+        for dx in dx0..dx1 {
+            if !in_quad(dx as f32 + 0.5, dy as f32 + 0.5) {
+                continue;
+            }
+            let (sx, sy) = inv.apply(dx as f32 + 0.5, dy as f32 + 0.5);
+            let (sx, sy) = (sx - 0.5, sy - 0.5);
+            let (x0, y0) = (sx.floor() as i32, sy.floor() as i32);
+            let (fx, fy) = (sx - x0 as f32, sy - y0 as f32);
+            if cmyk {
+                let smp = |x: i32, y: i32| -> [f32; 5] {
+                    let p = src.get_pixel(x, y).to_f32s();
+                    [p.0, p.1, p.2, p.3, src.get_alpha(x, y) as f32 / 65535.0]
+                };
+                let (sa, sb, sc, sd) = (
+                    smp(x0, y0),
+                    smp(x0 + 1, y0),
+                    smp(x0, y0 + 1),
+                    smp(x0 + 1, y0 + 1),
+                );
+                let mut v = [0.0f32; 5];
+                for i in 0..5 {
+                    let top = sa[i] + (sb[i] - sa[i]) * fx;
+                    let bot = sc[i] + (sd[i] - sc[i]) * fx;
+                    v[i] = top + (bot - top) * fy;
+                }
+                if v[4] > 0.001 {
+                    out.set_pixel(dx, dy, Pixel16::from_f32s(v[0], v[1], v[2], v[3]));
+                    out.set_alpha(dx, dy, (v[4].clamp(0.0, 1.0) * 65535.0 + 0.5) as u16);
+                }
+            } else {
+                let smp = |x: i32, y: i32| src.get_pixel(x, y).to_f32s();
+                let (sa, sb, sc, sd) = (
+                    smp(x0, y0),
+                    smp(x0 + 1, y0),
+                    smp(x0, y0 + 1),
+                    smp(x0 + 1, y0 + 1),
+                );
+                let lerp = |p: (f32, f32, f32, f32), q: (f32, f32, f32, f32), t: f32| {
+                    (
+                        p.0 + (q.0 - p.0) * t,
+                        p.1 + (q.1 - p.1) * t,
+                        p.2 + (q.2 - p.2) * t,
+                        p.3 + (q.3 - p.3) * t,
+                    )
+                };
+                let v = lerp(lerp(sa, sb, fx), lerp(sc, sd, fx), fy);
+                if v.3 > 0.001 {
+                    out.set_pixel(dx, dy, Pixel16::from_f32s(v.0, v.1, v.2, v.3));
+                }
+            }
+            if has_mask {
+                let mv = src.mask_value(sx.round() as i32, sy.round() as i32);
+                out.set_mask_value(dx, dy, mv);
+            }
+        }
+    }
+    doc.layers[layer] = out;
+}
+
+/// Select > Transform Selection: warp the selection mask itself
+/// (pixels untouched) by the same projective mapping, from the
+/// mask's current bounds corners to `corners` (TL, TR, BR, BL).
+pub fn transform_selection_quad(sel: &mut crate::selection::Selection, corners: [(f32, f32); 4]) {
+    let Some((bx, by, bw, bh)) = sel.bounds() else {
+        return;
+    };
+    let (bx1, by1) = (bx + bw as i32, by + bh as i32);
+    let src_corners = [
+        (bx as f32, by as f32),
+        (bx1 as f32, by as f32),
+        (bx1 as f32, by1 as f32),
+        (bx as f32, by1 as f32),
+    ];
+    let Some(fwd) = Homography::through(src_corners, corners) else {
+        return;
+    };
+    let Some(inv) = fwd.inverse() else { return };
+    let old = sel.clone();
+    let mut db: Option<(i32, i32, i32, i32)> = None;
+    for (px, py) in corners {
+        grow_bounds(&mut db, px.floor() as i32, py.floor() as i32);
+    }
+    let (dx0, dy0, dx1, dy1) = db.unwrap();
+    // Rewrite the union of old and new bounds so shrinking a
+    // selection clears what it leaves behind.
+    let (ux0, uy0) = (bx.min(dx0), by.min(dy0));
+    let (ux1, uy1) = (bx1.max(dx1), by1.max(dy1));
+    for dy in uy0..uy1 {
+        for dx in ux0..ux1 {
+            let (sx, sy) = inv.apply(dx as f32 + 0.5, dy as f32 + 0.5);
+            let v = old.value(sx.floor() as i32, sy.floor() as i32);
+            sel.set(dx, dy, v);
+        }
+    }
 }
 
 /// Image > Image Size: resample every layer to the new dimensions

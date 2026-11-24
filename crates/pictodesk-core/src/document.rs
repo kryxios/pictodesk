@@ -6,6 +6,7 @@ use crate::blend::{composite_over, composite_over_inks};
 use crate::color::{cmyk_to_rgb, WorkingSpace};
 use crate::layer::Layer;
 use crate::pixel::Pixel16;
+use crate::selection::Selection;
 
 /// The document's color mode — the classic Mode menu. In CMYK mode
 /// the layers store real CMYK ink values (in the tile pixels' four
@@ -104,6 +105,41 @@ pub struct Document {
     pub guides_x: Vec<i32>,
     /// Horizontal guide positions in document pixels (Phase 4).
     pub guides_y: Vec<i32>,
+    /// Color sampler points (Phase 5, max 4): persistent,
+    /// non-printing measurement points read by the Info panel.
+    pub samplers: Vec<(i32, i32)>,
+    /// The document's defined pattern (Phase 5, Edit > Define
+    /// Pattern), used by the Pattern Stamp and pattern fills.
+    pub pattern: Option<PatternData>,
+    /// The most recent selection (Phase 5, Select > Reselect).
+    pub last_selection: Option<Selection>,
+    /// Shared light angle in degrees for effects that opt into
+    /// the global angle (Phase 5, Layer > Effects > Global Angle).
+    pub global_angle: i32,
+    /// Session-only: hide all layer effects without removing
+    /// them (Layer > Effects > Hide All Effects). Not persisted.
+    pub effects_suppressed: bool,
+}
+
+/// A defined pattern: a small RGBA tile that repeats.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PatternData {
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub px: Vec<Pixel16>,
+}
+
+/// Pre-rendered effect buffers for one layer over a region (the
+/// region is expanded by the effect's margin, so blurs and shadow
+/// offsets have room). Built per render region, never stored.
+struct FxBuf {
+    li: usize,
+    ox: i32,
+    oy: i32,
+    w: usize,
+    below: Vec<Pixel16>,
+    within: Vec<Pixel16>,
 }
 
 impl Document {
@@ -125,6 +161,11 @@ impl Document {
             history_log: Vec::new(),
             guides_x: Vec::new(),
             guides_y: Vec::new(),
+            samplers: Vec::new(),
+            pattern: None,
+            last_selection: None,
+            global_angle: 120,
+            effects_suppressed: false,
         }
     }
 
@@ -379,8 +420,11 @@ impl Document {
     /// Hidden layers are discarded, as in the classic dialog flow.
     pub fn flatten(&mut self) {
         let mut flat = Layer::new("Background");
+        // Render in horizontal bands so effected documents build
+        // their effect buffers once per band, not once per pixel.
+        let band = 128i32;
         match self.mode {
-            ColorMode::Cmyk => {
+            ColorMode::Cmyk if !self.has_effects() => {
                 for y in 0..self.height as i32 {
                     for x in 0..self.width as i32 {
                         let (ink, a) = self.composite_inks(x, y);
@@ -396,14 +440,44 @@ impl Document {
                     }
                 }
             }
-            _ => {
-                for y in 0..self.height as i32 {
-                    for x in 0..self.width as i32 {
-                        let p = self.render_pixel(x, y);
-                        if p.a > 0 {
-                            flat.set_pixel(x, y, p);
+            ColorMode::Cmyk => {
+                // Effected CMYK: composite in RGB (the effects
+                // path), then convert the result back to inks.
+                let e = |v: f32| (v.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
+                let mut y = 0i32;
+                while y < self.height as i32 {
+                    let bh = band.min(self.height as i32 - y) as u32;
+                    let px = self.render_region_px(0, y, self.width, bh);
+                    for (n, p) in px.iter().enumerate() {
+                        let (xx, yy) = (
+                            (n as u32 % self.width) as i32,
+                            y + (n as u32 / self.width) as i32,
+                        );
+                        let (r, g, b, a) = p.to_f32s();
+                        if a > 0.0 {
+                            let (c, m, yel, k) = crate::color::rgb_to_cmyk(r, g, b);
+                            flat.set_pixel(xx, yy, Pixel16::from_f32s(c, m, yel, k));
+                            flat.set_alpha(xx, yy, e(a));
                         }
                     }
+                    y += bh as i32;
+                }
+            }
+            _ => {
+                let mut y = 0i32;
+                while y < self.height as i32 {
+                    let bh = band.min(self.height as i32 - y) as u32;
+                    let px = self.render_region_px(0, y, self.width, bh);
+                    for (n, p) in px.iter().enumerate() {
+                        if p.a > 0 {
+                            let (xx, yy) = (
+                                (n as u32 % self.width) as i32,
+                                y + (n as u32 / self.width) as i32,
+                            );
+                            flat.set_pixel(xx, yy, *p);
+                        }
+                    }
+                    y += bh as i32;
                 }
             }
         }
@@ -436,9 +510,173 @@ impl Document {
         }
     }
 
+    /// True when any visible layer carries an enabled effect —
+    /// those layers need region buffers (blurs), so rendering
+    /// routes through the effects compositor.
+    pub fn has_effects(&self) -> bool {
+        if self.effects_suppressed {
+            return false;
+        }
+        self.layers.iter().any(|l| {
+            l.visible
+                && l.adjustment.is_none()
+                && l.effects.map(|e| e.any_enabled()).unwrap_or(false)
+        })
+    }
+
+    /// Build effect buffers for every effected layer covering
+    /// (x, y, w, h) plus each effect's margin.
+    fn fx_buffers(&self, x: i32, y: i32, w: u32, h: u32) -> Vec<FxBuf> {
+        let mut out = Vec::new();
+        for (li, layer) in self.layers.iter().enumerate() {
+            let Some(fx) = &layer.effects else { continue };
+            if !layer.visible || layer.adjustment.is_some() || !fx.any_enabled() {
+                continue;
+            }
+            let m = fx.margin();
+            let (ox, oy) = (x - m, y - m);
+            let (bw, bh) = (
+                (w as i32 + 2 * m).max(0) as usize,
+                (h as i32 + 2 * m).max(0) as usize,
+            );
+            let mut content = vec![Pixel16::from_f32s(0.0, 0.0, 0.0, 0.0); bw * bh];
+            for yy in 0..bh as i32 {
+                for xx in 0..bw as i32 {
+                    let (dx, dy) = (ox + xx, oy + yy);
+                    let mf = Self::mask_factor(layer, dx, dy);
+                    let p = match self.mode {
+                        ColorMode::Cmyk => {
+                            let (c, mm, yel, k, a) = self.get_cmyk(li, dx, dy);
+                            let bf = |v: u16| v as f32 / 65535.0;
+                            let (r, g, b) =
+                                crate::color::cmyk_to_rgb(bf(c), bf(mm), bf(yel), bf(k));
+                            Pixel16::from_f32s(r, g, b, bf(a) * mf)
+                        }
+                        _ => {
+                            let p = layer.get_pixel(dx, dy).to_f32s();
+                            Pixel16::from_f32s(p.0, p.1, p.2, p.3 * mf)
+                        }
+                    };
+                    content[(yy as usize) * bw + xx as usize] = p;
+                }
+            }
+            let below = crate::effects::below_buffer(&content, bw, bh, fx, self.global_angle);
+            let mut within = content;
+            crate::effects::apply_within(&mut within, bw, bh, fx, self.global_angle);
+            out.push(FxBuf {
+                li,
+                ox,
+                oy,
+                w: bw,
+                below,
+                within,
+            });
+        }
+        out
+    }
+
+    /// The render_pixel loop with effect buffers substituted for
+    /// effected layers. Only called when `has_effects()`.
+    fn composite_with_fx(&self, fx: &[FxBuf], x: i32, y: i32) -> Pixel16 {
+        let mut acc = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+        for (li, layer) in self.layers.iter().enumerate() {
+            if !layer.visible {
+                continue;
+            }
+            if let Some(adj) = &layer.adjustment {
+                if acc.3 > 0.0 {
+                    let t = layer.opacity * Self::mask_factor(layer, x, y);
+                    if t > 0.0 {
+                        let (r, g, b) = adj.apply(acc.0, acc.1, acc.2);
+                        acc.0 += (r - acc.0) * t;
+                        acc.1 += (g - acc.1) * t;
+                        acc.2 += (b - acc.2) * t;
+                    }
+                }
+                continue;
+            }
+            let buf = fx.iter().find(|b| b.li == li);
+            if let Some(buf) = buf {
+                let idx = ((y - buf.oy) as usize) * buf.w + (x - buf.ox) as usize;
+                let bp = buf.below[idx].to_f32s();
+                if bp.3 > 0.0 {
+                    acc = composite_over(acc, bp, crate::blend::BlendMode::Normal, layer.opacity);
+                }
+                let mut p = buf.within[idx].to_f32s();
+                let mut mode = layer.blend_mode;
+                let mut opacity = layer.opacity;
+                if mode == crate::blend::BlendMode::Dissolve {
+                    let prob = opacity * p.3;
+                    if prob <= 0.0 || crate::blend::dissolve_hash(x, y, li as u32) >= prob {
+                        continue;
+                    }
+                    p.3 = 1.0;
+                    opacity = 1.0;
+                    mode = crate::blend::BlendMode::Normal;
+                }
+                acc = composite_over(acc, p, mode, opacity);
+                continue;
+            }
+            let mut p = layer.get_pixel(x, y).to_f32s();
+            p.3 *= Self::mask_factor(layer, x, y);
+            let mut mode = layer.blend_mode;
+            let mut opacity = layer.opacity;
+            if mode == crate::blend::BlendMode::Dissolve {
+                let prob = opacity * p.3;
+                if prob <= 0.0 || crate::blend::dissolve_hash(x, y, li as u32) >= prob {
+                    continue;
+                }
+                p.3 = 1.0;
+                opacity = 1.0;
+                mode = crate::blend::BlendMode::Normal;
+            }
+            acc = composite_over(acc, p, mode, opacity);
+        }
+        Pixel16::from_f32s(acc.0, acc.1, acc.2, acc.3)
+    }
+
+    /// Render a region to Pixel16 rows, effects-aware: buffers are
+    /// built once per region instead of once per pixel.
+    fn render_region_px(&self, x: i32, y: i32, w: u32, h: u32) -> Vec<Pixel16> {
+        if !self.has_effects() {
+            let mut out = Vec::with_capacity((w * h) as usize);
+            for yy in 0..h as i32 {
+                for xx in 0..w as i32 {
+                    out.push(self.render_pixel(x + xx, y + yy));
+                }
+            }
+            return out;
+        }
+        let fx = self.fx_buffers(x, y, w, h);
+        let mut out = Vec::with_capacity((w * h) as usize);
+        for yy in 0..h as i32 {
+            for xx in 0..w as i32 {
+                out.push(self.composite_with_fx(&fx, x + xx, y + yy));
+            }
+        }
+        out
+    }
+
     /// Flattened pixel at (x, y): all visible layers composited.
     /// CMYK documents composite in ink space and convert to RGB.
     pub fn render_pixel(&self, x: i32, y: i32) -> Pixel16 {
+        if self.has_effects() {
+            // Single-pixel query on an effected document: render
+            // a window around the point (margin-capped) and take
+            // the center. Region renders (display, flatten,
+            // export) build the buffers once and stay fast.
+            let m = self
+                .layers
+                .iter()
+                .filter_map(|l| l.effects)
+                .map(|e| e.margin())
+                .max()
+                .unwrap_or(0)
+                .min(256);
+            let side = (2 * m + 1) as u32;
+            let region = self.render_region_px(x - m, y - m, side, side);
+            return region[(m as usize) * side as usize + m as usize];
+        }
         if self.mode == ColorMode::Cmyk {
             let (ink, a) = self.composite_inks(x, y);
             let (r, g, b) = cmyk_to_rgb(ink[0], ink[1], ink[2], ink[3]);
@@ -602,16 +840,14 @@ impl Document {
     /// This is the Phase 0 "display" path — the GPU renderer later
     /// consumes the same tiles, not this buffer.
     pub fn render_region_rgba8(&self, x: i32, y: i32, w: u32, h: u32) -> Vec<u8> {
+        let px = self.render_region_px(x, y, w, h);
         let mut out = vec![0u8; (w * h * 4) as usize];
-        for yy in 0..h as i32 {
-            for xx in 0..w as i32 {
-                let p = self.render_pixel(x + xx, y + yy).to_rgba8();
-                let i = ((yy as u32 * w + xx as u32) * 4) as usize;
-                out[i] = p.0;
-                out[i + 1] = p.1;
-                out[i + 2] = p.2;
-                out[i + 3] = p.3;
-            }
+        for (n, p) in px.iter().enumerate() {
+            let p = p.to_rgba8();
+            out[n * 4] = p.0;
+            out[n * 4 + 1] = p.1;
+            out[n * 4 + 2] = p.2;
+            out[n * 4 + 3] = p.3;
         }
         out
     }
