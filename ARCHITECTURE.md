@@ -415,3 +415,35 @@ The full-behavior pass over the Phase 6 surface:
   fields stored in the document, Paths exported as an
   Illustrator-style EPS text file, the Options Bar, and
   full-screen display modes.
+
+## Phase 7 additions (v0.7.0)
+
+- Healing is texture transfer, not blurring: a heal stamp or
+  patch carries the source's high-frequency detail (source
+  minus its blur) onto the destination's own blurred tone, so
+  repairs keep the destination's lighting. Pattern Maker
+  builds seamless tiles by cross-blending a sample with its
+  half-offset copy under a sin² weight field.
+- The paint engine is dynamics-driven: a per-stroke wrapper
+  computes each stamp's effective tip (size/angle/roundness
+  with jitter and fade), scatter and count, texture and dual
+  tips, color dynamics, and opacity/flow jitter. The core tip
+  strength pipeline evaluates shape, texture, dual tip, noise
+  and wet edges in one function, so every stamp tool shares
+  the behavior. Brush presets (.ABR v2) serialize the whole
+  dynamics state; v1 files still load.
+- Tool Presets capture a tool plus its option state and live
+  in three places: an options-bar picker, a palette, and the
+  Preset Manager. Workspaces capture the panel visibility
+  set, the Options Bar and the screen mode. Both persist as
+  plain text under ~/.pictodesk/.
+- Liquify keeps its displacement field in the dialog with a
+  snapshot stack for multiple undo; meshes serialize to a
+  compact binary format and resample onto other sizes.
+- Type utilities work on the stored text spec, shifting
+  style runs so character styling survives edits: spell
+  check against a bundled basic wordlist plus a personal
+  dictionary, and find & replace with case/whole-word modes.
+- Save for Web gains color-to-transparency knockout with
+  optional error-diffusion dithering and WBMP output; JPEG
+  exports carry File Info as an XMP packet.

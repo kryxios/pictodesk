@@ -23,10 +23,15 @@ pub enum BlendMode {
     ColorDodge,
     ColorBurn,
     Exclusion,
+    LinearBurn,
+    LinearDodge,
+    VividLight,
+    LinearLight,
+    PinLight,
 }
 
 /// All modes in menu order (the classic palette order).
-pub const ALL_BLEND_MODES: [BlendMode; 17] = [
+pub const ALL_BLEND_MODES: [BlendMode; 22] = [
     BlendMode::Normal,
     BlendMode::Dissolve,
     BlendMode::Multiply,
@@ -34,10 +39,15 @@ pub const ALL_BLEND_MODES: [BlendMode; 17] = [
     BlendMode::Lighten,
     BlendMode::Screen,
     BlendMode::ColorDodge,
+    BlendMode::LinearDodge,
     BlendMode::ColorBurn,
+    BlendMode::LinearBurn,
     BlendMode::Overlay,
     BlendMode::SoftLight,
     BlendMode::HardLight,
+    BlendMode::VividLight,
+    BlendMode::LinearLight,
+    BlendMode::PinLight,
     BlendMode::Difference,
     BlendMode::Exclusion,
     BlendMode::Hue,
@@ -66,6 +76,11 @@ impl BlendMode {
             BlendMode::ColorDodge => 14,
             BlendMode::ColorBurn => 15,
             BlendMode::Exclusion => 16,
+            BlendMode::LinearBurn => 17,
+            BlendMode::LinearDodge => 18,
+            BlendMode::VividLight => 19,
+            BlendMode::LinearLight => 20,
+            BlendMode::PinLight => 21,
         }
     }
 
@@ -88,6 +103,11 @@ impl BlendMode {
             BlendMode::ColorDodge => "Color Dodge",
             BlendMode::ColorBurn => "Color Burn",
             BlendMode::Exclusion => "Exclusion",
+            BlendMode::LinearBurn => "Linear Burn",
+            BlendMode::LinearDodge => "Linear Dodge",
+            BlendMode::VividLight => "Vivid Light",
+            BlendMode::LinearLight => "Linear Light",
+            BlendMode::PinLight => "Pin Light",
         }
     }
 
@@ -119,6 +139,11 @@ impl BlendMode {
             14 => BlendMode::ColorDodge,
             15 => BlendMode::ColorBurn,
             16 => BlendMode::Exclusion,
+            17 => BlendMode::LinearBurn,
+            18 => BlendMode::LinearDodge,
+            19 => BlendMode::VividLight,
+            20 => BlendMode::LinearLight,
+            21 => BlendMode::PinLight,
             _ => return None,
         })
     }
@@ -173,6 +198,39 @@ impl BlendMode {
                 }
             }
             BlendMode::Exclusion => b + s - 2.0 * b * s,
+            BlendMode::LinearBurn => (b + s - 1.0).max(0.0),
+            BlendMode::LinearDodge => (b + s).min(1.0),
+            BlendMode::VividLight => {
+                if s < 0.5 {
+                    let d = 2.0 * s;
+                    if d <= 0.0 {
+                        0.0
+                    } else {
+                        1.0 - ((1.0 - b) / d).min(1.0)
+                    }
+                } else {
+                    let d = 2.0 * (s - 0.5);
+                    if d >= 1.0 {
+                        1.0
+                    } else {
+                        (b / (1.0 - d)).min(1.0)
+                    }
+                }
+            }
+            BlendMode::LinearLight => {
+                if s < 0.5 {
+                    (b + 2.0 * s - 1.0).max(0.0)
+                } else {
+                    (b + 2.0 * (s - 0.5)).min(1.0)
+                }
+            }
+            BlendMode::PinLight => {
+                if s < 0.5 {
+                    b.min(2.0 * s)
+                } else {
+                    b.max(2.0 * (s - 0.5))
+                }
+            }
             // Dissolve is not a channel formula: the compositor
             // gates the whole pixel on a deterministic hash (see
             // Document::render_pixel). Fall back to Normal here.

@@ -26,6 +26,7 @@ pub enum ExportFormat {
     Gif,
     Pcx,
     Tga,
+    Wbmp,
 }
 
 impl ExportFormat {
@@ -38,6 +39,7 @@ impl ExportFormat {
             "pcx" => Some(ExportFormat::Pcx),
             "tga" => Some(ExportFormat::Tga),
             "gif" => Some(ExportFormat::Gif),
+            "wbmp" => Some(ExportFormat::Wbmp),
             _ => None,
         }
     }
@@ -413,8 +415,176 @@ pub fn export_image(
             enc.write_image(&rgba, w, h, image::ExtendedColorType::Rgba8)
                 .map_err(|e| IoError::Encode(e.to_string()))?;
         }
+        ExportFormat::Wbmp => {
+            out = encode_wbmp(&rgba, w, h);
+        }
+    }
+    // XMP: File Info fields ride in JPEG exports as an APP1
+    // XMP packet (7.0).
+    if matches!(format, ExportFormat::Jpeg) {
+        if let Some(packet) = xmp_packet(doc) {
+            out = insert_jpeg_xmp(&out, &packet);
+        }
     }
     Ok(out)
+}
+
+/// Encode an arbitrary RGBA buffer (Save for Web works on a
+/// processed render: transparency knockout, dithering).
+pub fn encode_rgba(
+    rgba: &[u8],
+    w: u32,
+    h: u32,
+    format: ExportFormat,
+    jpeg_quality: u8,
+) -> Result<Vec<u8>, IoError> {
+    let mut out: Vec<u8> = Vec::new();
+    match format {
+        ExportFormat::Png => {
+            let enc = image::codecs::png::PngEncoder::new(&mut out);
+            enc.write_image(rgba, w, h, image::ExtendedColorType::Rgba8)
+                .map_err(|e| IoError::Encode(e.to_string()))?;
+        }
+        ExportFormat::Gif => {
+            let enc = image::codecs::gif::GifEncoder::new(&mut out);
+            enc.write_image(rgba, w, h, image::ExtendedColorType::Rgba8)
+                .map_err(|e| IoError::Encode(e.to_string()))?;
+        }
+        ExportFormat::Wbmp => {
+            out = encode_wbmp(rgba, w, h);
+        }
+        _ => {
+            let rgb: Vec<u8> = rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .flat_map(|p| [p[0], p[1], p[2]])
+                .collect();
+            let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, jpeg_quality);
+            enc.write_image(&rgb, w, h, image::ExtendedColorType::Rgb8)
+                .map_err(|e| IoError::Encode(e.to_string()))?;
+        }
+    }
+    Ok(out)
+}
+
+/// WBMP (Wireless Bitmap): a 1-bit format — two zero header
+/// bytes, multi-byte-integer dimensions, then rows of packed
+/// bits, MSB first, 1 = white (luminance >= 128).
+pub fn encode_wbmp(rgba: &[u8], w: u32, h: u32) -> Vec<u8> {
+    fn varint(mut v: u32, out: &mut Vec<u8>) {
+        let mut stack = vec![(v & 0x7F) as u8];
+        v >>= 7;
+        while v > 0 {
+            stack.push((v & 0x7F) as u8);
+            v >>= 7;
+        }
+        for (i, b) in stack.iter().rev().enumerate() {
+            out.push(if i + 1 < stack.len() { b | 0x80 } else { *b });
+        }
+    }
+    let mut out = vec![0u8, 0u8];
+    varint(w, &mut out);
+    varint(h, &mut out);
+    let row_bytes = (w as usize).div_ceil(8);
+    for y in 0..h as usize {
+        for bx in 0..row_bytes {
+            let mut byte = 0u8;
+            for bit in 0..8 {
+                let x = bx * 8 + bit;
+                if x < w as usize {
+                    let i = (y * w as usize + x) * 4;
+                    let lum = (0.299 * rgba[i] as f32
+                        + 0.587 * rgba[i + 1] as f32
+                        + 0.114 * rgba[i + 2] as f32) as u32;
+                    if lum >= 128 {
+                        byte |= 0x80 >> bit;
+                    }
+                }
+            }
+            out.push(byte);
+        }
+    }
+    out
+}
+
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Build the XMP packet for a document's File Info fields,
+/// or None when every field is empty.
+pub fn xmp_packet(doc: &Document) -> Option<String> {
+    let fields = [
+        &doc.info_title,
+        &doc.info_caption,
+        &doc.info_keywords,
+        &doc.info_copyright,
+        &doc.info_credit,
+    ];
+    if fields.iter().all(|f| f.trim().is_empty()) {
+        return None;
+    }
+    let mut inner = String::new();
+    if !doc.info_title.trim().is_empty() {
+        inner += &format!(
+            "<dc:title><rdf:Alt><rdf:li xml:lang=\"x-default\">{}</rdf:li></rdf:Alt></dc:title>",
+            xml_escape(&doc.info_title)
+        );
+    }
+    if !doc.info_caption.trim().is_empty() {
+        inner += &format!(
+            "<dc:description><rdf:Alt><rdf:li xml:lang=\"x-default\">{}</rdf:li></rdf:Alt></dc:description>",
+            xml_escape(&doc.info_caption)
+        );
+    }
+    if !doc.info_keywords.trim().is_empty() {
+        inner += "<dc:subject><rdf:Bag>";
+        for kw in doc.info_keywords.split(',') {
+            let kw = kw.trim();
+            if !kw.is_empty() {
+                inner += &format!("<rdf:li>{}</rdf:li>", xml_escape(kw));
+            }
+        }
+        inner += "</rdf:Bag></dc:subject>";
+    }
+    if !doc.info_copyright.trim().is_empty() {
+        inner += &format!(
+            "<dc:rights><rdf:Alt><rdf:li xml:lang=\"x-default\">{}</rdf:li></rdf:Alt></dc:rights>",
+            xml_escape(&doc.info_copyright)
+        );
+    }
+    if !doc.info_credit.trim().is_empty() {
+        inner += &format!(
+            "<photoshop:Credit>{}</photoshop:Credit>",
+            xml_escape(&doc.info_credit)
+        );
+    }
+    Some(format!(
+        "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\"><rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\"><rdf:Description rdf:about=\"\" xmlns:dc=\"http://purl.org/dc/elements/1.1/\" xmlns:photoshop=\"http://ns.adobe.com/photoshop/1.0/\">{inner}</rdf:Description></rdf:RDF></x:xmpmeta>"
+    ))
+}
+
+/// Splice an XMP packet into encoded JPEG bytes as the
+/// first APP1 segment after the SOI marker.
+pub fn insert_jpeg_xmp(jpeg: &[u8], packet: &str) -> Vec<u8> {
+    if jpeg.len() < 2 || jpeg[0] != 0xFF || jpeg[1] != 0xD8 {
+        return jpeg.to_vec();
+    }
+    let mut seg = Vec::with_capacity(29 + packet.len());
+    seg.extend_from_slice(b"http://ns.adobe.com/xap/1.0/\0");
+    seg.extend_from_slice(packet.as_bytes());
+    let len = (seg.len() + 2) as u16;
+    let mut out = Vec::with_capacity(jpeg.len() + seg.len() + 4);
+    out.extend_from_slice(&jpeg[0..2]);
+    out.push(0xFF);
+    out.push(0xE1);
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(&seg);
+    out.extend_from_slice(&jpeg[2..]);
+    out
 }
 
 pub fn load_file(path: &Path) -> Result<Document, IoError> {

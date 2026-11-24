@@ -67,6 +67,8 @@ enum Tool {
     BackgroundEraser,
     Stamp,
     PatternStamp,
+    Heal,
+    Patch,
     Pen,
     FreeformPen,
     MagneticPen,
@@ -122,6 +124,8 @@ impl Tool {
             Tool::BackgroundEraser => "Background Eraser",
             Tool::Stamp => "Clone Stamp",
             Tool::PatternStamp => "Pattern Stamp",
+            Tool::Heal => "Healing Brush",
+            Tool::Patch => "Patch",
             Tool::Pen => "Pen",
             Tool::FreeformPen => "Freeform Pen",
             Tool::MagneticPen => "Magnetic Pen",
@@ -163,6 +167,7 @@ impl Tool {
             Tool::HistoryBrush | Tool::ArtHistoryBrush => 'y',
             Tool::Eraser | Tool::MagicEraser | Tool::BackgroundEraser => 'e',
             Tool::Stamp | Tool::PatternStamp => 's',
+            Tool::Heal | Tool::Patch => 'j',
             Tool::Pen | Tool::FreeformPen | Tool::MagneticPen | Tool::ConvertAnchor => 'p',
             Tool::Type | Tool::VertType | Tool::TypeMask | Tool::VertTypeMask => 't',
             Tool::Bucket => 'k',
@@ -182,7 +187,7 @@ impl Tool {
 }
 
 /// Toolbox order, two columns, classic grouping.
-const TOOLS: [Tool; 49] = [
+const TOOLS: [Tool; 50] = [
     Tool::Move,
     Tool::MarqueeRect,
     Tool::MarqueeEllipse,
@@ -200,7 +205,6 @@ const TOOLS: [Tool; 49] = [
     Tool::ColorSampler,
     Tool::Measure,
     Tool::Brush,
-    Tool::Airbrush,
     Tool::Pencil,
     Tool::HistoryBrush,
     Tool::ArtHistoryBrush,
@@ -209,6 +213,8 @@ const TOOLS: [Tool; 49] = [
     Tool::BackgroundEraser,
     Tool::Stamp,
     Tool::PatternStamp,
+    Tool::Heal,
+    Tool::Patch,
     Tool::Bucket,
     Tool::Gradient,
     Tool::Blur,
@@ -289,6 +295,7 @@ enum PanelRow {
 enum PanelKind {
     Cp,
     Brushes,
+    ToolPresets,
     Histogram,
     Color,
     Navigator,
@@ -374,6 +381,10 @@ enum Action {
     FilterOffset,
     FilterCustom,
     AdjustEqualize,
+    AutoLevelsCmd,
+    AutoContrastCmd,
+    AutoColorCmd,
+    PatternMakerDialog,
     CopyMerged,
     PasteInto,
     SelectAll,
@@ -421,6 +432,13 @@ enum Action {
     PurgeAll,
     ToggleHistogram,
     ToggleBrushes,
+    ToggleToolPresets,
+    SpellCheckDialog,
+    FindReplaceDialog,
+    FileBrowserDialog,
+    SaveWorkspaceDialog,
+    ApplyWorkspace(usize),
+    DeleteWorkspace(usize),
     ToggleChannels,
     ToggleLayers,
     NewLayer,
@@ -601,6 +619,10 @@ enum OptAct {
     StrokeDown,
     StrokeUp,
     StampSample,
+    HealSource,
+    FlowDown,
+    FlowUp,
+    AirbrushToggle,
     EraseHistory,
     DropperSample,
     GradShape,
@@ -610,6 +632,11 @@ enum OptAct {
 
 #[derive(Clone, Debug, PartialEq)]
 enum DialogKind {
+    SpellCheck,
+    FindReplace,
+    SaveWorkspace,
+    RenameItem,
+    FileBrowser,
     BrightnessContrast,
     HueSaturation,
     ColorBalance,
@@ -673,6 +700,7 @@ enum DialogKind {
     SelectiveColor,
     ReplaceColor,
     Variations,
+    PatternMaker,
     // Phase 6.5 Batch 3 kinds: channel dialogs.
     ApplyImage,
     Calculations,
@@ -835,6 +863,12 @@ impl DialogKind {
             DialogKind::SelectiveColor => "Selective Color",
             DialogKind::ReplaceColor => "Replace Color",
             DialogKind::Variations => "Variations",
+            DialogKind::PatternMaker => "Pattern Maker",
+            DialogKind::SaveWorkspace => "Save Workspace",
+            DialogKind::SpellCheck => "Check Spelling",
+            DialogKind::FindReplace => "Find and Replace",
+            DialogKind::RenameItem => "Rename",
+            DialogKind::FileBrowser => "File Browser",
             DialogKind::ApplyImage => "Apply Image",
             DialogKind::Calculations => "Calculations",
             DialogKind::LoadSel => "Load Selection",
@@ -1032,6 +1066,8 @@ struct Dialog {
     rc_target: (u8, u8, u8),
     /// Variations working copy (Batch 4).
     var_doc: Option<pictodesk_core::document::Document>,
+    /// Phase 7: the Pattern Maker's generated tile.
+    pm_tile: Option<pictodesk_core::document::PatternData>,
     /// Variations thumbnail of the working copy (88x56 RGB).
     var_thumb: Vec<(u8, u8, u8)>,
     /// Color Settings: pending default working space index.
@@ -1042,6 +1078,22 @@ struct Dialog {
     /// 8 Freeze, 9 Thaw), last stamp point, freeze mask, mesh.
     liq_tool: u8,
     liq_last: Option<(f32, f32)>,
+    liq_zoom: f32,
+    liq_pan: (f32, f32),
+    liq_backdrop: bool,
+    liq_undo: Vec<Vec<(f32, f32)>>,
+    liq_seed: u32,
+    liq_save_req: bool,
+    liq_load_req: bool,
+    spell_items: Vec<(usize, usize, usize, String)>,
+    spell_pos: usize,
+    spell_ignore: Vec<String>,
+    web_knockout: bool,
+    web_dither: bool,
+    browser_dir: String,
+    browser_entries: Vec<BrowserEntry>,
+    browser_sel: usize,
+    browser_sort_rank: bool,
     liq_frozen: Vec<u8>,
     liq_mesh: bool,
     /// Preset Manager: selected preset row.
@@ -1077,6 +1129,13 @@ struct Dialog {
 impl Dialog {
     fn new(kind: DialogKind, doc: &Document) -> Self {
         let vals = match kind {
+            DialogKind::SaveWorkspace
+            | DialogKind::RenameItem
+            | DialogKind::FileBrowser
+            | DialogKind::SpellCheck
+            | DialogKind::FindReplace => {
+                vec![]
+            }
             DialogKind::BrightnessContrast => vec![0.0, 0.0],
             DialogKind::HueSaturation => vec![0.0, 0.0, 0.0],
             DialogKind::ColorBalance => vec![0.0; 9],
@@ -1134,6 +1193,7 @@ impl Dialog {
             DialogKind::SelectiveColor => vec![0.0, 0.0, 0.0, 0.0],
             DialogKind::ReplaceColor => vec![40.0, 0.0, 0.0, 0.0],
             DialogKind::Variations => vec![20.0],
+            DialogKind::PatternMaker => vec![],
             DialogKind::ApplyImage => vec![100.0],
             DialogKind::Calculations => vec![100.0],
             DialogKind::LoadSel => vec![],
@@ -1305,10 +1365,27 @@ impl Dialog {
             pr_bilinear: false,
             rc_target: (0, 0, 0),
             var_doc: None,
+            pm_tile: None,
             var_thumb: Vec::new(),
             cs_default: 0,
             liq_tool: 0,
             liq_last: None,
+            liq_zoom: 1.0,
+            liq_pan: (0.0, 0.0),
+            liq_backdrop: false,
+            liq_undo: Vec::new(),
+            liq_seed: 1,
+            liq_save_req: false,
+            liq_load_req: false,
+            spell_items: Vec::new(),
+            spell_pos: 0,
+            spell_ignore: Vec::new(),
+            web_knockout: false,
+            web_dither: false,
+            browser_dir: String::new(),
+            browser_entries: Vec::new(),
+            browser_sel: 0,
+            browser_sort_rank: false,
             liq_frozen: Vec::new(),
             liq_mesh: false,
             preset_sel: 0,
@@ -1331,6 +1408,13 @@ impl Dialog {
     /// (label, min, max) per slider index.
     fn slider_defs(&self) -> Vec<(&'static str, f32, f32)> {
         match self.kind {
+            DialogKind::SaveWorkspace
+            | DialogKind::RenameItem
+            | DialogKind::FileBrowser
+            | DialogKind::SpellCheck
+            | DialogKind::FindReplace => {
+                vec![]
+            }
             DialogKind::BrightnessContrast => {
                 vec![("Brightness", -150.0, 150.0), ("Contrast", -100.0, 100.0)]
             }
@@ -1523,6 +1607,7 @@ impl Dialog {
                 ("Lightness", -100.0, 100.0),
             ],
             DialogKind::Variations => vec![("Fine - Coarse", 1.0, 40.0)],
+            DialogKind::PatternMaker => vec![],
             DialogKind::ApplyImage => vec![("Opacity %", 0.0, 100.0)],
             DialogKind::Calculations => vec![("Opacity %", 0.0, 100.0)],
             DialogKind::LoadSel => vec![],
@@ -1818,9 +1903,158 @@ enum DragMode {
     MagLasso,
     FreePen,
     MagPen,
+    PatchDrag,
     // Phase 6 drags.
     ShapeDrag,
     SliceDrag,
+}
+
+/// Phase 7 paint-engine settings (the Brushes palette's
+/// sections). Controls: 0 = Off, 1 = Fade, 2+ = pen
+/// controls (present in the palette; this build has no
+/// tablet pressure input, so they behave as Off — named in
+/// the phase delivery). One shared Fade length (fade_steps)
+/// serves every Fade control.
+#[derive(Clone, Debug, PartialEq)]
+struct BrushDynamics {
+    spacing: f32,
+    angle_deg: f32,
+    roundness: f32,
+    flip_x: bool,
+    flip_y: bool,
+    size_jitter: f32,
+    size_control: u8,
+    min_diameter: f32,
+    angle_jitter: f32,
+    angle_control: u8,
+    round_jitter: f32,
+    round_control: u8,
+    min_roundness: f32,
+    fade_steps: u32,
+    scatter: f32,
+    both_axes: bool,
+    count: u8,
+    count_jitter: f32,
+    texture_on: bool,
+    tex_scale: f32,
+    tex_depth: f32,
+    tex_min_depth: f32,
+    tex_mode: u8,
+    tex_invert: bool,
+    protect_texture: bool,
+    dual_on: bool,
+    dual_size: f32,
+    dual_hardness: f32,
+    dual_mode: u8,
+    dual_scatter: f32,
+    fb_jitter: f32,
+    hue_jitter: f32,
+    sat_jitter: f32,
+    bri_jitter: f32,
+    opacity_jitter: f32,
+    opacity_control: u8,
+    flow_jitter: f32,
+    flow_control: u8,
+    noise: bool,
+    wet_edges: bool,
+    airbrush: bool,
+    smoothing: bool,
+}
+
+impl Default for BrushDynamics {
+    fn default() -> Self {
+        BrushDynamics {
+            spacing: 0.25,
+            angle_deg: 0.0,
+            roundness: 1.0,
+            flip_x: false,
+            flip_y: false,
+            size_jitter: 0.0,
+            size_control: 0,
+            min_diameter: 0.0,
+            angle_jitter: 0.0,
+            angle_control: 0,
+            round_jitter: 0.0,
+            round_control: 0,
+            min_roundness: 0.0,
+            fade_steps: 100,
+            scatter: 0.0,
+            both_axes: false,
+            count: 1,
+            count_jitter: 0.0,
+            texture_on: false,
+            tex_scale: 1.0,
+            tex_depth: 0.5,
+            tex_min_depth: 0.0,
+            tex_mode: 0,
+            tex_invert: false,
+            protect_texture: false,
+            dual_on: false,
+            dual_size: 13.0,
+            dual_hardness: 1.0,
+            dual_mode: 1,
+            dual_scatter: 0.0,
+            fb_jitter: 0.0,
+            hue_jitter: 0.0,
+            sat_jitter: 0.0,
+            bri_jitter: 0.0,
+            opacity_jitter: 0.0,
+            opacity_control: 0,
+            flow_jitter: 0.0,
+            flow_control: 0,
+            noise: false,
+            wet_edges: false,
+            airbrush: false,
+            smoothing: false,
+        }
+    }
+}
+
+/// One LCG step -> 0..1. Stroke randomness is seeded per
+/// stroke so a stroke is reproducible in tests.
+fn next_rand(state: &mut u32) -> f32 {
+    *state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+    (*state >> 9) as f32 / (1u32 << 23) as f32
+}
+
+/// rgb -> hsl with hue in turns (this codebase's convention).
+fn rgb_to_hsl_turns(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
+    let mx = r.max(g).max(b);
+    let mn = r.min(g).min(b);
+    let l = (mx + mn) / 2.0;
+    if (mx - mn).abs() < 1e-6 {
+        return (0.0, 0.0, l);
+    }
+    let d = mx - mn;
+    let s = if l > 0.5 {
+        d / (2.0 - mx - mn)
+    } else {
+        d / (mx + mn)
+    };
+    let h = if mx == r {
+        ((g - b) / d).rem_euclid(6.0)
+    } else if mx == g {
+        (b - r) / d + 2.0
+    } else {
+        (r - g) / d + 4.0
+    };
+    (h / 6.0, s, l)
+}
+
+fn hsl_turns_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
+    let h = h.rem_euclid(1.0);
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let x = c * (1.0 - ((h * 6.0) % 2.0 - 1.0).abs());
+    let m = l - c / 2.0;
+    let (r, g, b) = match (h * 6.0) as i32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    (r + m, g + m, b + m)
 }
 
 struct StrokeState {
@@ -1829,6 +2063,12 @@ struct StrokeState {
     last_point: (f32, f32),
     smudge_carry: Pixel16,
     tiles_seen: Vec<(i32, i32)>,
+    /// Phase 7 engine state: RNG, stamp counter (Fade),
+    /// the smoothed point, and the stroke's texture.
+    rng: u32,
+    stamps: u32,
+    smooth: (f32, f32),
+    tex: Option<std::rc::Rc<pictodesk_core::brush::BrushTexture>>,
 }
 
 /// What the canvas is showing: the composite, one color channel,
@@ -2111,6 +2351,9 @@ enum RecordedStep {
     Flatten,
     CropToSelection,
     Equalize,
+    AutoLevels,
+    AutoContrast,
+    AutoColor,
     Sharpen,
     MotionBlur(f32, f32),
     RadialBlur(f32),
@@ -2247,6 +2490,9 @@ impl RecordedStep {
             RecordedStep::Flatten => "Flatten Image".into(),
             RecordedStep::CropToSelection => "Crop".into(),
             RecordedStep::Equalize => "Equalize".into(),
+            RecordedStep::AutoLevels => "Auto Levels".into(),
+            RecordedStep::AutoContrast => "Auto Contrast".into(),
+            RecordedStep::AutoColor => "Auto Color".into(),
             RecordedStep::Sharpen => "Sharpen".into(),
             RecordedStep::MotionBlur(..) => "Motion Blur".into(),
             RecordedStep::RadialBlur(_) => "Radial Blur".into(),
@@ -2404,6 +2650,9 @@ fn step_to_line(step: &RecordedStep) -> Option<String> {
         RecordedStep::FlipH => "fliph".into(),
         RecordedStep::FlipV => "flipv".into(),
         RecordedStep::Equalize => "equalize".into(),
+        RecordedStep::AutoLevels => "autolevels".into(),
+        RecordedStep::AutoContrast => "autocontrast".into(),
+        RecordedStep::AutoColor => "autocolor".into(),
         RecordedStep::ImageSize(v0, v1) => format!("imagesize {} {}", *v0, *v1),
         RecordedStep::CanvasSize(w, h, a) => format!("canvassize {w} {h} {} {}", a.0, a.1),
         RecordedStep::Rotate180 => "rot180".into(),
@@ -2821,6 +3070,9 @@ fn line_to_step(line: &str) -> Option<RecordedStep> {
         "fliph" => RecordedStep::FlipH,
         "flipv" => RecordedStep::FlipV,
         "equalize" => RecordedStep::Equalize,
+        "autolevels" => RecordedStep::AutoLevels,
+        "autocontrast" => RecordedStep::AutoContrast,
+        "autocolor" => RecordedStep::AutoColor,
         "imagesize" => RecordedStep::ImageSize(pu(1)?, pu(2)?),
         "canvassize" => RecordedStep::CanvasSize(pu(1)?, pu(2)?, (pi(3)?, pi(4)?)),
         "rot180" => RecordedStep::Rotate180,
@@ -3008,6 +3260,282 @@ fn actions_file_path() -> Option<PathBuf> {
 /// Load the persisted action sets + actions, if the file
 /// exists. Format: header, then `set <name>` lines and
 /// `action <set>\t<name>` lines each followed by step lines.
+/// Stamp text into a layer in the 8x8 UI font (Picture
+/// Package labels).
+fn stamp_label(
+    layer: &mut pictodesk_core::layer::Layer,
+    x: i32,
+    y: i32,
+    text: &str,
+    color: Pixel16,
+) {
+    for (ci, ch) in text.chars().enumerate() {
+        if let Some(glyph) = font8x8::BASIC_FONTS.get(ch) {
+            for (row, &bits) in glyph.iter().enumerate() {
+                for col in 0..8 {
+                    if bits & (1 << col) != 0 {
+                        layer.set_pixel(x + (ci * 8 + col) as i32, y + row as i32, color);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Save for Web color-to-transparency: pixels equal to
+/// `key` become transparent. With dithering, pixels near the
+/// key color join in by color distance, error-diffused, so
+/// edges soften instead of stair-stepping.
+fn knockout_color(rgba: &mut [u8], w: u32, h: u32, key: (u8, u8, u8), dither: bool) {
+    let (w, h) = (w as usize, h as usize);
+    if !dither {
+        for px in rgba.as_chunks_mut::<4>().0 {
+            if (px[0], px[1], px[2]) == key {
+                px[3] = 0;
+            }
+        }
+        return;
+    }
+    let dist = |px: &[u8]| -> f32 {
+        let dr = px[0] as f32 - key.0 as f32;
+        let dg = px[1] as f32 - key.1 as f32;
+        let db = px[2] as f32 - key.2 as f32;
+        (dr * dr + dg * dg + db * db).sqrt()
+    };
+    let mut err = vec![0f32; w * h];
+    for y in 0..h {
+        for x in 0..w {
+            let i = y * w + x;
+            // score: 1 at the key color, 0 at distance >= 72.
+            let score = (1.0 - dist(&rgba[i * 4..i * 4 + 3]) / 72.0).clamp(0.0, 1.0) + err[i];
+            let transparent = score >= 0.5;
+            if transparent {
+                rgba[i * 4 + 3] = 0;
+            }
+            let e = score - if transparent { 1.0 } else { 0.0 };
+            if x + 1 < w {
+                err[i + 1] += e * 7.0 / 16.0;
+            }
+            if y + 1 < h {
+                if x > 0 {
+                    err[i + w - 1] += e * 3.0 / 16.0;
+                }
+                err[i + w] += e * 5.0 / 16.0;
+                if x + 1 < w {
+                    err[i + w + 1] += e / 16.0;
+                }
+            }
+        }
+    }
+}
+
+/// Replace a byte range in a type layer's text, shifting
+/// style runs so character styling survives the edit.
+fn spec_replace(spec: &mut pictodesk_core::text::TextSpec, start: usize, end: usize, repl: &str) {
+    spec.text.replace_range(start..end, repl);
+    let delta = repl.len() as isize - (end - start) as isize;
+    for run in &mut spec.runs {
+        if run.end <= start {
+            // Before the edit: untouched.
+        } else if run.start >= end {
+            run.start = (run.start as isize + delta).max(0) as usize;
+            run.end = (run.end as isize + delta).max(0) as usize;
+        } else {
+            if run.start > start {
+                run.start = start;
+            }
+            run.end = if run.end > end {
+                (run.end as isize + delta).max(0) as usize
+            } else {
+                start + repl.len()
+            };
+        }
+    }
+    spec.runs.retain(|r| r.end > r.start);
+}
+
+/// The bundled basic English wordlist (spell check).
+fn wordlist() -> &'static std::collections::HashSet<String> {
+    static WL: std::sync::OnceLock<std::collections::HashSet<String>> = std::sync::OnceLock::new();
+    WL.get_or_init(|| {
+        include_str!("../words.txt")
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    })
+}
+
+fn personal_dict() -> std::collections::HashSet<String> {
+    std::fs::read_to_string(pictodesk_dir().join("dictionary.txt"))
+        .map(|t| {
+            t.lines()
+                .map(|l| l.trim().to_lowercase())
+                .filter(|l| !l.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Word tokens of a text: (byte start, byte end, word).
+/// Words are letter runs with internal apostrophes.
+fn word_tokens(text: &str) -> Vec<(usize, usize, String)> {
+    let mut out = Vec::new();
+    let mut start: Option<usize> = None;
+    for (i, c) in text.char_indices() {
+        let part = c.is_alphabetic() || (c == '\'' && start.is_some());
+        if part {
+            if start.is_none() {
+                start = Some(i);
+            }
+        } else if let Some(st) = start.take() {
+            out.push((st, i, text[st..i].to_string()));
+        }
+    }
+    if let Some(st) = start {
+        out.push((st, text.len(), text[st..].to_string()));
+    }
+    out
+}
+
+fn spell_known(
+    word: &str,
+    personal: &std::collections::HashSet<String>,
+    ignore: &[String],
+) -> bool {
+    let lower = word.to_lowercase();
+    let base = lower.strip_suffix("'s").unwrap_or(&lower);
+    wordlist().contains(base) || personal.contains(base) || ignore.iter().any(|i| i == base)
+}
+
+fn pictodesk_dir() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    std::path::PathBuf::from(home).join(".pictodesk")
+}
+
+/// Tool Presets on disk: one per line, tab-separated, the
+/// dynamics block hex-encoded (the .ABR v2 layout).
+fn load_tool_presets() -> Vec<ToolPreset> {
+    let path = pictodesk_dir().join("tool-presets.txt");
+    let mut out = Vec::new();
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        for line in text.lines() {
+            let f: Vec<&str> = line.split('\t').collect();
+            if f.len() < 8 {
+                continue;
+            }
+            let (Ok(tid), Ok(size), Ok(hard), Ok(flow)) = (
+                f[1].parse::<usize>(),
+                f[2].parse::<f32>(),
+                f[3].parse::<f32>(),
+                f[4].parse::<f32>(),
+            ) else {
+                continue;
+            };
+            let rgb = |t: &str| {
+                let p: Vec<u8> = t.split(',').filter_map(|x| x.parse::<u8>().ok()).collect();
+                if p.len() == 3 {
+                    (p[0], p[1], p[2])
+                } else {
+                    (0, 0, 0)
+                }
+            };
+            let dyn_ = hex_decode(f[7])
+                .and_then(|b| dyn_from_bytes(&b, 0))
+                .map(|(d, _)| d)
+                .unwrap_or_default();
+            out.push(ToolPreset {
+                name: f[0].to_string(),
+                tool: TOOLS.get(tid).copied().unwrap_or(Tool::Brush),
+                size,
+                hardness: hard,
+                dyn_,
+                flow,
+                fg: rgb(f[5]),
+                bg: rgb(f[6]),
+            });
+        }
+    }
+    if out.is_empty() {
+        let seed = |name: &str, tool: Tool, size: f32, hard: f32, air: bool, flow: f32| {
+            let dyn_ = BrushDynamics {
+                airbrush: air,
+                ..BrushDynamics::default()
+            };
+            ToolPreset {
+                name: name.into(),
+                tool,
+                size,
+                hardness: hard,
+                dyn_,
+                flow,
+                fg: (0, 0, 0),
+                bg: (255, 255, 255),
+            }
+        };
+        out = vec![
+            seed("Hard Round 13", Tool::Brush, 13.0, 1.0, false, 1.0),
+            seed("Soft Round 100", Tool::Brush, 100.0, 0.0, false, 1.0),
+            seed("Airbrush Soft", Tool::Brush, 45.0, 0.0, true, 0.5),
+            seed("Eraser Hard 19", Tool::Eraser, 19.0, 1.0, false, 1.0),
+            seed("Clone Stamp 27", Tool::Stamp, 27.0, 0.6, false, 1.0),
+        ];
+    }
+    out
+}
+
+fn save_tool_presets(presets: &[ToolPreset]) {
+    let dir = pictodesk_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let mut text = String::new();
+    for p in presets {
+        let mut bytes = Vec::new();
+        dyn_to_bytes(&p.dyn_, &mut bytes);
+        text += &format!(
+            "{}\t{}\t{}\t{}\t{}\t{},{},{}\t{},{},{}\t{}\n",
+            p.name.replace('\t', " "),
+            tool_id(p.tool),
+            p.size,
+            p.hardness,
+            p.flow,
+            p.fg.0,
+            p.fg.1,
+            p.fg.2,
+            p.bg.0,
+            p.bg.1,
+            p.bg.2,
+            hex_encode(&bytes)
+        );
+    }
+    let _ = std::fs::write(dir.join("tool-presets.txt"), text);
+}
+
+fn load_workspaces() -> Vec<(String, Workspace)> {
+    let path = pictodesk_dir().join("workspaces.txt");
+    let mut out = Vec::new();
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        for line in text.lines() {
+            let f: Vec<&str> = line.split('\t').collect();
+            if f.len() < 3 || f[1].len() < 9 {
+                continue;
+            }
+            let mut panels = [false; 9];
+            for (i, c) in f[1].chars().take(9).enumerate() {
+                panels[i] = c == '1';
+            }
+            out.push((
+                f[0].to_string(),
+                Workspace {
+                    panels,
+                    options_bar: f[1].chars().nth(9) == Some('1'),
+                    display_mode: f[2].parse().unwrap_or(0),
+                },
+            ));
+        }
+    }
+    out
+}
+
 fn load_actions_state() -> (Vec<String>, Vec<RecordedAction>) {
     let mut sets = vec!["Default Set".to_string()];
     let mut actions = Vec::new();
@@ -3150,29 +3678,337 @@ fn read_aco(bytes: &[u8]) -> Option<Vec<(u8, u8, u8)>> {
 /// (diameter, hardness) f32 pairs). The full .abr format
 /// carries sampled brush images; PictoDesk presets are round
 /// brushes, so diameter + hardness is the whole preset.
-fn write_abr(path: &std::path::Path, presets: &[(f32, f32)]) -> std::io::Result<()> {
-    let mut out: Vec<u8> = b"PDABR1".to_vec();
+/// A brush preset (Phase 7): tip size/hardness plus the
+/// full dynamics state, so a preset recalls a whole brush.
+/// A Tool Preset (7.0): a tool plus the option state it was
+/// captured with — tip, dynamics, flow and colors.
+#[derive(Clone, PartialEq)]
+struct ToolPreset {
+    name: String,
+    tool: Tool,
+    size: f32,
+    hardness: f32,
+    dyn_: BrushDynamics,
+    flow: f32,
+    fg: (u8, u8, u8),
+    bg: (u8, u8, u8),
+}
+
+/// One File Browser entry (7.0): a folder or image file
+/// with its letter rank, rotate-on-open flag and thumbnail.
+#[derive(Clone)]
+struct BrowserEntry {
+    path: std::path::PathBuf,
+    name: String,
+    is_dir: bool,
+    rank: u8,   // 0 = unranked, 1..=5 = A..E
+    rotate: i8, // -1 CCW, 0 none, 1 CW (applied on open)
+    tw: u32,
+    th: u32,
+    thumb: Vec<u8>,
+    info: String,
+}
+
+/// Minimal JPEG EXIF read: Make / Model / DateTime from the
+/// APP1 segment's TIFF IFD0.
+fn exif_summary(bytes: &[u8]) -> String {
+    if bytes.len() < 4 || bytes[0] != 0xFF || bytes[1] != 0xD8 {
+        return String::new();
+    }
+    let mut i = 2usize;
+    while i + 4 <= bytes.len() {
+        if bytes[i] != 0xFF {
+            break;
+        }
+        let marker = bytes[i + 1];
+        let len = u16::from_be_bytes([bytes[i + 2], bytes[i + 3]]) as usize;
+        if len < 2 {
+            break;
+        }
+        if marker == 0xE1 && i + 10 <= bytes.len() && &bytes[i + 4..i + 10] == b"Exif\0\0" {
+            return tiff_summary(&bytes[i + 10..(i + 2 + len).min(bytes.len())]);
+        }
+        i += 2 + len;
+    }
+    String::new()
+}
+
+fn tiff_summary(t: &[u8]) -> String {
+    if t.len() < 8 {
+        return String::new();
+    }
+    let le = &t[0..2] == b"II";
+    let u16f = |o: usize| -> u16 {
+        if o + 2 > t.len() {
+            0
+        } else if le {
+            u16::from_le_bytes([t[o], t[o + 1]])
+        } else {
+            u16::from_be_bytes([t[o], t[o + 1]])
+        }
+    };
+    let u32f = |o: usize| -> u32 {
+        if o + 4 > t.len() {
+            0
+        } else if le {
+            u32::from_le_bytes([t[o], t[o + 1], t[o + 2], t[o + 3]])
+        } else {
+            u32::from_be_bytes([t[o], t[o + 1], t[o + 2], t[o + 3]])
+        }
+    };
+    if u16f(2) != 42 {
+        return String::new();
+    }
+    let ifd = u32f(4) as usize;
+    if ifd + 2 > t.len() {
+        return String::new();
+    }
+    let count = u16f(ifd) as usize;
+    let mut parts: Vec<String> = Vec::new();
+    for k in 0..count {
+        let e = ifd + 2 + k * 12;
+        if e + 12 > t.len() {
+            break;
+        }
+        let tag = u16f(e);
+        if !matches!(tag, 0x010F | 0x0110 | 0x0132) || u16f(e + 2) != 2 {
+            continue;
+        }
+        let n = u32f(e + 4) as usize;
+        let bytes: Vec<u8> = if n <= 4 {
+            t[e + 8..e + 8 + n].to_vec()
+        } else {
+            let off = u32f(e + 8) as usize;
+            if off + n > t.len() {
+                continue;
+            }
+            t[off..off + n].to_vec()
+        };
+        let text: String = bytes
+            .iter()
+            .take_while(|b| **b != 0)
+            .map(|b| *b as char)
+            .collect();
+        if !text.trim().is_empty() {
+            parts.push(text.trim().to_string());
+        }
+    }
+    parts.join(" · ")
+}
+
+/// A Workspace (7.0): the panel visibility set, the Options
+/// Bar, and the screen mode.
+#[derive(Clone)]
+struct Workspace {
+    panels: [bool; 9], // cp, brushes, tool presets, histogram,
+    // palette, navigator, actions, history, info
+    options_bar: bool,
+    display_mode: u8,
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn hex_decode(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).ok())
+        .collect()
+}
+
+fn tool_id(t: Tool) -> usize {
+    TOOLS.iter().position(|x| *x == t).unwrap_or(0)
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct BrushPreset {
+    size: f32,
+    hardness: f32,
+    dyn_: BrushDynamics,
+}
+
+fn dyn_to_bytes(d: &BrushDynamics, out: &mut Vec<u8>) {
+    let fs = [
+        d.spacing,
+        d.angle_deg,
+        d.roundness,
+        d.size_jitter,
+        d.min_diameter,
+        d.angle_jitter,
+        d.round_jitter,
+        d.min_roundness,
+        d.scatter,
+        d.count_jitter,
+        d.tex_scale,
+        d.tex_depth,
+        d.tex_min_depth,
+        d.dual_size,
+        d.dual_hardness,
+        d.dual_scatter,
+        d.fb_jitter,
+        d.hue_jitter,
+        d.sat_jitter,
+        d.bri_jitter,
+        d.opacity_jitter,
+        d.flow_jitter,
+    ];
+    for v in fs {
+        out.extend_from_slice(&v.to_be_bytes());
+    }
+    out.extend_from_slice(&[
+        d.size_control,
+        d.angle_control,
+        d.round_control,
+        d.count,
+        d.tex_mode,
+        d.dual_mode,
+        d.opacity_control,
+        d.flow_control,
+    ]);
+    let mut bits: u16 = 0;
+    for (i, b) in [
+        d.flip_x,
+        d.flip_y,
+        d.both_axes,
+        d.texture_on,
+        d.tex_invert,
+        d.protect_texture,
+        d.dual_on,
+        d.noise,
+        d.wet_edges,
+        d.airbrush,
+        d.smoothing,
+    ]
+    .iter()
+    .enumerate()
+    {
+        if *b {
+            bits |= 1 << i;
+        }
+    }
+    out.extend_from_slice(&bits.to_be_bytes());
+    out.extend_from_slice(&d.fade_steps.to_be_bytes());
+}
+
+fn dyn_from_bytes(bytes: &[u8], mut b: usize) -> Option<(BrushDynamics, usize)> {
+    let mut d = BrushDynamics::default();
+    let mut fs = [
+        &mut d.spacing,
+        &mut d.angle_deg,
+        &mut d.roundness,
+        &mut d.size_jitter,
+        &mut d.min_diameter,
+        &mut d.angle_jitter,
+        &mut d.round_jitter,
+        &mut d.min_roundness,
+        &mut d.scatter,
+        &mut d.count_jitter,
+        &mut d.tex_scale,
+        &mut d.tex_depth,
+        &mut d.tex_min_depth,
+        &mut d.dual_size,
+        &mut d.dual_hardness,
+        &mut d.dual_scatter,
+        &mut d.fb_jitter,
+        &mut d.hue_jitter,
+        &mut d.sat_jitter,
+        &mut d.bri_jitter,
+        &mut d.opacity_jitter,
+        &mut d.flow_jitter,
+    ];
+    for slot in fs.iter_mut() {
+        **slot = f32::from_be_bytes(bytes.get(b..b + 4)?.try_into().ok()?);
+        b += 4;
+    }
+    let u8s = bytes.get(b..b + 8)?;
+    d.size_control = u8s[0];
+    d.angle_control = u8s[1];
+    d.round_control = u8s[2];
+    d.count = u8s[3];
+    d.tex_mode = u8s[4];
+    d.dual_mode = u8s[5];
+    d.opacity_control = u8s[6];
+    d.flow_control = u8s[7];
+    b += 8;
+    let bits = u16::from_be_bytes(bytes.get(b..b + 2)?.try_into().ok()?);
+    b += 2;
+    let flags = [
+        &mut d.flip_x,
+        &mut d.flip_y,
+        &mut d.both_axes,
+        &mut d.texture_on,
+        &mut d.tex_invert,
+        &mut d.protect_texture,
+        &mut d.dual_on,
+        &mut d.noise,
+        &mut d.wet_edges,
+        &mut d.airbrush,
+        &mut d.smoothing,
+    ];
+    for (i, f) in flags.into_iter().enumerate() {
+        *f = bits & (1 << i) != 0;
+    }
+    d.fade_steps = u32::from_be_bytes(bytes.get(b..b + 4)?.try_into().ok()?);
+    b += 4;
+    Some((d, b))
+}
+
+/// .ABR v2 (Phase 7): presets carry dynamics. v1 files
+/// (size/hardness only) still load, with default dynamics.
+/// (Still PictoDesk's own compact format — named in the
+/// Phase 6.5 delivery; v2 extends it the same way.)
+fn write_abr(path: &std::path::Path, presets: &[BrushPreset]) -> std::io::Result<()> {
+    let mut out: Vec<u8> = b"PDABR2".to_vec();
     out.extend_from_slice(&(presets.len() as u16).to_be_bytes());
-    for (sz, h) in presets {
-        out.extend_from_slice(&sz.to_be_bytes());
-        out.extend_from_slice(&h.to_be_bytes());
+    for p in presets {
+        out.extend_from_slice(&p.size.to_be_bytes());
+        out.extend_from_slice(&p.hardness.to_be_bytes());
+        dyn_to_bytes(&p.dyn_, &mut out);
     }
     std::fs::write(path, out)
 }
 
-fn read_abr(bytes: &[u8]) -> Option<Vec<(f32, f32)>> {
-    if bytes.get(..6)? != b"PDABR1" {
-        return None;
+fn read_abr(bytes: &[u8]) -> Option<Vec<BrushPreset>> {
+    match bytes.get(..6)? {
+        b"PDABR1" => {
+            let count = u16::from_be_bytes([bytes[6], bytes[7]]) as usize;
+            let mut out = Vec::new();
+            for j in 0..count {
+                let b = 8 + j * 8;
+                let sz = f32::from_be_bytes(bytes.get(b..b + 4)?.try_into().ok()?);
+                let h = f32::from_be_bytes(bytes.get(b + 4..b + 8)?.try_into().ok()?);
+                out.push(BrushPreset {
+                    size: sz,
+                    hardness: h,
+                    dyn_: BrushDynamics::default(),
+                });
+            }
+            Some(out)
+        }
+        b"PDABR2" => {
+            let count = u16::from_be_bytes([bytes[6], bytes[7]]) as usize;
+            let mut out = Vec::new();
+            let mut b = 8usize;
+            for _ in 0..count {
+                let sz = f32::from_be_bytes(bytes.get(b..b + 4)?.try_into().ok()?);
+                let h = f32::from_be_bytes(bytes.get(b + 4..b + 8)?.try_into().ok()?);
+                b += 8;
+                let (dyn_, nb) = dyn_from_bytes(bytes, b)?;
+                b = nb;
+                out.push(BrushPreset {
+                    size: sz,
+                    hardness: h,
+                    dyn_,
+                });
+            }
+            Some(out)
+        }
+        _ => None,
     }
-    let count = u16::from_be_bytes([bytes[6], bytes[7]]) as usize;
-    let mut out = Vec::new();
-    for j in 0..count {
-        let b = 8 + j * 8;
-        let sz = f32::from_be_bytes(bytes.get(b..b + 4)?.try_into().ok()?);
-        let h = f32::from_be_bytes(bytes.get(b + 4..b + 8)?.try_into().ok()?);
-        out.push((sz, h));
-    }
-    Some(out)
 }
 
 /// The adjustment step a settings-capable dialog currently
@@ -3592,6 +4428,9 @@ fn apply_step(doc: &mut Document, step: &RecordedStep, sel: Option<&Selection>) 
             }
         }
         RecordedStep::Equalize => adjust::equalize(doc, layer, sel),
+        RecordedStep::AutoLevels => adjust::auto_levels(doc, layer, sel),
+        RecordedStep::AutoContrast => adjust::auto_contrast(doc, layer, sel),
+        RecordedStep::AutoColor => adjust::auto_color(doc, layer, sel),
         RecordedStep::Sharpen => filter::sharpen(doc, layer, sel),
         RecordedStep::MotionBlur(a, d) => filter::motion_blur(doc, layer, sel, *a, *d),
         RecordedStep::RadialBlur(a) => filter::radial_blur(doc, layer, sel, *a),
@@ -4168,6 +5007,15 @@ struct App {
     tone_exposure: f32,
     sponge_saturate: bool,
     clone_src: Option<(f32, f32)>,
+    /// Phase 7: Healing Brush source + Sampled/Pattern toggle.
+    heal_src: Option<(f32, f32)>,
+    heal_use_pattern: bool,
+    /// Phase 7 paint engine: dynamics, Flow, palette section,
+    /// and the stroke seed counter.
+    brush_dyn: BrushDynamics,
+    flow: f32,
+    brush_section: u8,
+    stroke_seed: u32,
     viewport: Viewport,
     file_path: Option<PathBuf>,
     dirty: bool,
@@ -4281,6 +5129,9 @@ struct App {
     /// The Split Channels set (Phase 6.5), kept for Merge
     /// Channels: (channel name, grayscale document).
     split_docs: Vec<(String, pictodesk_core::document::Document)>,
+    pkg_sources: Vec<std::path::PathBuf>,
+    liq_return: Option<Dialog>,
+    mesh_bytes: Vec<u8>,
     // Phase 6 app state.
     /// Shape tools: stroke width in px (0 = no stroke), polygon
     /// sides, polygon-as-star.
@@ -4320,7 +5171,11 @@ struct App {
     /// Phase 6.5 Batch 6d: swatch palette + brush preset state
     /// (save/load as .ACO / .ABR) and a stashed settings step.
     palette: Vec<(u8, u8, u8)>,
-    brush_presets: Vec<(f32, f32)>,
+    brush_presets: Vec<BrushPreset>,
+    tool_presets: Vec<ToolPreset>,
+    show_tool_presets: bool,
+    tool_preset_popup: bool,
+    workspaces: Vec<(String, Workspace)>,
     settings_step: Option<RecordedStep>,
     active_action: usize,
     recording: bool,
@@ -4383,6 +5238,8 @@ struct App {
 impl App {
     fn new(doc: Document, file_path: Option<PathBuf>) -> Self {
         let (saved_sets, saved_actions) = load_actions_state();
+        let saved_tool_presets = load_tool_presets();
+        let saved_workspaces = load_workspaces();
         let mut hist = History::new();
         hist.set_limit(Some(20)); // Phase 5: the History panel's default depth
         let mut app = App {
@@ -4398,6 +5255,12 @@ impl App {
             tone_exposure: 0.5,
             sponge_saturate: true,
             clone_src: None,
+            heal_src: None,
+            heal_use_pattern: false,
+            brush_dyn: BrushDynamics::default(),
+            flow: 1.0,
+            brush_section: 0,
+            stroke_seed: 0,
             viewport: Viewport {
                 scale: 1.0,
                 offset: (0.0, 0.0),
@@ -4472,6 +5335,9 @@ impl App {
             print_profile: 0,
             quick_mask: false,
             split_docs: Vec::new(),
+            pkg_sources: Vec::new(),
+            liq_return: None,
+            mesh_bytes: Vec::new(),
             shape_stroke: 0,
             shape_sides: 5,
             shape_star: false,
@@ -4491,13 +5357,25 @@ impl App {
             actions_button_mode: false,
             play_pending: None,
             palette: ui::PALETTE.to_vec(),
+            tool_presets: saved_tool_presets,
+            show_tool_presets: false,
+            tool_preset_popup: false,
+            workspaces: saved_workspaces,
             brush_presets: [1.0f32, 3.0, 5.0, 9.0, 13.0, 21.0, 35.0, 50.0]
                 .iter()
-                .map(|sz| (*sz, 1.0f32))
+                .map(|sz| BrushPreset {
+                    size: *sz,
+                    hardness: 1.0,
+                    dyn_: BrushDynamics::default(),
+                })
                 .chain(
                     [1.0f32, 3.0, 5.0, 9.0, 13.0, 21.0, 35.0, 50.0]
                         .iter()
-                        .map(|sz| (*sz, 0.0f32)),
+                        .map(|sz| BrushPreset {
+                            size: *sz,
+                            hardness: 0.0,
+                            dyn_: BrushDynamics::default(),
+                        }),
                 )
                 .collect(),
             settings_step: None,
@@ -4734,22 +5612,11 @@ impl App {
             place(PanelKind::Cp, h, &mut out, &mut y);
         }
         if self.show_brushes {
-            let brushes_h = if matches!(
-                self.tool,
-                Tool::Dodge
-                    | Tool::Burn
-                    | Tool::Sponge
-                    | Tool::Eraser
-                    | Tool::MagicEraser
-                    | Tool::BackgroundEraser
-                    | Tool::ArtHistoryBrush
-                    | Tool::Gradient
-            ) {
-                128
-            } else {
-                104
-            };
-            place(PanelKind::Brushes, brushes_h, &mut out, &mut y);
+            place(PanelKind::Brushes, self.brushes_panel_h(), &mut out, &mut y);
+        }
+        if self.show_tool_presets {
+            let h = 24 + self.tool_presets.len().min(10) as i32 * 15 + 20;
+            place(PanelKind::ToolPresets, h, &mut out, &mut y);
         }
         if self.show_histogram {
             place(PanelKind::Histogram, 132, &mut out, &mut y);
@@ -4834,6 +5701,29 @@ impl App {
         };
         let can_undo = self.hist.can_undo();
         let can_redo = self.hist.can_redo();
+        let mut workspace_items: Vec<MenuItem> = self
+            .workspaces
+            .iter()
+            .enumerate()
+            .map(|(i, (n, _))| MenuItem::new(n, Action::ApplyWorkspace(i)))
+            .collect();
+        if !workspace_items.is_empty() {
+            workspace_items.push(MenuItem::new("-", Action::None));
+        }
+        workspace_items.push(MenuItem::new(
+            "Save Workspace...",
+            Action::SaveWorkspaceDialog,
+        ));
+        let workspace_delete: Vec<MenuItem> = self
+            .workspaces
+            .iter()
+            .enumerate()
+            .map(|(i, (n, _))| MenuItem::new(n, Action::DeleteWorkspace(i)))
+            .collect();
+        if !workspace_delete.is_empty() {
+            workspace_items
+                .push(MenuItem::new("Delete Workspace", Action::None).sub(workspace_delete));
+        }
         vec![
             Menu {
                 title: "File",
@@ -4905,6 +5795,9 @@ impl App {
                     MenuItem::new("Stroke...", Action::StrokeDialog).off_if(!has_sel),
                     MenuItem::new("Define Pattern", Action::DefinePattern),
                     MenuItem::new("Define Brush", Action::DefineBrush).off_if(!has_sel),
+                    MenuItem::new("-", Action::None),
+                    MenuItem::new("Find and Replace...", Action::FindReplaceDialog),
+                    MenuItem::new("Check Spelling...", Action::SpellCheckDialog),
                     MenuItem::new("Define Custom Shape", Action::DefineCustomShape),
                     MenuItem::new("Preset Manager...", Action::PresetManagerDialog),
                     MenuItem::new("Free Transform...", Action::FreeTransform).key("T"),
@@ -4927,7 +5820,6 @@ impl App {
                     MenuItem::new("Image Size...", Action::ImageSizeDialog),
                     MenuItem::new("Canvas Size...", Action::CanvasSizeDialog),
                     MenuItem::new("Duplicate", Action::DuplicateImage),
-                    MenuItem::new("Liquify...", Action::LiquifyDialog).key("X"),
                     MenuItem::new("Perspective Crop", Action::PerspectiveCrop),
                     MenuItem::new("Crop", Action::CropToSelection).off_if(!has_sel),
                     MenuItem::new("Rotate", Action::None).sub(vec![
@@ -4948,6 +5840,9 @@ impl App {
                         MenuItem::new("Curves...", Action::AdjustDialog("curves")),
                         MenuItem::new("Invert", Action::AdjustDialog("invert")).key("I"),
                         MenuItem::new("Equalize", Action::AdjustEqualize),
+                        MenuItem::new("Auto Levels", Action::AutoLevelsCmd),
+                        MenuItem::new("Auto Contrast", Action::AutoContrastCmd),
+                        MenuItem::new("Auto Color", Action::AutoColorCmd),
                         MenuItem::new("Desaturate", Action::AdjustDialog("desat")),
                         MenuItem::new("Posterize...", Action::AdjustDialog("posterize")),
                         MenuItem::new("Threshold...", Action::AdjustDialog("threshold")),
@@ -5228,6 +6123,9 @@ impl App {
                         MenuItem::new("Underpainting...", Action::LegacyFilterDialog(42)),
                         MenuItem::new("Watercolor...", Action::LegacyFilterDialog(43)),
                     ]),
+                    MenuItem::new("Liquify...", Action::LiquifyDialog).key("X"),
+                    MenuItem::new("Pattern Maker...", Action::PatternMakerDialog),
+                    MenuItem::new("-", Action::None),
                     MenuItem::new("Brush Strokes", Action::None).sub(vec![
                         MenuItem::new("Accented Edges...", Action::LegacyFilterDialog(44)),
                         MenuItem::new("Angled Strokes...", Action::LegacyFilterDialog(45)),
@@ -5411,6 +6309,11 @@ impl App {
                     MenuItem::new("History", Action::ToggleHistoryPanel)
                         .check_if(self.show_history),
                     MenuItem::new("Info", Action::ToggleInfoPanel).check_if(self.show_info),
+                    MenuItem::new("Tool Presets", Action::ToggleToolPresets)
+                        .check_if(self.show_tool_presets),
+                    MenuItem::new("-", Action::None),
+                    MenuItem::new("File Browser...", Action::FileBrowserDialog),
+                    MenuItem::new("Workspace", Action::None).sub(workspace_items),
                     MenuItem::new("Rulers", Action::ToggleRulers).check_if(self.show_rulers),
                     MenuItem::new("Options Bar", Action::ToggleOptionsBar)
                         .check_if(self.show_options_bar),
@@ -5764,6 +6667,486 @@ impl App {
     }
 
     /// Persist the action library (Phase 6.5 Batch 6d).
+    fn save_workspaces_file(&self) {
+        let dir = pictodesk_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let mut text = String::new();
+        for (name, w) in &self.workspaces {
+            let mut flags = String::new();
+            for p in w.panels {
+                flags.push(if p { '1' } else { '0' });
+            }
+            flags.push(if w.options_bar { '1' } else { '0' });
+            text += &format!("{}\t{flags}\t{}\n", name.replace('\t', " "), w.display_mode);
+        }
+        let _ = std::fs::write(dir.join("workspaces.txt"), text);
+    }
+
+    fn apply_workspace(&mut self, i: usize) {
+        let Some((name, w)) = self.workspaces.get(i).cloned() else {
+            return;
+        };
+        self.show_cp = w.panels[0];
+        self.show_brushes = w.panels[1];
+        self.show_tool_presets = w.panels[2];
+        self.show_histogram = w.panels[3];
+        self.show_palette = w.panels[4];
+        self.show_navigator = w.panels[5];
+        self.show_actions = w.panels[6];
+        self.show_history = w.panels[7];
+        self.show_info = w.panels[8];
+        self.show_options_bar = w.options_bar;
+        self.display_mode = w.display_mode;
+        self.status = format!("Workspace '{name}' applied");
+        self.fit_view(self.win_size.0, self.win_size.1);
+    }
+
+    fn capture_workspace(&self) -> Workspace {
+        Workspace {
+            panels: [
+                self.show_cp,
+                self.show_brushes,
+                self.show_tool_presets,
+                self.show_histogram,
+                self.show_palette,
+                self.show_navigator,
+                self.show_actions,
+                self.show_history,
+                self.show_info,
+            ],
+            options_bar: self.show_options_bar,
+            display_mode: self.display_mode,
+        }
+    }
+
+    fn capture_tool_preset(&self, name: String) -> ToolPreset {
+        let fg = self.fg.to_rgba8();
+        let bg = self.bg.to_rgba8();
+        ToolPreset {
+            name,
+            tool: self.tool,
+            size: self.tip.size,
+            hardness: self.tip.hardness,
+            dyn_: self.brush_dyn.clone(),
+            flow: self.flow,
+            fg: (fg.0, fg.1, fg.2),
+            bg: (bg.0, bg.1, bg.2),
+        }
+    }
+
+    fn apply_tool_preset(&mut self, idx: usize) {
+        let Some(p) = self.tool_presets.get(idx).cloned() else {
+            return;
+        };
+        self.tool = p.tool;
+        self.tip = BrushTip::new(p.size, p.hardness);
+        self.brush_dyn = p.dyn_.clone();
+        self.flow = p.flow;
+        self.fg = Pixel16::from_rgba8(p.fg.0, p.fg.1, p.fg.2, 255);
+        self.bg = Pixel16::from_rgba8(p.bg.0, p.bg.1, p.bg.2, 255);
+        self.status = format!("Tool preset '{}'", p.name);
+    }
+
+    /// The tool preset whose state matches the current tool
+    /// setup, if any (drives the options-bar picker label).
+    fn current_tool_preset(&self) -> Option<usize> {
+        self.tool_presets.iter().position(|p| {
+            p.tool == self.tool
+                && p.size == self.tip.size
+                && p.hardness == self.tip.hardness
+                && p.dyn_ == self.brush_dyn
+        })
+    }
+
+    /// File Browser (7.0): browse a folder's images with
+    /// thumbnails, letter ranks, rotate-on-open flags, an
+    /// EXIF info line, and batch rename.
+    fn open_file_browser(&mut self) {
+        let mut d = Dialog::new(DialogKind::FileBrowser, &self.doc);
+        d.text_focus = true;
+        let start = std::env::current_dir()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| ".".into());
+        d.browser_dir = start;
+        self.dialog = Some(d);
+        self.browser_rescan();
+    }
+
+    fn browser_meta() -> std::collections::HashMap<String, (u8, i8)> {
+        let mut map = std::collections::HashMap::new();
+        if let Ok(text) = std::fs::read_to_string(pictodesk_dir().join("browser.txt")) {
+            for line in text.lines() {
+                let f: Vec<&str> = line.split('\t').collect();
+                if f.len() >= 3 {
+                    map.insert(
+                        f[0].to_string(),
+                        (f[1].parse().unwrap_or(0), f[2].parse().unwrap_or(0)),
+                    );
+                }
+            }
+        }
+        map
+    }
+
+    fn browser_save_meta(&self) {
+        let Some(d) = &self.dialog else { return };
+        let mut map = Self::browser_meta();
+        for e in &d.browser_entries {
+            if !e.is_dir {
+                map.insert(e.path.to_string_lossy().into_owned(), (e.rank, e.rotate));
+            }
+        }
+        let dir = pictodesk_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let mut text = String::new();
+        for (k, (rank, rot)) in map.iter() {
+            if *rank != 0 || *rot != 0 {
+                text += &format!("{k}\t{rank}\t{rot}\n");
+            }
+        }
+        let _ = std::fs::write(dir.join("browser.txt"), text);
+    }
+
+    fn browser_rescan(&mut self) {
+        let meta = Self::browser_meta();
+        let (dir, sort_rank) = {
+            let Some(d) = &self.dialog else { return };
+            (d.browser_dir.clone(), d.browser_sort_rank)
+        };
+        let mut entries: Vec<BrowserEntry> = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            let mut paths: Vec<std::path::PathBuf> =
+                rd.filter_map(|e| e.ok().map(|e| e.path())).collect();
+            paths.sort();
+            for p in paths {
+                let name = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                if p.is_dir() {
+                    entries.push(BrowserEntry {
+                        path: p,
+                        name,
+                        is_dir: true,
+                        rank: 0,
+                        rotate: 0,
+                        tw: 0,
+                        th: 0,
+                        thumb: Vec::new(),
+                        info: "Folder".into(),
+                    });
+                    continue;
+                }
+                let ext = p
+                    .extension()
+                    .map(|e| e.to_string_lossy().to_ascii_lowercase())
+                    .unwrap_or_default();
+                if !matches!(
+                    ext.as_str(),
+                    "png" | "jpg" | "jpeg" | "gif" | "bmp" | "tif" | "tiff" | "tga" | "pcx"
+                ) {
+                    continue;
+                }
+                let key = p.to_string_lossy().into_owned();
+                let (rank, rotate) = meta.get(&key).copied().unwrap_or((0, 0));
+                let mut entry = BrowserEntry {
+                    path: p.clone(),
+                    name,
+                    is_dir: false,
+                    rank,
+                    rotate,
+                    tw: 0,
+                    th: 0,
+                    thumb: Vec::new(),
+                    info: String::new(),
+                };
+                if let Ok(bytes) = std::fs::read(&p) {
+                    let exif = exif_summary(&bytes);
+                    if let Ok(doc) = pictodesk_core::io::import_image(&bytes) {
+                        let (w, h) = (doc.width, doc.height);
+                        let full = doc.render_region_rgba8(0, 0, w, h);
+                        let (tw, th) = if w >= h {
+                            (56u32, (56 * h / w.max(1)).max(1))
+                        } else {
+                            ((56 * w / h.max(1)).max(1), 56u32)
+                        };
+                        let mut thumb = vec![0u8; (tw * th * 4) as usize];
+                        for y in 0..th {
+                            for x in 0..tw {
+                                let (sx, sy) = (x * w / tw, y * h / th);
+                                let si = ((sy * w + sx) * 4) as usize;
+                                let di = ((y * tw + x) * 4) as usize;
+                                thumb[di..di + 4].copy_from_slice(&full[si..si + 4]);
+                            }
+                        }
+                        entry.tw = tw;
+                        entry.th = th;
+                        entry.thumb = thumb;
+                        entry.info = if exif.is_empty() {
+                            format!("{w} x {h}")
+                        } else {
+                            format!("{w} x {h} · {exif}")
+                        };
+                    } else {
+                        entry.info = "Unreadable".into();
+                    }
+                }
+                entries.push(entry);
+                if entries.len() >= 60 {
+                    break;
+                }
+            }
+        }
+        entries.sort_by(|a, b| {
+            b.is_dir.cmp(&a.is_dir).then_with(|| {
+                if sort_rank {
+                    a.rank
+                        .cmp(&b.rank)
+                        .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+                } else {
+                    a.name.to_lowercase().cmp(&b.name.to_lowercase())
+                }
+            })
+        });
+        if let Some(d) = &mut self.dialog {
+            d.browser_entries = entries;
+            d.browser_sel = 0;
+        }
+    }
+
+    fn browser_cell(&self, r: Rect, i: usize) -> Rect {
+        Rect::new(
+            r.x + 12 + (i % 4) as i32 * 94,
+            r.y + 64 + (i / 4) as i32 * 68,
+            92,
+            66,
+        )
+    }
+
+    fn browser_button_rects(&self, r: Rect) -> [Rect; 8] {
+        let mut out = [Rect::new(0, 0, 0, 0); 8];
+        for (i, slot) in out.iter_mut().enumerate() {
+            *slot = Rect::new(
+                r.x + 12 + (i % 4) as i32 * 94,
+                r.y + 288 + (i / 4) as i32 * 24,
+                92,
+                20,
+            );
+        }
+        out
+    }
+
+    fn browser_batch_rename(&mut self) {
+        let prefix = {
+            let Some(d) = &self.dialog else { return };
+            d.text.trim().to_string()
+        };
+        if prefix.is_empty() {
+            self.status = "Batch Rename: type a prefix first".into();
+            return;
+        }
+        let mut n = 0;
+        let mut renames: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+        if let Some(d) = &self.dialog {
+            for e in &d.browser_entries {
+                if e.is_dir {
+                    continue;
+                }
+                n += 1;
+                let ext = e
+                    .path
+                    .extension()
+                    .map(|x| format!(".{}", x.to_string_lossy()))
+                    .unwrap_or_default();
+                let new_path = e.path.with_file_name(format!("{prefix}{n:03}{ext}"));
+                if new_path != e.path && !new_path.exists() {
+                    renames.push((e.path.clone(), new_path));
+                }
+            }
+        }
+        let mut done = 0;
+        for (from, to) in &renames {
+            if std::fs::rename(from, to).is_ok() {
+                done += 1;
+            }
+        }
+        self.browser_rescan();
+        self.status = format!("Batch Rename: {done} file(s) renamed");
+    }
+
+    /// All unknown words across the document's type layers:
+    /// (layer, byte start, byte end, word).
+    fn spell_collect(&self, ignore: &[String]) -> Vec<(usize, usize, usize, String)> {
+        let personal = personal_dict();
+        let mut out = Vec::new();
+        for (li, layer) in self.doc.layers.iter().enumerate() {
+            let Some(spec) = &layer.text else { continue };
+            for (st, en, word) in word_tokens(&spec.text) {
+                if word.len() >= 2 && !spell_known(&word, &personal, ignore) {
+                    out.push((li, st, en, word));
+                }
+            }
+        }
+        out
+    }
+
+    fn open_spell_check(&mut self) {
+        let mut d = Dialog::new(DialogKind::SpellCheck, &self.doc);
+        d.spell_items = self.spell_collect(&d.spell_ignore);
+        d.spell_pos = 0;
+        d.text_focus = true;
+        if let Some((_, _, _, w)) = d.spell_items.first() {
+            d.text = w.clone();
+        }
+        self.dialog = Some(d);
+    }
+
+    /// After a spell action, refresh the item list (offsets
+    /// may have shifted) and prefill the Change field.
+    fn spell_refresh(&mut self) {
+        let ignore = self
+            .dialog
+            .as_ref()
+            .map(|d| d.spell_ignore.clone())
+            .unwrap_or_default();
+        let items = self.spell_collect(&ignore);
+        if let Some(d) = &mut self.dialog {
+            d.spell_items = items;
+            if d.spell_pos > d.spell_items.len() {
+                d.spell_pos = d.spell_items.len();
+            }
+            if let Some((_, _, _, w)) = d.spell_items.get(d.spell_pos) {
+                d.text = w.clone();
+            }
+        }
+    }
+
+    fn spell_change(&mut self) {
+        let Some(d) = &self.dialog else { return };
+        let Some((li, st, en, _)) = d.spell_items.get(d.spell_pos).cloned() else {
+            return;
+        };
+        let repl = d.text.trim().to_string();
+        if repl.is_empty() {
+            return;
+        }
+        self.structural("Check Spelling", |doc| {
+            if let Some(spec) = &mut doc.layers[li].text {
+                spec_replace(spec, st, en, &repl);
+            }
+            typo::render_type_layer(doc, li);
+        });
+        self.spell_refresh();
+    }
+
+    fn spell_add(&mut self) {
+        let word = {
+            let Some(d) = &self.dialog else { return };
+            let Some((_, _, _, w)) = d.spell_items.get(d.spell_pos) else {
+                return;
+            };
+            w.to_lowercase()
+        };
+        let dir = pictodesk_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("dictionary.txt");
+        let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+        text += &format!("{word}\n");
+        let _ = std::fs::write(&path, text);
+        self.spell_refresh();
+    }
+
+    /// Matches of `needle` in type layers: (layer, start, end).
+    fn find_text_matches(
+        &self,
+        needle: &str,
+        case_sensitive: bool,
+        whole_word: bool,
+    ) -> Vec<(usize, usize, usize)> {
+        let mut out = Vec::new();
+        if needle.is_empty() {
+            return out;
+        }
+        for (li, layer) in self.doc.layers.iter().enumerate() {
+            let Some(spec) = &layer.text else { continue };
+            let hay = if case_sensitive {
+                spec.text.clone()
+            } else {
+                spec.text.to_lowercase()
+            };
+            let ndl = if case_sensitive {
+                needle.to_string()
+            } else {
+                needle.to_lowercase()
+            };
+            let mut from = 0usize;
+            while let Some(pos) = hay[from..].find(&ndl) {
+                let (st, en) = (from + pos, from + pos + ndl.len());
+                let ok = if whole_word {
+                    let before = hay[..st].chars().last();
+                    let after = hay[en..].chars().next();
+                    !before.map(|c| c.is_alphanumeric()).unwrap_or(false)
+                        && !after.map(|c| c.is_alphanumeric()).unwrap_or(false)
+                } else {
+                    true
+                };
+                if ok {
+                    out.push((li, st, en));
+                }
+                from = en.max(st + 1);
+            }
+        }
+        out
+    }
+
+    fn find_replace_all(&mut self) -> usize {
+        let (needle, repl, case_sensitive, whole_word) = {
+            let Some(d) = &self.dialog else { return 0 };
+            (d.text.clone(), d.text2.clone(), d.opt_a, d.opt_b)
+        };
+        let mut matches = self.find_text_matches(&needle, case_sensitive, whole_word);
+        if matches.is_empty() {
+            self.status = "Find and Replace: no matches".into();
+            return 0;
+        }
+        let count = matches.len();
+        // Replace back to front so earlier offsets stay valid.
+        matches.sort_by_key(|m| std::cmp::Reverse((m.0, m.1)));
+        self.structural("Find and Replace", |doc| {
+            let mut touched: Vec<usize> = Vec::new();
+            for (li, st, en) in &matches {
+                if let Some(spec) = &mut doc.layers[*li].text {
+                    spec_replace(spec, *st, *en, &repl);
+                    if !touched.contains(li) {
+                        touched.push(*li);
+                    }
+                }
+            }
+            for li in touched {
+                typo::render_type_layer(doc, li);
+            }
+        });
+        self.status = format!("Replaced {count} occurrence(s)");
+        count
+    }
+
+    /// Clicking a panel name opens the rename dialog (7.0):
+    /// kind 0 = layer, 1 = alpha channel.
+    fn open_rename(&mut self, kind: u8, idx: usize) {
+        let name = if kind == 0 {
+            self.doc.layers.get(idx).map(|l| l.name.clone())
+        } else {
+            self.doc.alphas.get(idx).map(|a| a.name.clone())
+        };
+        let Some(name) = name else { return };
+        let mut d = Dialog::new(DialogKind::RenameItem, &self.doc);
+        d.fx_page = kind as usize;
+        d.preset_sel = idx;
+        d.text = name;
+        d.text_focus = true;
+        self.dialog = Some(d);
+    }
+
     fn save_actions_file(&self) {
         let Some(path) = actions_file_path() else {
             return;
@@ -6525,6 +7908,7 @@ impl App {
                             .map(|e| {
                                 let e = e.to_ascii_lowercase();
                                 let exts: &[&str] = match self.file_panel_purpose {
+                                    6 => &["pdmesh"],
                                     3 => &["aco"],
                                     4 => &["abr"],
                                     5 => &["txt"],
@@ -8314,6 +9698,24 @@ impl App {
                     adjust::equalize(d, l, s)
                 });
             }
+            Action::AutoLevelsCmd => {
+                self.apply_filter_now("Auto Levels", RecordedStep::AutoLevels, |d, l, s| {
+                    adjust::auto_levels(d, l, s)
+                });
+            }
+            Action::AutoContrastCmd => {
+                self.apply_filter_now("Auto Contrast", RecordedStep::AutoContrast, |d, l, s| {
+                    adjust::auto_contrast(d, l, s)
+                });
+            }
+            Action::AutoColorCmd => {
+                self.apply_filter_now("Auto Color", RecordedStep::AutoColor, |d, l, s| {
+                    adjust::auto_color(d, l, s)
+                });
+            }
+            Action::PatternMakerDialog => {
+                self.open_pattern_maker();
+            }
             Action::SelectColorRange => self.open_dialog(DialogKind::ColorRange),
             Action::ModifyExpand => self.open_modify_dialog(0),
             Action::ModifyContract => self.open_modify_dialog(1),
@@ -8343,6 +9745,36 @@ impl App {
             Action::ToggleBrushes => {
                 self.show_brushes = !self.show_brushes;
                 self.fit_view(self.win_size.0, self.win_size.1);
+            }
+            Action::SpellCheckDialog => {
+                self.open_spell_check();
+            }
+            Action::FindReplaceDialog => {
+                let mut d = Dialog::new(DialogKind::FindReplace, &self.doc);
+                d.text_focus = true;
+                self.dialog = Some(d);
+            }
+            Action::ToggleToolPresets => {
+                self.show_tool_presets = !self.show_tool_presets;
+                self.fit_view(self.win_size.0, self.win_size.1);
+            }
+            Action::FileBrowserDialog => {
+                self.open_file_browser();
+            }
+            Action::SaveWorkspaceDialog => {
+                let mut d = Dialog::new(DialogKind::SaveWorkspace, &self.doc);
+                d.text_focus = true;
+                self.dialog = Some(d);
+            }
+            Action::ApplyWorkspace(i) => {
+                self.apply_workspace(i);
+            }
+            Action::DeleteWorkspace(i) => {
+                if i < self.workspaces.len() {
+                    let (name, _) = self.workspaces.remove(i);
+                    self.save_workspaces_file();
+                    self.status = format!("Workspace '{name}' deleted");
+                }
             }
             Action::ToggleRulers => {
                 self.show_rulers = !self.show_rulers;
@@ -8612,6 +10044,28 @@ impl App {
         self.var_rebuild_thumb();
     }
 
+    /// Pattern Maker (Phase 7): generate the seamless tile
+    /// from the selection (or the whole canvas) up front;
+    /// the dialog previews it tiled and OK installs it as
+    /// the document pattern.
+    fn open_pattern_maker(&mut self) {
+        let rect = match self.sel.as_ref().and_then(|s| s.bounds()) {
+            Some((x, y, w, h)) => (x, y, w as i32, h as i32),
+            None => (0, 0, self.doc.width as i32, self.doc.height as i32),
+        };
+        let tile = pictodesk_core::pattern::make_tile(&self.doc, rect, "Pattern Maker");
+        match tile {
+            Some(t) => {
+                let mut d = Dialog::new(DialogKind::PatternMaker, &self.doc);
+                d.pm_tile = Some(t);
+                self.dialog = Some(d);
+            }
+            None => {
+                self.status = "Pattern Maker needs a sample of at least 4x4 pixels".into();
+            }
+        }
+    }
+
     /// The 3x3 Variations cells: (label, channel shift kind)
     /// in dialog coordinates. Kinds: 0 current, 1..=6 color
     /// pushes (R+, G+, B+, Y, C, M), 7 darker, 8 lighter.
@@ -8808,8 +10262,25 @@ impl App {
         let fmt = match d.web_format {
             1 => ExportFormat::Png,
             2 => ExportFormat::Gif,
+            3 => ExportFormat::Wbmp,
             _ => ExportFormat::Jpeg,
         };
+        if d.web_knockout && matches!(fmt, ExportFormat::Png | ExportFormat::Gif) {
+            // Color-to-transparency: the current background
+            // color knocks out to transparent, optionally
+            // with Floyd-Steinberg dithered edges.
+            let mut rgba = self.doc.render_full_rgba8();
+            let bg = self.bg.to_rgba8();
+            knockout_color(
+                &mut rgba,
+                self.doc.width,
+                self.doc.height,
+                (bg.0, bg.1, bg.2),
+                d.web_dither,
+            );
+            return io::encode_rgba(&rgba, self.doc.width, self.doc.height, fmt, d.vals[0] as u8)
+                .ok();
+        }
         io::export_image(&self.doc, fmt, d.vals[0] as u8).ok()
     }
 
@@ -9825,9 +11296,66 @@ impl App {
                     self.status = "Slice options saved".into();
                 }
             }
+            DialogKind::FileBrowser => {
+                if let Some(entry) = d.browser_entries.get(d.browser_sel).cloned() {
+                    if entry.is_dir {
+                        self.open_file_browser();
+                        if let Some(nd) = &mut self.dialog {
+                            nd.browser_dir = entry.path.to_string_lossy().into_owned();
+                        }
+                        self.browser_rescan();
+                    } else {
+                        let rotate = entry.rotate;
+                        self.open_path(&entry.path);
+                        match rotate {
+                            1 => self.do_action(Action::Rotate90Cw),
+                            -1 => self.do_action(Action::Rotate90Ccw),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            DialogKind::SaveWorkspace => {
+                let name = d.text.trim().to_string();
+                if name.is_empty() {
+                    self.status = "Workspace needs a name".into();
+                } else {
+                    let w = self.capture_workspace();
+                    if let Some(slot) = self.workspaces.iter_mut().find(|(n, _)| *n == name) {
+                        slot.1 = w;
+                    } else {
+                        self.workspaces.push((name.clone(), w));
+                    }
+                    self.save_workspaces_file();
+                    self.status = format!("Workspace '{name}' saved");
+                }
+            }
+            DialogKind::RenameItem => {
+                let name = d.text.trim().to_string();
+                if !name.is_empty() {
+                    if d.fx_page == 0 {
+                        let li = d.preset_sel.min(self.doc.layers.len().saturating_sub(1));
+                        self.structural("Rename Layer", |doc| {
+                            doc.layers[li].name = name.clone();
+                        });
+                    } else {
+                        let ai = d.preset_sel.min(self.doc.alphas.len().saturating_sub(1));
+                        self.structural("Rename Channel", |doc| {
+                            if ai < doc.alphas.len() {
+                                doc.alphas[ai].name = name.clone();
+                            }
+                        });
+                    }
+                    self.status = format!("Renamed to '{name}'");
+                }
+            }
             DialogKind::PresetManager => {
-                // OK applies the selected style preset (Styles
-                // tab) to the active layer.
+                // OK applies the selected preset: a style on
+                // the Styles tab, a tool setup on the Tools tab.
+                if self.preset_tab == 2 {
+                    let sel = d.preset_sel;
+                    self.apply_tool_preset(sel);
+                }
                 if self.preset_tab == 0 {
                     if let Some((name, fx)) = self.style_presets.get(d.preset_sel).cloned() {
                         let li = self.doc.active_layer;
@@ -9939,7 +11467,13 @@ impl App {
                     d.vals[0].round().max(50.0) as u32,
                     d.vals[1].round().max(50.0) as u32,
                 );
-                self.run_picture_package(pw, ph, d.pkg_layout);
+                self.run_picture_package(
+                    pw,
+                    ph,
+                    d.pkg_layout,
+                    d.fx_a == 1 || d.fx_a == 3,
+                    d.fx_a >= 2,
+                );
             }
             DialogKind::WebGallery => {
                 let folder = d.text.clone();
@@ -9975,6 +11509,17 @@ impl App {
                 self.print_bilinear = d.pr_bilinear;
                 self.print_profile = d.print_profile;
                 self.do_print(copies);
+            }
+            DialogKind::PatternMaker => {
+                if let Some(t) = d.pm_tile.clone() {
+                    self.doc.pattern = Some(t);
+                    if d.opt_a {
+                        self.filter_now("Fill with Pattern", None, |doc, layer, sel| {
+                            pictodesk_core::pattern::fill_layer_pattern(doc, layer, sel);
+                        });
+                    }
+                    self.status = "Pattern Maker: tile installed as the document pattern".into();
+                }
             }
             DialogKind::Variations => {
                 if let Some(vd) = d.var_doc.clone() {
@@ -10217,6 +11762,7 @@ impl App {
                 let ext = match d.web_format {
                     1 => "png",
                     2 => "gif",
+                    3 => "wbmp",
                     _ => "jpg",
                 };
                 let name = self
@@ -10355,6 +11901,15 @@ impl App {
                         },
                         None => self.status = "No settings to save".into(),
                     },
+                    6 => {
+                        match std::fs::write(&path, &self.mesh_bytes) {
+                            Ok(()) => self.status = "Mesh saved".into(),
+                            Err(e) => self.status = format!("Mesh save failed: {e}"),
+                        }
+                        if let Some(back) = self.liq_return.take() {
+                            self.dialog = Some(back);
+                        }
+                    }
                     5 => {
                         let text = paths_to_ai(&self.doc);
                         match std::fs::write(&path, text) {
@@ -10516,6 +12071,12 @@ impl App {
             return;
         }
         if let Some(mut d) = self.dialog.take() {
+            if d.kind == DialogKind::SaveAs && d.save_mode == 6 {
+                if let Some(back) = self.liq_return.take() {
+                    self.dialog = Some(back);
+                    return;
+                }
+            }
             if let Some(snap) = d.adj_snapshot.take() {
                 // Adjustment dialog cancelled: restore the document
                 // exactly as it was before the dialog opened.
@@ -10634,7 +12195,7 @@ impl App {
             h += 22; // the stop message line
         }
         if d.kind == DialogKind::SaveForWeb {
-            h += 14; // encoded-size line
+            h += 36; // second button row + encoded-size line
         }
         if matches!(
             d.kind,
@@ -10685,6 +12246,9 @@ impl App {
         }
         if d.kind == DialogKind::Variations {
             h += 210; // 3x3 thumbnail grid + labels
+        }
+        if d.kind == DialogKind::PatternMaker {
+            h += 196; // tiled preview + fill toggle
         }
         if d.kind == DialogKind::NoteEdit {
             h += 44; // audio buttons + attached-audio line
@@ -10781,7 +12345,16 @@ impl App {
             h = 46 + 322 + 40; // mini-editor canvas + two button rows + OK/Cancel
         }
         if d.kind == DialogKind::Liquify {
-            h = 46 + 344 + 84; // editor + tool rows + sliders + OK/Cancel
+            h = 46 + 366 + 84; // editor + tool rows + sliders + OK/Cancel
+        }
+        if d.kind == DialogKind::FileBrowser {
+            h = 46 + 336; // text row + thumb grid + info + buttons
+        }
+        if d.kind == DialogKind::SpellCheck {
+            h = 46 + 150;
+        }
+        if d.kind == DialogKind::FindReplace {
+            h = 46 + 132;
         }
         let w = 400;
         let rect = Rect::new((ww - w) / 2, (wh - h) / 2, w, h);
@@ -10874,7 +12447,7 @@ impl App {
             y += 22;
         }
         if d.kind == DialogKind::Liquify {
-            y += 384; // editor canvas + tool rows sit above the sliders
+            y += 406; // editor canvas + tool rows sit above the sliders
         }
         if matches!(
             d.kind,
@@ -10884,6 +12457,9 @@ impl App {
                 | DialogKind::PageSetup
         ) {
             y += 22;
+        }
+        if d.kind == DialogKind::SaveForWeb {
+            y += 22; // second button row
         }
         if d.kind == DialogKind::Print {
             y += 250;
@@ -11055,8 +12631,8 @@ impl App {
                 .map(|i| Rect::new(rect.x + 12 + i * 128, rect.y + 30, 124, 18))
                 .collect()
         } else if d.kind == DialogKind::Liquify {
-            // Tool buttons: three rows under the editor canvas.
-            (0..13)
+            // Tool buttons: four rows under the editor canvas.
+            (0..19)
                 .map(|i| {
                     Rect::new(
                         rect.x + 12 + (i % 5) * 76,
@@ -11083,23 +12659,35 @@ impl App {
                 ));
             }
             v
+        } else if d.kind == DialogKind::PicturePackage {
+            (0..4)
+                .map(|i| Rect::new(rect.x + 12 + i * 96, rect.y + 30, 92, 18))
+                .collect()
+        } else if d.kind == DialogKind::FindReplace {
+            (0..3)
+                .map(|i| Rect::new(rect.x + 12 + i * 128, rect.y + 104, 124, 18))
+                .collect()
         } else if matches!(
             d.kind,
-            DialogKind::CondMode
-                | DialogKind::PicturePackage
-                | DialogKind::SaveForWeb
-                | DialogKind::PageSetup
+            DialogKind::CondMode | DialogKind::SaveForWeb | DialogKind::PageSetup
         ) {
             let n = match d.kind {
                 DialogKind::CondMode => 2,
-                DialogKind::SaveForWeb => 4,
+                DialogKind::SaveForWeb => 7,
                 _ => 1,
             };
             if d.kind == DialogKind::SaveForWeb {
-                // Four buttons (3 formats + Weighted) need the
-                // tighter spacing.
+                // Seven buttons in two rows: four formats,
+                // then Weighted / Knockout / Dither toggles.
                 (0..n)
-                    .map(|i| Rect::new(rect.x + 12 + i * 96, rect.y + 30, 92, 18))
+                    .map(|i| {
+                        Rect::new(
+                            rect.x + 12 + (i % 4) * 96,
+                            rect.y + 30 + (i / 4) * 22,
+                            92,
+                            18,
+                        )
+                    })
                     .collect()
             } else {
                 (0..n)
@@ -11178,6 +12766,11 @@ impl App {
                 | DialogKind::ChannelOptions
                 | DialogKind::FileInfo
                 | DialogKind::InsertStop
+                | DialogKind::SaveWorkspace
+                | DialogKind::RenameItem
+                | DialogKind::FileBrowser
+                | DialogKind::SpellCheck
+                | DialogKind::FindReplace
         ) {
             Some(Rect::new(rect.x + 12, rect.y + 28, w - 24, 18))
         } else {
@@ -11288,6 +12881,9 @@ impl App {
         if self.show_brushes {
             self.draw_brushes(f);
         }
+        if self.show_tool_presets {
+            self.draw_tool_presets(f);
+        }
         if self.show_histogram {
             self.draw_histogram_panel(f);
         }
@@ -11312,6 +12908,9 @@ impl App {
         if self.display_mode == 0 {
             if self.show_options_bar {
                 self.draw_options_bar(f);
+                if self.tool_preset_popup {
+                    self.draw_tool_preset_popup(f);
+                }
             }
             self.draw_status(f);
         }
@@ -12010,8 +13609,46 @@ impl App {
                 OptAct::TipHardDown,
                 OptAct::TipHardUp,
             );
+            if matches!(
+                self.tool,
+                Tool::Brush
+                    | Tool::Airbrush
+                    | Tool::Pencil
+                    | Tool::Heal
+                    | Tool::Stamp
+                    | Tool::PatternStamp
+            ) {
+                stepper(
+                    &mut out,
+                    &mut x,
+                    "Flow",
+                    format!("{:.0}%", self.flow * 100.0),
+                    OptAct::FlowDown,
+                    OptAct::FlowUp,
+                );
+            }
         }
         match self.tool {
+            Tool::Brush | Tool::Pencil => toggle(
+                &mut out,
+                &mut x,
+                "Airbrush".into(),
+                self.brush_dyn.airbrush,
+                OptAct::AirbrushToggle,
+                76,
+            ),
+            Tool::Heal => toggle(
+                &mut out,
+                &mut x,
+                if self.heal_use_pattern {
+                    "Source: Pattern".into()
+                } else {
+                    "Source: Sampled".into()
+                },
+                false,
+                OptAct::HealSource,
+                118,
+            ),
             Tool::Stamp | Tool::PatternStamp => toggle(
                 &mut out,
                 &mut x,
@@ -12132,6 +13769,17 @@ impl App {
         ) {
             caps.push("Size:");
             caps.push("Hard:");
+            if matches!(
+                self.tool,
+                Tool::Brush
+                    | Tool::Airbrush
+                    | Tool::Pencil
+                    | Tool::Heal
+                    | Tool::Stamp
+                    | Tool::PatternStamp
+            ) {
+                caps.push("Flow:");
+            }
         }
         match self.tool {
             Tool::MagicEraser | Tool::BackgroundEraser => caps.push("Tol:"),
@@ -12153,7 +13801,16 @@ impl App {
         };
         f.fill_rect(bar, ui::PLATINUM);
         f.fill_rect(Rect::new(0, bar.bottom() - 1, bar.w, 1), ui::DARK);
-        f.text(bar.x + 8, bar.y + 9, self.tool.name(), 1, ui::BLACK);
+        let picker_label = match self.current_tool_preset() {
+            Some(i) => self.tool_presets[i].name.clone(),
+            None => self.tool.name().to_string(),
+        };
+        f.button(
+            Rect::new(bar.x + 4, bar.y + 3, 110, 20),
+            &picker_label,
+            self.tool_preset_popup,
+            true,
+        );
         // Stepper captions sit in the 56px slots the items
         // builder reserved before each value button.
         let caps = self.options_captions();
@@ -12181,6 +13838,10 @@ impl App {
         let Some(bar) = self.options_bar_rect() else {
             return false;
         };
+        if Rect::new(bar.x + 4, bar.y + 3, 110, 20).contains(mx, my) {
+            self.tool_preset_popup = !self.tool_preset_popup;
+            return true;
+        }
         if !bar.contains(mx, my) {
             return false;
         }
@@ -12212,6 +13873,18 @@ impl App {
                     }
                     OptAct::StrokeDown => self.shape_stroke = self.shape_stroke.saturating_sub(1),
                     OptAct::StrokeUp => self.shape_stroke = (self.shape_stroke + 1).min(100),
+                    OptAct::FlowDown => {
+                        self.flow = (self.flow - 0.05).clamp(0.05, 1.0);
+                    }
+                    OptAct::FlowUp => {
+                        self.flow = (self.flow + 0.05).clamp(0.05, 1.0);
+                    }
+                    OptAct::AirbrushToggle => {
+                        self.brush_dyn.airbrush = !self.brush_dyn.airbrush;
+                    }
+                    OptAct::HealSource => {
+                        self.heal_use_pattern = !self.heal_use_pattern;
+                    }
                     OptAct::StampSample => {
                         self.stamp_sample_merged = !self.stamp_sample_merged;
                         self.status = if self.stamp_sample_merged {
@@ -12247,6 +13920,63 @@ impl App {
             }
         }
         true // clicks anywhere on the bar are consumed
+    }
+
+    /// Tool Presets panel (7.0): click a row to apply it;
+    /// the footer captures the current tool setup.
+    fn draw_tool_presets(&mut self, f: &mut Frame) {
+        let Some(r) = self.group_rect(PanelKind::ToolPresets) else {
+            return;
+        };
+        f.text(r.x + 5, r.y + 5, "Tool Presets", 1, ui::BLACK);
+        let cur = self.current_tool_preset();
+        for (i, p) in self.tool_presets.iter().take(10).enumerate() {
+            let rr = Rect::new(r.x + 4, r.y + 20 + i as i32 * 15, r.w - 8, 14);
+            if cur == Some(i) {
+                f.fill_rect(rr, (36, 84, 160));
+                f.text(rr.x + 3, rr.y + 3, &p.name, 1, ui::WHITE);
+            } else {
+                f.text(rr.x + 3, rr.y + 3, &p.name, 1, ui::BLACK);
+            }
+        }
+        Self::draw_small_button(
+            f,
+            Rect::new(r.x + 5, r.bottom() - 16, 100, 13),
+            "New Preset",
+            true,
+        );
+    }
+
+    /// The options-bar tool preset picker popup.
+    fn draw_tool_preset_popup(&mut self, f: &mut Frame) {
+        let Some(bar) = self.options_bar_rect() else {
+            return;
+        };
+        let w = 200;
+        let h = self.tool_presets.len() as i32 * 16 + 6;
+        let pop = Rect::new(bar.x + 4, bar.bottom(), w, h);
+        f.fill_rect(pop, ui::PLATINUM);
+        f.outline_rect(pop, ui::BLACK);
+        let cur = self.current_tool_preset();
+        for (i, p) in self.tool_presets.iter().enumerate() {
+            let rr = Rect::new(pop.x + 3, pop.y + 3 + i as i32 * 16, w - 6, 15);
+            if cur == Some(i) {
+                f.fill_rect(rr, (36, 84, 160));
+                f.text(rr.x + 3, rr.y + 3, &p.name, 1, ui::WHITE);
+            } else {
+                f.text(rr.x + 3, rr.y + 3, &p.name, 1, ui::BLACK);
+            }
+        }
+    }
+
+    fn tool_preset_row_rect(&self, i: usize) -> Option<Rect> {
+        let bar = self.options_bar_rect()?;
+        Some(Rect::new(
+            bar.x + 7,
+            bar.bottom() + 3 + i as i32 * 16,
+            194,
+            15,
+        ))
     }
 
     fn draw_toolbox(&mut self, f: &mut Frame) {
@@ -12356,6 +14086,241 @@ impl App {
         )
     }
 
+    // ---- Phase 7 Brushes palette: dynamics sections ----
+
+    fn brush_section_names() -> [&'static str; 8] {
+        [
+            "Tip Shape",
+            "Shape Dynamics",
+            "Scattering",
+            "Texture",
+            "Dual Brush",
+            "Color Dynamics",
+            "Other Dynamics",
+            "Toggles",
+        ]
+    }
+
+    fn brush_section_active(&self, sec: u8) -> bool {
+        let d = &self.brush_dyn;
+        match sec {
+            0 => {
+                d.angle_deg != 0.0
+                    || d.roundness != 1.0
+                    || d.spacing != 0.25
+                    || d.flip_x
+                    || d.flip_y
+            }
+            1 => {
+                d.size_jitter > 0.0
+                    || d.angle_jitter > 0.0
+                    || d.round_jitter > 0.0
+                    || d.size_control > 0
+                    || d.angle_control > 0
+                    || d.round_control > 0
+            }
+            2 => d.scatter > 0.0 || d.count > 1,
+            3 => d.texture_on,
+            4 => d.dual_on,
+            5 => {
+                d.fb_jitter > 0.0 || d.hue_jitter > 0.0 || d.sat_jitter > 0.0 || d.bri_jitter > 0.0
+            }
+            6 => {
+                d.opacity_jitter > 0.0
+                    || d.flow_jitter > 0.0
+                    || d.opacity_control > 0
+                    || d.flow_control > 0
+            }
+            _ => d.noise || d.wet_edges || d.airbrush || d.smoothing,
+        }
+    }
+
+    fn brushes_panel_h(&self) -> i32 {
+        let rows = self.dyn_row_defs().len() as i32;
+        let tool_row = if self.tool_row_rects().is_some() {
+            24
+        } else {
+            0
+        };
+        86 + 8 * 13 + 6 + rows * 17 + 22 + tool_row
+    }
+
+    /// (id, label, value text, kind) for the current section.
+    /// kind: 0 stepper, 1 toggle, 2 cycle.
+    fn dyn_row_defs(&self) -> Vec<(u8, String, String, u8)> {
+        let d = &self.brush_dyn;
+        let pct = |v: f32| format!("{:.0}%", v * 100.0);
+        let ctl = |c: u8| {
+            ["Off", "Fade", "Pen Pressure", "Pen Tilt", "Stylus Wheel"][(c as usize).min(4)]
+                .to_string()
+        };
+        let step = |id: u8, label: &str, v: String| (id, label.to_string(), v, 0u8);
+        let tog = |id: u8, label: &str, on: bool| {
+            (
+                id,
+                label.to_string(),
+                if on { "On".into() } else { "Off".into() },
+                1u8,
+            )
+        };
+        let cyc = |id: u8, label: &str, v: String| (id, label.to_string(), v, 2u8);
+        match self.brush_section {
+            0 => vec![
+                step(1, "Angle", format!("{:.0} deg", d.angle_deg)),
+                step(2, "Roundness", pct(d.roundness)),
+                step(3, "Spacing", pct(d.spacing)),
+                tog(4, "Flip X", d.flip_x),
+                tog(5, "Flip Y", d.flip_y),
+            ],
+            1 => vec![
+                step(10, "Size Jitter", pct(d.size_jitter)),
+                cyc(11, "Size Control", ctl(d.size_control)),
+                step(12, "Min Diameter", pct(d.min_diameter)),
+                step(13, "Angle Jitter", pct(d.angle_jitter)),
+                cyc(14, "Angle Control", ctl(d.angle_control)),
+                step(15, "Round Jitter", pct(d.round_jitter)),
+                cyc(16, "Round Control", ctl(d.round_control)),
+                step(17, "Min Roundness", pct(d.min_roundness)),
+                step(18, "Fade Steps", format!("{}", d.fade_steps)),
+            ],
+            2 => vec![
+                step(20, "Scatter", pct(d.scatter)),
+                tog(21, "Both Axes", d.both_axes),
+                step(22, "Count", format!("{}", d.count)),
+                step(23, "Count Jitter", pct(d.count_jitter)),
+            ],
+            3 => vec![
+                tog(30, "Texture", d.texture_on),
+                step(31, "Scale", pct(d.tex_scale)),
+                step(32, "Depth", pct(d.tex_depth)),
+                step(33, "Min Depth", pct(d.tex_min_depth)),
+                cyc(
+                    34,
+                    "Mode",
+                    if d.tex_mode == 1 {
+                        "Subtract".into()
+                    } else {
+                        "Multiply".into()
+                    },
+                ),
+                tog(35, "Invert", d.tex_invert),
+                tog(36, "Protect Texture", d.protect_texture),
+            ],
+            4 => vec![
+                tog(40, "Dual Brush", d.dual_on),
+                step(41, "Diameter", format!("{:.0} px", d.dual_size)),
+                step(42, "Hardness", pct(d.dual_hardness)),
+                cyc(
+                    43,
+                    "Mode",
+                    pictodesk_core::blend::BlendMode::from_id(d.dual_mode)
+                        .map(|m| m.name().to_string())
+                        .unwrap_or_else(|| "Multiply".into()),
+                ),
+                step(44, "Scatter", pct(d.dual_scatter)),
+            ],
+            5 => vec![
+                step(50, "F/B Jitter", pct(d.fb_jitter)),
+                step(51, "Hue Jitter", pct(d.hue_jitter)),
+                step(52, "Saturation Jit", pct(d.sat_jitter)),
+                step(53, "Brightness Jit", pct(d.bri_jitter)),
+            ],
+            6 => vec![
+                step(60, "Opacity Jitter", pct(d.opacity_jitter)),
+                cyc(61, "Opacity Control", ctl(d.opacity_control)),
+                step(62, "Flow Jitter", pct(d.flow_jitter)),
+                cyc(63, "Flow Control", ctl(d.flow_control)),
+            ],
+            _ => vec![
+                tog(70, "Noise", d.noise),
+                tog(71, "Wet Edges", d.wet_edges),
+                tog(72, "Airbrush", d.airbrush),
+                tog(73, "Smoothing", d.smoothing),
+            ],
+        }
+    }
+
+    fn dyn_adjust(&mut self, id: u8, dir: i32) {
+        let d = &mut self.brush_dyn;
+        let f = dir as f32;
+        match id {
+            1 => d.angle_deg = (d.angle_deg + f * 5.0).clamp(-180.0, 180.0),
+            2 => d.roundness = (d.roundness + f * 0.05).clamp(0.02, 1.0),
+            3 => d.spacing = (d.spacing + f * 0.05).clamp(0.01, 2.0),
+            10 => d.size_jitter = (d.size_jitter + f * 0.05).clamp(0.0, 1.0),
+            12 => d.min_diameter = (d.min_diameter + f * 0.05).clamp(0.0, 1.0),
+            13 => d.angle_jitter = (d.angle_jitter + f * 0.05).clamp(0.0, 1.0),
+            15 => d.round_jitter = (d.round_jitter + f * 0.05).clamp(0.0, 1.0),
+            17 => d.min_roundness = (d.min_roundness + f * 0.05).clamp(0.0, 1.0),
+            18 => {
+                d.fade_steps = (d.fade_steps as i32 + dir * 10).clamp(10, 9999) as u32;
+            }
+            20 => d.scatter = (d.scatter + f * 0.1).clamp(0.0, 10.0),
+            22 => d.count = (d.count as i32 + dir).clamp(1, 16) as u8,
+            23 => d.count_jitter = (d.count_jitter + f * 0.05).clamp(0.0, 1.0),
+            31 => d.tex_scale = (d.tex_scale + f * 0.1).clamp(0.1, 4.0),
+            32 => d.tex_depth = (d.tex_depth + f * 0.05).clamp(0.0, 1.0),
+            33 => d.tex_min_depth = (d.tex_min_depth + f * 0.05).clamp(0.0, 1.0),
+            41 => d.dual_size = (d.dual_size + f * 2.0).clamp(1.0, 500.0),
+            42 => d.dual_hardness = (d.dual_hardness + f * 0.05).clamp(0.0, 1.0),
+            44 => d.dual_scatter = (d.dual_scatter + f * 0.1).clamp(0.0, 10.0),
+            50 => d.fb_jitter = (d.fb_jitter + f * 0.05).clamp(0.0, 1.0),
+            51 => d.hue_jitter = (d.hue_jitter + f * 0.05).clamp(0.0, 1.0),
+            52 => d.sat_jitter = (d.sat_jitter + f * 0.05).clamp(0.0, 1.0),
+            53 => d.bri_jitter = (d.bri_jitter + f * 0.05).clamp(0.0, 1.0),
+            60 => d.opacity_jitter = (d.opacity_jitter + f * 0.05).clamp(0.0, 1.0),
+            62 => d.flow_jitter = (d.flow_jitter + f * 0.05).clamp(0.0, 1.0),
+            _ => {}
+        }
+    }
+
+    fn dyn_toggle(&mut self, id: u8) {
+        let d = &mut self.brush_dyn;
+        match id {
+            4 => d.flip_x = !d.flip_x,
+            5 => d.flip_y = !d.flip_y,
+            21 => d.both_axes = !d.both_axes,
+            30 => d.texture_on = !d.texture_on,
+            35 => d.tex_invert = !d.tex_invert,
+            36 => d.protect_texture = !d.protect_texture,
+            40 => d.dual_on = !d.dual_on,
+            70 => d.noise = !d.noise,
+            71 => d.wet_edges = !d.wet_edges,
+            72 => d.airbrush = !d.airbrush,
+            73 => d.smoothing = !d.smoothing,
+            _ => {}
+        }
+    }
+
+    fn dyn_cycle(&mut self, id: u8) {
+        let d = &mut self.brush_dyn;
+        match id {
+            11 => d.size_control = (d.size_control + 1) % 5,
+            14 => d.angle_control = (d.angle_control + 1) % 5,
+            16 => d.round_control = (d.round_control + 1) % 5,
+            34 => d.tex_mode = (d.tex_mode + 1) % 2,
+            43 => {
+                d.dual_mode = (d.dual_mode + 1) % 22;
+            }
+            61 => d.opacity_control = (d.opacity_control + 1) % 5,
+            63 => d.flow_control = (d.flow_control + 1) % 5,
+            _ => {}
+        }
+    }
+
+    fn dyn_section_rect(&self, r: Rect, i: u8) -> Rect {
+        Rect::new(r.x + 4, r.y + 86 + i as i32 * 13, r.w - 8, 12)
+    }
+
+    fn dyn_row_rects(&self, r: Rect, j: usize) -> (Rect, Rect, Rect) {
+        let y = r.y + 196 + j as i32 * 17;
+        (
+            Rect::new(r.x + 96, y, 62, 15),
+            Rect::new(r.x + 160, y, 16, 15),
+            Rect::new(r.x + 178, y, 16, 15),
+        )
+    }
+
     fn draw_brushes(&mut self, f: &mut Frame) {
         let Some(r) = self.group_rect(PanelKind::Brushes) else {
             return;
@@ -12369,12 +14334,13 @@ impl App {
             1,
             ui::BLACK,
         );
-        for (idx, (sz, hardness)) in self.brush_presets.iter().enumerate() {
+        for (idx, p) in self.brush_presets.iter().enumerate() {
+            let (sz, hardness) = (p.size, p.hardness);
             let (row, i) = ((idx / 8) as i32, (idx % 8) as i32);
             let cx = r.x + 16 + i * 23;
             let cy = r.y + 30 + row * 26;
             let rad = (sz / 2.0).min(8.0) as i32;
-            let col = if *hardness > 0.5 {
+            let col = if hardness > 0.5 {
                 ui::BLACK
             } else {
                 ui::SHADOW
@@ -12386,9 +14352,32 @@ impl App {
                     }
                 }
             }
-            if (self.tip.size - sz).abs() < 0.1 && (self.tip.hardness - hardness).abs() < 0.1 {
+            if (self.tip.size - sz).abs() < 0.1
+                && (self.tip.hardness - hardness).abs() < 0.1
+                && self.brush_dyn == p.dyn_
+            {
                 f.outline_rect(Rect::new(cx - 10, cy - 10, 20, 20), ui::BLACK);
             }
+        }
+        // Phase 7: dynamics section list + the section's rows.
+        for (i, name) in Self::brush_section_names().iter().enumerate() {
+            let sr = self.dyn_section_rect(r, i as u8);
+            let label = if self.brush_section_active(i as u8) {
+                format!("{name} *")
+            } else {
+                name.to_string()
+            };
+            f.button(sr, &label, self.brush_section == i as u8, true);
+        }
+        for (j, (id, label, value, kind)) in self.dyn_row_defs().iter().enumerate() {
+            let (vb, minus, plus) = self.dyn_row_rects(r, j);
+            f.text(r.x + 6, vb.y + 4, label, 1, ui::BLACK);
+            f.button(vb, value, false, true);
+            if *kind == 0 {
+                f.button(minus, "-", false, true);
+                f.button(plus, "+", false, true);
+            }
+            let _ = id;
         }
         Self::draw_small_button(
             f,
@@ -13942,6 +15931,10 @@ impl App {
                     return true;
                 }
             }
+            if li == self.doc.active_layer && mx >= rr.x + 64 {
+                self.open_rename(0, li);
+                return true;
+            }
             if self.doc.active_layer != li {
                 self.record_step(RecordedStep::LayerSelect(li));
             }
@@ -14508,12 +16501,72 @@ impl App {
                     return true;
                 }
             }
-            for (idx, (sz, hardness)) in self.brush_presets.iter().enumerate() {
+            if let Some(r) = self.group_rect(PanelKind::Brushes) {
+                for i in 0..8u8 {
+                    if self.dyn_section_rect(r, i).contains(mx, my) {
+                        self.brush_section = i;
+                        return true;
+                    }
+                }
+                for (j, (id, _label, _value, kind)) in self.dyn_row_defs().iter().enumerate() {
+                    let (vb, minus, plus) = self.dyn_row_rects(r, j);
+                    match kind {
+                        0 => {
+                            if minus.contains(mx, my) {
+                                self.dyn_adjust(*id, -1);
+                                return true;
+                            }
+                            if plus.contains(mx, my) {
+                                self.dyn_adjust(*id, 1);
+                                return true;
+                            }
+                        }
+                        1 => {
+                            if vb.contains(mx, my) {
+                                self.dyn_toggle(*id);
+                                return true;
+                            }
+                        }
+                        _ => {
+                            if vb.contains(mx, my) {
+                                self.dyn_cycle(*id);
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            for (idx, p) in self.brush_presets.iter().enumerate() {
                 let (row, i) = (idx / 8, idx % 8);
                 if self.brushes_cell(i, row).contains(mx, my) {
-                    self.tip = BrushTip::new(*sz, *hardness);
+                    self.tip = BrushTip::new(p.size, p.hardness);
+                    self.brush_dyn = p.dyn_.clone();
                     return true;
                 }
+            }
+        }
+        if let Some(r) = self.group_rect(PanelKind::ToolPresets) {
+            if r.contains(mx, my) {
+                for (i, _) in self.tool_presets.iter().take(10).enumerate() {
+                    let rr = Rect::new(r.x + 4, r.y + 20 + i as i32 * 15, r.w - 8, 14);
+                    if rr.contains(mx, my) {
+                        self.apply_tool_preset(i);
+                        return true;
+                    }
+                }
+                if Rect::new(r.x + 5, r.bottom() - 16, 100, 13).contains(mx, my) {
+                    let name = format!(
+                        "{} Preset {}",
+                        self.tool.name(),
+                        self.tool_presets.len() + 1
+                    );
+                    let p = self.capture_tool_preset(name);
+                    self.tool_presets.push(p);
+                    save_tool_presets(&self.tool_presets);
+                    self.status = "Tool preset captured".into();
+                    return true;
+                }
+                return true;
             }
         }
         // Channels / Paths group
@@ -14534,6 +16587,12 @@ impl App {
                     let rows = self.channel_rows();
                     if row >= 0 && (row as usize) < rows.len() {
                         let view = rows[row as usize].1;
+                        if let ChannelView::Alpha(a) = view {
+                            if self.channel_view == view && mx >= r.x + 64 {
+                                self.open_rename(1, a);
+                                return true;
+                            }
+                        }
                         self.channel_view = view;
                         self.doc.multi_active = match view {
                             ChannelView::Channel(i) if self.doc.mode == ColorMode::Multichannel => {
@@ -14770,7 +16829,8 @@ impl App {
                     "Save Brushes (.ABR)",
                     "Save Settings",
                     "Export Paths (.ai)",
-                ][(d.save_mode as usize).min(5)]
+                    "Save Mesh",
+                ][(d.save_mode as usize).min(6)]
             } else {
                 d.kind.title()
             },
@@ -15049,6 +17109,43 @@ impl App {
                     f.outline_rect(cell, if kind == 0 { ui::ACCENT } else { ui::SHADOW });
                     f.text(cell.x, cell.y + 54, label, 1, ui::BLACK);
                 }
+            }
+        }
+        if d.kind == DialogKind::PatternMaker {
+            if let Some(t) = &d.pm_tile {
+                let r = layout.rect;
+                let bx = r.x + 12;
+                let by = r.y + 36;
+                // Tiled preview: the tile repeated into a
+                // 240x150 box, scaled down by an integer
+                // factor when the tile is large.
+                let mut stride = 1usize;
+                while t.width as usize / stride > 120 || t.height as usize / stride > 75 {
+                    stride += 1;
+                }
+                let (tw, th) = (t.width as usize / stride, t.height as usize / stride);
+                if tw > 0 && th > 0 {
+                    for yy in 0..150i32 {
+                        for xx in 0..240i32 {
+                            let tx = (xx as usize % tw) * stride;
+                            let ty = (yy as usize % th) * stride;
+                            let p = t.px[ty * t.width as usize + tx].to_rgba8();
+                            f.set(bx + xx, by + yy, (p.0, p.1, p.2));
+                        }
+                    }
+                }
+                f.outline_rect(Rect::new(bx, by, 240, 150), ui::SHADOW);
+                f.text(
+                    bx + 248,
+                    by + 4,
+                    &format!("Tile: {}x{}", t.width, t.height),
+                    1,
+                    ui::BLACK,
+                );
+                f.text(bx + 248, by + 20, "Seamless", 1, ui::BLACK);
+                f.text(bx + 248, by + 36, "cross-blend", 1, ui::BLACK);
+                let fb = Rect::new(bx, by + 158, 150, 18);
+                f.button(fb, "Fill layer on OK", d.opt_a, true);
             }
         }
         if d.kind == DialogKind::SelectiveColor {
@@ -15703,26 +17800,50 @@ impl App {
             );
         }
         if d.kind == DialogKind::PicturePackage {
-            let names = [
+            let layouts = [
                 "Layout: 1-up",
                 "Layout: 2-up",
                 "Layout: 4-up",
                 "Layout: wallets",
             ];
-            f.button(
-                layout.range_buttons[0],
-                names[d.pkg_layout as usize],
-                false,
-                true,
-            );
+            let pages = [
+                "Page: Letter",
+                "Page: A4",
+                "Page: 4x6",
+                "Page: 5x7",
+                "Page: Legal",
+            ];
+            let outputs = [
+                "Output: Flat",
+                "Output: Layers",
+                "Flat + Label",
+                "Layers + Label",
+            ];
+            let src = if self.pkg_sources.is_empty() {
+                "Source: This doc".to_string()
+            } else {
+                format!("Sources: {}", self.pkg_sources.len())
+            };
+            let labels = [
+                layouts[d.pkg_layout as usize].to_string(),
+                pages[(d.fx_page).min(4)].to_string(),
+                outputs[(d.fx_a as usize).min(3)].to_string(),
+                src,
+            ];
+            for (i, br) in layout.range_buttons.iter().enumerate() {
+                f.button(*br, &labels[i], false, true);
+            }
         }
         if d.kind == DialogKind::SaveForWeb {
-            let names = ["JPEG", "PNG", "GIF", "Weighted"];
+            let names = [
+                "JPEG", "PNG", "GIF", "WBMP", "Weighted", "Knockout", "Dither",
+            ];
             for (i, br) in layout.range_buttons.iter().enumerate() {
-                let on = if i < 3 {
-                    d.web_format == i as u8
-                } else {
-                    d.web_weighted
+                let on = match i {
+                    0..=3 => d.web_format == i as u8,
+                    4 => d.web_weighted,
+                    5 => d.web_knockout,
+                    _ => d.web_dither,
                 };
                 f.button(*br, names[i], on, true);
             }
@@ -16069,11 +18190,30 @@ impl App {
                 .doc
                 .render_region_rgba8(0, 0, self.doc.width, self.doc.height);
             let (dw, dh) = (self.doc.width.max(1) as f32, self.doc.height.max(1) as f32);
-            let lscale = (er.w as f32 / dw).min(er.h as f32 / dh);
+            let lscale = (er.w as f32 / dw).min(er.h as f32 / dh) * d.liq_zoom.max(0.05);
             let (lox, loy) = (
-                er.x as f32 + (er.w as f32 - dw * lscale) / 2.0,
-                er.y as f32 + (er.h as f32 - dh * lscale) / 2.0,
+                er.x as f32 + er.w as f32 / 2.0 - d.liq_pan.0 * lscale,
+                er.y as f32 + er.h as f32 / 2.0 - d.liq_pan.1 * lscale,
             );
+            // Backdrop (7.0): the other layers, dimmed, under
+            // the warped active layer.
+            let (under, over) = if d.liq_backdrop {
+                let li = d.adj_layer.unwrap_or(self.doc.active_layer);
+                let mut du = self.doc.clone();
+                if li < du.layers.len() {
+                    du.layers[li].visible = false;
+                }
+                let mut dv = self.doc.clone();
+                for (i, l) in dv.layers.iter_mut().enumerate() {
+                    l.visible = i == li;
+                }
+                (
+                    Some(du.render_region_rgba8(0, 0, du.width, du.height)),
+                    Some(dv.render_region_rgba8(0, 0, dv.width, dv.height)),
+                )
+            } else {
+                (None, None)
+            };
             for py in 0..er.h {
                 for px in 0..er.w {
                     let (dx, dy) = (
@@ -16102,6 +18242,27 @@ impl App {
                         src.get(idx + 1).copied().unwrap_or(0),
                         src.get(idx + 2).copied().unwrap_or(0),
                     );
+                    if let (Some(u), Some(o)) = (&under, &over) {
+                        let (ar, ag, ab, aa) = (
+                            o.get(idx).copied().unwrap_or(0),
+                            o.get(idx + 1).copied().unwrap_or(0),
+                            o.get(idx + 2).copied().unwrap_or(0),
+                            o.get(idx + 3).copied().unwrap_or(0),
+                        );
+                        let uidx = ((dy as u32) * self.doc.width + dx as u32) as usize * 4;
+                        let dim = |v: u8| (v as f32 * 0.55) as u8;
+                        let (ur, ug, ub) = (
+                            dim(u.get(uidx).copied().unwrap_or(0)),
+                            dim(u.get(uidx + 1).copied().unwrap_or(0)),
+                            dim(u.get(uidx + 2).copied().unwrap_or(0)),
+                        );
+                        let mix = |a: u8, b: u8| {
+                            ((a as u16 * aa as u16 + b as u16 * (255 - aa as u16)) / 255) as u8
+                        };
+                        cr = mix(ar, ur);
+                        cg = mix(ag, ug);
+                        cb = mix(ab, ub);
+                    }
                     let fi = (sy as usize) * self.doc.width as usize + sx as usize;
                     if d.liq_frozen.get(fi).copied().unwrap_or(0) != 0 {
                         cr = ((cr as u16 + 255) / 2) as u8;
@@ -16119,13 +18280,16 @@ impl App {
             f.outline_rect(er, ui::BLACK);
             let tools = [
                 "Warp", "Twirl+", "Twirl-", "Pucker", "Bloat", "Shift", "Reflect", "Recon",
-                "Freeze", "Thaw", "Mesh", "Stiff", "Clear",
+                "Freeze", "Thaw", "Turbul", "Hand", "Mesh", "Stiff", "Clear", "Undo", "Bckdrop",
+                "SaveMesh", "LoadMesh",
             ];
             for (i, br) in layout.range_buttons.iter().enumerate() {
-                let on = if i < 10 {
+                let on = if i < 12 {
                     d.liq_tool == i as u8
-                } else if i == 10 {
+                } else if i == 12 {
                     d.liq_mesh
+                } else if i == 16 {
+                    d.liq_backdrop
                 } else {
                     false
                 };
@@ -16133,14 +18297,158 @@ impl App {
             }
             f.text(
                 r.x + 12,
-                r.y + 380,
+                r.y + 402,
                 "Live warp preview. Freeze = red mask.",
                 1,
                 ui::BLACK,
             );
+            let zr = self.liquify_zoom_rects(r);
+            f.button(zr[0], "-", false, true);
+            f.button(zr[1], "+", false, true);
+            f.button(zr[2], "Fit", d.liq_zoom == 1.0, true);
+        }
+        if d.kind == DialogKind::SpellCheck {
+            if let Some(tf) = layout.text_field {
+                f.text(tf.x, tf.y - 10, "Change to:", 1, ui::BLACK);
+            }
+            match d.spell_items.get(d.spell_pos) {
+                Some((li, _, _, word)) => {
+                    f.text(r.x + 12, r.y + 58, "Not in dictionary:", 1, ui::BLACK);
+                    f.text(r.x + 12, r.y + 74, word, 2, ui::BLACK);
+                    f.text(
+                        r.x + 12,
+                        r.y + 104,
+                        &format!(
+                            "Layer '{}' · {} of {}",
+                            self.doc.layers[*li].name,
+                            d.spell_pos + 1,
+                            d.spell_items.len()
+                        ),
+                        1,
+                        ui::DARK,
+                    );
+                }
+                None => {
+                    f.text(
+                        r.x + 12,
+                        r.y + 74,
+                        "Check complete: no unknown words.",
+                        1,
+                        ui::BLACK,
+                    );
+                }
+            }
+            let labels = ["Change", "Ignore", "Ign All", "Add", "Done"];
+            for (i, label) in labels.iter().enumerate() {
+                let br = Rect::new(r.x + 12 + i as i32 * 76, r.y + 122, 72, 18);
+                f.button(br, label, false, true);
+            }
+        }
+        if d.kind == DialogKind::FindReplace {
+            if let Some(tf) = layout.text_field {
+                if d.text.is_empty() {
+                    f.text(tf.x + 4, tf.y + 4, "Find text", 1, ui::SHADOW);
+                }
+                let f2 = Rect::new(tf.x, tf.y + 34, tf.w, tf.h);
+                f.text(f2.x, f2.y - 10, "Replace:", 1, ui::BLACK);
+                if d.text2.is_empty() {
+                    f.text(f2.x + 4, f2.y + 4, "Replacement text", 1, ui::SHADOW);
+                }
+                f.fill_rect(f2, ui::WHITE);
+                f.outline_rect(f2, ui::SHADOW);
+                if d.text_focus && d.text_focus_n == 1 {
+                    f.outline_rect(Rect::new(f2.x - 1, f2.y - 1, f2.w + 2, f2.h + 2), ui::BLACK);
+                }
+                f.text(f2.x + 4, f2.y + 4, &d.text2, 1, ui::BLACK);
+            }
+            let n = self.find_text_matches(&d.text, d.opt_a, d.opt_b).len();
+            f.text(
+                r.x + 12,
+                r.y + 92,
+                &format!("{n} match(es) in type layers"),
+                1,
+                ui::DARK,
+            );
+            let labels = ["Replace All", "Case", "Whole Word"];
+            for (i, br) in layout.range_buttons.iter().enumerate() {
+                let on = match i {
+                    1 => d.opt_a,
+                    2 => d.opt_b,
+                    _ => false,
+                };
+                f.button(*br, labels[i], on, true);
+            }
+        }
+        if d.kind == DialogKind::FileBrowser {
+            f.text(
+                r.x + 12,
+                r.y + 52,
+                &format!("Folder: {}", d.browser_dir),
+                1,
+                ui::BLACK,
+            );
+            for (i, e) in d.browser_entries.iter().take(12).enumerate() {
+                let cell = self.browser_cell(r, i);
+                if i == d.browser_sel {
+                    f.fill_rect(cell, (36, 84, 160));
+                } else {
+                    f.fill_rect(cell, ui::WHITE);
+                }
+                f.outline_rect(cell, ui::BLACK);
+                if e.is_dir {
+                    f.text(cell.x + 8, cell.y + 22, "[Folder]", 1, ui::BLACK);
+                } else if e.tw > 0 {
+                    let (ox, oy) = (
+                        cell.x + (92 - e.tw as i32) / 2,
+                        cell.y + 3 + (46 - e.th as i32) / 2,
+                    );
+                    for y in 0..e.th as i32 {
+                        for x in 0..e.tw as i32 {
+                            let idx = ((y * e.tw as i32 + x) * 4) as usize;
+                            if idx + 2 < e.thumb.len() {
+                                f.set(
+                                    ox + x,
+                                    oy + y,
+                                    (e.thumb[idx], e.thumb[idx + 1], e.thumb[idx + 2]),
+                                );
+                            }
+                        }
+                    }
+                }
+                let label = if e.rank > 0 {
+                    format!("{} [{}]", e.name, (b'A' + e.rank - 1) as char)
+                } else {
+                    e.name.clone()
+                };
+                let label: String = label.chars().take(11).collect();
+                let tc = if i == d.browser_sel {
+                    ui::WHITE
+                } else {
+                    ui::BLACK
+                };
+                f.text(cell.x + 4, cell.y + 52, &label, 1, tc);
+            }
+            let info = d
+                .browser_entries
+                .get(d.browser_sel)
+                .map(|e| e.info.clone())
+                .unwrap_or_default();
+            f.text(r.x + 12, r.y + 276, &info, 1, ui::BLACK);
+            let labels = [
+                "Open", "Up", "Rotate L", "Rotate R", "Rank", "Sort", "Rename", "Refresh",
+            ];
+            for (i, br) in self.browser_button_rects(r).iter().enumerate() {
+                let on = (i == 5 && d.browser_sort_rank)
+                    || (i == 4
+                        && d.browser_entries
+                            .get(d.browser_sel)
+                            .map(|e| e.rank > 0)
+                            .unwrap_or(false));
+                f.button(*br, labels[i], on, true);
+            }
         }
         if d.kind == DialogKind::PresetManager {
-            let tabs = ["Styles", "Shapes"];
+            let tabs = ["Styles", "Shapes", "Tools"];
             for (i, t) in tabs.iter().enumerate() {
                 let br = Rect::new(r.x + 12 + i as i32 * 92, r.y + 52, 88, 18);
                 f.button(br, t, self.preset_tab == i, true);
@@ -16160,13 +18468,13 @@ impl App {
             f.button(
                 Rect::new(r.x + 130, by, 90, 18),
                 "New...",
-                self.preset_tab == 0,
+                self.preset_tab != 1,
                 true,
             );
             f.button(
                 Rect::new(r.x + 228, by, 90, 18),
                 "Delete",
-                self.preset_tab == 0,
+                self.preset_tab != 1,
                 true,
             );
             f.text(
@@ -16174,6 +18482,8 @@ impl App {
                 r.y + 178,
                 if self.preset_tab == 0 {
                     "New = save layer effects by name."
+                } else if self.preset_tab == 2 {
+                    "New = capture the current tool."
                 } else {
                     "Shapes: built-ins + this doc's."
                 },
@@ -17022,6 +19332,26 @@ fn draw_tool_icon(f: &mut Frame, tool: Tool, r: Rect) {
                 f.set(cx + dx, cy + dy, b);
             }
         }
+        Tool::Heal => {
+            // Bandage: a diagonal strip with two dots.
+            for t in 0..11 {
+                let xx = cx - 5 + t;
+                let yy = cy + 5 - t;
+                f.fill_rect(Rect::new(xx, yy, 3, 3), b);
+            }
+            f.set(cx - 1, cy - 1, b);
+            f.set(cx + 2, cy + 2, b);
+        }
+        Tool::Patch => {
+            // Dashed selection square with a solid patch corner.
+            for t in (0..13).step_by(3) {
+                f.fill_rect(Rect::new(cx - 6 + t, cy - 6, 2, 1), b);
+                f.fill_rect(Rect::new(cx - 6 + t, cy + 6, 2, 1), b);
+                f.fill_rect(Rect::new(cx - 6, cy - 6 + t, 1, 2), b);
+                f.fill_rect(Rect::new(cx + 6, cy - 6 + t, 1, 2), b);
+            }
+            f.fill_rect(Rect::new(cx + 1, cy + 1, 5, 5), b);
+        }
         Tool::PatternStamp => {
             // Stamp over a checker patch.
             f.fill_rect(Rect::new(cx - 2, cy - 8, 4, 5), b);
@@ -17242,6 +19572,151 @@ impl App {
                     }
                 }
             }
+            if self.dialog.as_ref().map(|d| &d.kind) == Some(&DialogKind::SpellCheck) {
+                let r = layout.rect;
+                for i in 0..5usize {
+                    let br = Rect::new(r.x + 12 + i as i32 * 76, r.y + 122, 72, 18);
+                    if br.contains(mx, my) {
+                        match i {
+                            0 => self.spell_change(),
+                            1 => {
+                                if let Some(d) = &mut self.dialog {
+                                    d.spell_pos += 1;
+                                    if let Some((_, _, _, w)) =
+                                        d.spell_items.get(d.spell_pos).cloned()
+                                    {
+                                        d.text = w;
+                                    }
+                                }
+                            }
+                            2 => {
+                                let word = self.dialog.as_ref().and_then(|d| {
+                                    d.spell_items
+                                        .get(d.spell_pos)
+                                        .map(|(_, _, _, w)| w.to_lowercase())
+                                });
+                                if let Some(w) = word {
+                                    if let Some(d) = &mut self.dialog {
+                                        d.spell_ignore.push(w);
+                                    }
+                                    self.spell_refresh();
+                                }
+                            }
+                            3 => self.spell_add(),
+                            _ => self.dialog_ok(),
+                        }
+                        return;
+                    }
+                }
+            }
+            if self.dialog.as_ref().map(|d| &d.kind) == Some(&DialogKind::FindReplace) {
+                if let Some(tf) = layout.text_field {
+                    let d = self.dialog.as_mut().unwrap();
+                    d.text_focus = true;
+                    if tf.contains(mx, my) {
+                        d.text_focus_n = 0;
+                        return;
+                    }
+                    let f2 = Rect::new(tf.x, tf.y + 34, tf.w, tf.h);
+                    if f2.contains(mx, my) {
+                        d.text_focus_n = 1;
+                        return;
+                    }
+                }
+            }
+            if self.dialog.as_ref().map(|d| &d.kind) == Some(&DialogKind::FileBrowser) {
+                let r = layout.rect;
+                for i in 0..12usize {
+                    let cell = self.browser_cell(r, i);
+                    if cell.contains(mx, my) {
+                        if let Some(d) = &mut self.dialog {
+                            if i < d.browser_entries.len() {
+                                d.browser_sel = i;
+                            }
+                        }
+                        return;
+                    }
+                }
+                for (i, br) in self.browser_button_rects(r).iter().enumerate() {
+                    if br.contains(mx, my) {
+                        match i {
+                            0 => {
+                                self.dialog_ok();
+                            }
+                            1 => {
+                                let parent = {
+                                    let d = self.dialog.as_ref().unwrap();
+                                    std::path::Path::new(&d.browser_dir)
+                                        .parent()
+                                        .map(|p| p.to_string_lossy().into_owned())
+                                };
+                                if let Some(p) = parent {
+                                    self.dialog.as_mut().unwrap().browser_dir = p;
+                                    self.browser_rescan();
+                                }
+                            }
+                            2 | 3 => {
+                                let delta: i8 = if i == 2 { -1 } else { 1 };
+                                if let Some(d) = &mut self.dialog {
+                                    if let Some(e) = d.browser_entries.get_mut(d.browser_sel) {
+                                        if !e.is_dir {
+                                            e.rotate = (e.rotate + delta).clamp(-1, 1);
+                                        }
+                                    }
+                                }
+                                self.browser_save_meta();
+                            }
+                            4 => {
+                                if let Some(d) = &mut self.dialog {
+                                    if let Some(e) = d.browser_entries.get_mut(d.browser_sel) {
+                                        if !e.is_dir {
+                                            e.rank = (e.rank + 1) % 6;
+                                        }
+                                    }
+                                }
+                                self.browser_save_meta();
+                            }
+                            5 => {
+                                if let Some(d) = &mut self.dialog {
+                                    d.browser_sort_rank = !d.browser_sort_rank;
+                                }
+                                self.browser_rescan();
+                            }
+                            6 => self.browser_batch_rename(),
+                            _ => self.browser_rescan(),
+                        }
+                        return;
+                    }
+                }
+            }
+            if self.dialog.as_ref().map(|d| &d.kind) == Some(&DialogKind::Liquify) {
+                let zr = self.liquify_zoom_rects(layout.rect);
+                for (i, z) in zr.iter().enumerate() {
+                    if z.contains(mx, my) {
+                        if let Some(d) = &mut self.dialog {
+                            match i {
+                                0 => d.liq_zoom = (d.liq_zoom * 0.8).max(0.25),
+                                1 => d.liq_zoom = (d.liq_zoom * 1.25).min(8.0),
+                                _ => {
+                                    d.liq_zoom = 1.0;
+                                    d.liq_pan =
+                                        (self.doc.width as f32 / 2.0, self.doc.height as f32 / 2.0);
+                                }
+                            }
+                        }
+                        return;
+                    }
+                }
+            }
+            if self.dialog.as_ref().map(|d| &d.kind) == Some(&DialogKind::PatternMaker) {
+                let fb = Rect::new(layout.rect.x + 12, layout.rect.y + 36 + 158, 150, 18);
+                if fb.contains(mx, my) {
+                    if let Some(d) = &mut self.dialog {
+                        d.opt_a = !d.opt_a;
+                    }
+                    return;
+                }
+            }
             if self.dialog.as_ref().map(|d| &d.kind) == Some(&DialogKind::Variations) {
                 if let Some(cells) = self.var_cells() {
                     for (cell, _label, kind) in cells {
@@ -17349,9 +19824,10 @@ impl App {
                             }
                         } else if d.kind == DialogKind::Liquify {
                             match i {
-                                0..=9 => d.liq_tool = i as u8,
-                                10 => d.liq_mesh = !d.liq_mesh,
-                                11 => {
+                                0..=11 => d.liq_tool = i as u8,
+                                12 => d.liq_mesh = !d.liq_mesh,
+                                13 => {
+                                    d.liq_undo.push(d.liq_disp.clone());
                                     let mut fld = pictodesk_core::liquify::LiquifyField {
                                         w: doc_wh.0,
                                         h: doc_wh.1,
@@ -17360,15 +19836,33 @@ impl App {
                                     fld.reconstruct(1, &d.liq_frozen.clone());
                                     d.liq_disp = fld.disp;
                                 }
-                                _ => {
+                                14 => {
+                                    d.liq_undo.push(d.liq_disp.clone());
                                     for v in d.liq_disp.iter_mut() {
                                         *v = (0.0, 0.0);
                                     }
                                 }
+                                15 => {
+                                    if let Some(prev) = d.liq_undo.pop() {
+                                        d.liq_disp = prev;
+                                    }
+                                }
+                                16 => d.liq_backdrop = !d.liq_backdrop,
+                                17 => d.liq_save_req = true,
+                                _ => d.liq_load_req = true,
                             }
                         }
                         d.kind == DialogKind::PhotoFilter
                     };
+                    if self
+                        .dialog
+                        .as_ref()
+                        .map(|d| d.liq_save_req || d.liq_load_req)
+                        .unwrap_or(false)
+                    {
+                        self.liquify_mesh_io();
+                        return;
+                    }
                     let kind6 = self.dialog.as_ref().unwrap().kind.clone();
                     if kind6 == DialogKind::Blending {
                         self.blend_sync_from_vals();
@@ -17384,6 +19878,7 @@ impl App {
                 self.dialog.as_ref().map(|d| &d.kind),
                 Some(DialogKind::CondMode)
                     | Some(DialogKind::PicturePackage)
+                    | Some(DialogKind::FindReplace)
                     | Some(DialogKind::SaveForWeb)
                     | Some(DialogKind::Print)
                     | Some(DialogKind::PageSetup)
@@ -17418,16 +19913,55 @@ impl App {
                                     d.cond_to = (d.cond_to + 1) % 3;
                                 }
                             }
-                            DialogKind::PicturePackage => {
-                                let d = self.dialog.as_mut().unwrap();
-                                d.pkg_layout = (d.pkg_layout + 1) % 4;
-                            }
-                            DialogKind::SaveForWeb => {
-                                if i == 3 {
+                            DialogKind::PicturePackage => match i {
+                                0 => {
                                     let d = self.dialog.as_mut().unwrap();
-                                    d.web_weighted = !d.web_weighted;
-                                } else {
-                                    self.dialog.as_mut().unwrap().web_format = i as u8;
+                                    d.pkg_layout = (d.pkg_layout + 1) % 4;
+                                }
+                                1 => {
+                                    let d = self.dialog.as_mut().unwrap();
+                                    d.fx_page = (d.fx_page + 1) % 5;
+                                    let (pw, ph) = [
+                                        (612.0, 792.0),
+                                        (595.0, 842.0),
+                                        (288.0, 432.0),
+                                        (360.0, 504.0),
+                                        (612.0, 1008.0),
+                                    ][d.fx_page];
+                                    d.vals[0] = pw;
+                                    d.vals[1] = ph;
+                                }
+                                2 => {
+                                    let d = self.dialog.as_mut().unwrap();
+                                    d.fx_a = (d.fx_a + 1) % 4;
+                                }
+                                _ => {
+                                    self.file_panel_purpose = 7;
+                                    self.open_file_panel();
+                                }
+                            },
+                            DialogKind::FindReplace => match i {
+                                0 => {
+                                    self.find_replace_all();
+                                }
+                                1 => {
+                                    let d = self.dialog.as_mut().unwrap();
+                                    d.opt_a = !d.opt_a;
+                                }
+                                _ => {
+                                    let d = self.dialog.as_mut().unwrap();
+                                    d.opt_b = !d.opt_b;
+                                }
+                            },
+                            DialogKind::SaveForWeb => {
+                                {
+                                    let d = self.dialog.as_mut().unwrap();
+                                    match i {
+                                        0..=3 => d.web_format = i as u8,
+                                        4 => d.web_weighted = !d.web_weighted,
+                                        5 => d.web_knockout = !d.web_knockout,
+                                        _ => d.web_dither = !d.web_dither,
+                                    }
                                 }
                                 self.refresh_web_size();
                             }
@@ -17735,7 +20269,7 @@ impl App {
                 Some(DialogKind::PresetManager)
             ) {
                 let r = layout.rect;
-                for i in 0..2usize {
+                for i in 0..3usize {
                     let br = Rect::new(r.x + 12 + i as i32 * 92, r.y + 52, 88, 18);
                     if br.contains(mx, my) {
                         self.preset_tab = i;
@@ -17755,6 +20289,34 @@ impl App {
                 if Rect::new(r.x + 12, by, 110, 18).contains(mx, my) {
                     self.dialog_ok();
                     return;
+                }
+                if self.preset_tab == 2 {
+                    if Rect::new(r.x + 130, by, 90, 18).contains(mx, my) {
+                        let typed = self.dialog.as_ref().unwrap().text.trim().to_string();
+                        let name = if typed.is_empty() {
+                            format!(
+                                "{} Preset {}",
+                                self.tool.name(),
+                                self.tool_presets.len() + 1
+                            )
+                        } else {
+                            typed
+                        };
+                        let p = self.capture_tool_preset(name.clone());
+                        self.tool_presets.push(p);
+                        save_tool_presets(&self.tool_presets);
+                        self.status = format!("Tool preset '{name}' saved");
+                        return;
+                    }
+                    if Rect::new(r.x + 228, by, 90, 18).contains(mx, my) {
+                        let sel = self.dialog.as_ref().unwrap().preset_sel;
+                        if sel < self.tool_presets.len() {
+                            let p = self.tool_presets.remove(sel);
+                            save_tool_presets(&self.tool_presets);
+                            self.status = format!("Tool preset '{}' deleted", p.name);
+                        }
+                        return;
+                    }
                 }
                 if self.preset_tab == 0 {
                     if Rect::new(r.x + 130, by, 90, 18).contains(mx, my) {
@@ -18086,6 +20648,20 @@ impl App {
                         3 => self.load_swatches_file(&path),
                         4 => self.load_brushes_file(&path),
                         5 => self.load_settings_file(&path),
+                        7 => {
+                            self.pkg_sources.push(path.clone());
+                            self.status =
+                                format!("Picture Package sources: {}", self.pkg_sources.len());
+                        }
+                        6 => {
+                            match std::fs::read(&path)
+                                .ok()
+                                .and_then(|b| pictodesk_core::liquify::field_from_bytes(&b))
+                            {
+                                Some(f) => self.liquify_install_mesh(f),
+                                None => self.status = "Not a mesh file".into(),
+                            }
+                        }
                         _ => self.take_map_file(&path),
                     }
                     return;
@@ -18160,6 +20736,20 @@ impl App {
                     }
                 }
             }
+        }
+        // Tool preset picker popup: a row applies, any
+        // other click dismisses.
+        if self.tool_preset_popup {
+            self.tool_preset_popup = false;
+            for i in 0..self.tool_presets.len() {
+                if let Some(rr) = self.tool_preset_row_rect(i) {
+                    if rr.contains(mx, my) {
+                        self.apply_tool_preset(i);
+                        return;
+                    }
+                }
+            }
+            return;
         }
         // ---- options bar (Phase 6.5 Batch 5)
         if self.options_press(mx, my) {
@@ -18573,10 +21163,18 @@ impl App {
                     .map(|(i, l)| (i, l.offset))
                     .collect();
             }
+            Tool::Patch => {
+                if self.sel.is_some() {
+                    self.drag = DragMode::PatchDrag;
+                } else {
+                    self.status = "The Patch tool needs a selection first".into();
+                }
+            }
             Tool::Brush
             | Tool::Airbrush
             | Tool::Pencil
             | Tool::Eraser
+            | Tool::Heal
             | Tool::Stamp
             | Tool::HistoryBrush
             | Tool::ArtHistoryBrush
@@ -18625,6 +21223,25 @@ impl App {
                 if self.tool == Tool::Stamp && self.clone_src.is_none() {
                     self.status = "Alt+click to set clone source first".into();
                     return;
+                }
+                if self.tool == Tool::Heal && !self.heal_use_pattern {
+                    if !matches!(
+                        self.doc.mode,
+                        pictodesk_core::document::ColorMode::Rgb
+                            | pictodesk_core::document::ColorMode::Grayscale
+                    ) {
+                        self.status = "Healing works in RGB and Grayscale documents for now".into();
+                        return;
+                    }
+                    if self.alt_down {
+                        self.heal_src = Some(dp);
+                        self.status = "Heal source set".into();
+                        return;
+                    }
+                    if self.heal_src.is_none() {
+                        self.status = "Alt+click to set the heal source first".into();
+                        return;
+                    }
                 }
                 if self.tool == Tool::PatternStamp && self.doc.pattern.is_none() {
                     self.status =
@@ -19065,9 +21682,37 @@ impl App {
 
     /// File > Automate > Picture Package: the current image
     /// repeated on one page in a classic layout.
-    fn run_picture_package(&mut self, page_w: u32, page_h: u32, layout: u8) {
-        let src = self.doc.render_full_rgba8();
-        let (iw, ih) = (self.doc.width.max(1), self.doc.height.max(1));
+    fn run_picture_package(
+        &mut self,
+        page_w: u32,
+        page_h: u32,
+        layout: u8,
+        layered: bool,
+        labels: bool,
+    ) {
+        // Sources (7.0): the picked files, or the current
+        // document when none were picked. Cells cycle through
+        // them, so a page can hold different images.
+        let mut sources: Vec<(Vec<u8>, u32, u32, String)> = Vec::new();
+        for p in &self.pkg_sources {
+            if let Ok(bytes) = std::fs::read(p) {
+                if let Ok(doc) = pictodesk_core::io::import_image(&bytes) {
+                    let label = p
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    sources.push((doc.render_full_rgba8(), doc.width, doc.height, label));
+                }
+            }
+        }
+        if sources.is_empty() {
+            sources.push((
+                self.doc.render_full_rgba8(),
+                self.doc.width,
+                self.doc.height,
+                "Document".to_string(),
+            ));
+        }
         let mut page = Document::new(page_w, page_h);
         page.layers[0].fill_rect(
             0,
@@ -19086,8 +21731,12 @@ impl App {
         let margin = 24u32;
         let cell_w = (page_w - margin * 2) / cols;
         let cell_h = (page_h - margin * 2) / rows;
+        let mut cell_no = 0usize;
         for r in 0..rows {
             for c in 0..cols {
+                let (src, iw, ih, label) = &sources[cell_no % sources.len()];
+                let (iw, ih) = (*iw, *ih);
+                cell_no += 1;
                 let scale = ((cell_w - 8) as f32 / iw as f32).min((cell_h - 8) as f32 / ih as f32);
                 let (tw, th) = (
                     ((iw as f32 * scale) as u32).max(1),
@@ -19095,13 +21744,22 @@ impl App {
                 );
                 let ox = margin + c * cell_w + (cell_w - tw) / 2;
                 let oy = margin + r * cell_h + (cell_h - th) / 2;
+                // Layered output: each image gets its own
+                // layer; flattened: everything on the base.
+                let target = if layered {
+                    let l = pictodesk_core::layer::Layer::new(label.clone());
+                    page.layers.push(l);
+                    page.layers.len() - 1
+                } else {
+                    0
+                };
                 for yy in 0..th {
                     for xx in 0..tw {
                         let sx = (xx as f32 / scale) as u32;
                         let sy = (yy as f32 / scale) as u32;
                         let idx = ((sy * iw + sx) * 4) as usize;
                         if idx + 3 < src.len() {
-                            page.layers[0].set_pixel(
+                            page.layers[target].set_pixel(
                                 (ox + xx) as i32,
                                 (oy + yy) as i32,
                                 Pixel16::from_rgba8(
@@ -19113,6 +21771,16 @@ impl App {
                             );
                         }
                     }
+                }
+                if labels {
+                    let black = Pixel16::from_rgba8(0, 0, 0, 255);
+                    stamp_label(
+                        &mut page.layers[target],
+                        ox as i32,
+                        (oy + th + 2) as i32,
+                        label,
+                        black,
+                    );
                 }
             }
         }
@@ -20068,6 +22736,7 @@ impl App {
         let n = (self.doc.width * self.doc.height) as usize;
         d.liq_disp = vec![(0.0, 0.0); n];
         d.liq_frozen = vec![0u8; n];
+        d.liq_pan = (self.doc.width as f32 / 2.0, self.doc.height as f32 / 2.0);
         self.dialog = Some(d);
         self.status = "Liquify: paint with the warp tools, OK to apply".into();
     }
@@ -20079,24 +22748,128 @@ impl App {
         Some(Rect::new(r.x + 12, r.y + 30, r.w - 24, 276))
     }
 
-    /// Map a window point in the Liquify editor to doc coords.
+    /// Map a window point in the Liquify editor to doc coords
+    /// (Phase 7: zoom + pan around the pan point).
     fn liquify_doc_point(&self, mx: i32, my: i32) -> Option<(f32, f32)> {
         let er = self.liquify_editor_rect()?;
         if !er.contains(mx, my) {
             return None;
         }
+        let d = self.dialog.as_ref()?;
         let (w, h) = (self.doc.width as f32, self.doc.height as f32);
-        let scale = (er.w as f32 / w).min(er.h as f32 / h);
+        let scale = (er.w as f32 / w).min(er.h as f32 / h) * d.liq_zoom.max(0.05);
         let (ox, oy) = (
-            er.x as f32 + (er.w as f32 - w * scale) / 2.0,
-            er.y as f32 + (er.h as f32 - h * scale) / 2.0,
+            er.x as f32 + er.w as f32 / 2.0 - d.liq_pan.0 * scale,
+            er.y as f32 + er.h as f32 / 2.0 - d.liq_pan.1 * scale,
         );
         Some(((mx as f32 - ox) / scale, (my as f32 - oy) / scale))
+    }
+
+    /// The three zoom buttons on the Liquify hint line.
+    fn liquify_zoom_rects(&self, r: Rect) -> [Rect; 3] {
+        [
+            Rect::new(r.x + 296, r.y + 400, 30, 16),
+            Rect::new(r.x + 328, r.y + 400, 30, 16),
+            Rect::new(r.x + 360, r.y + 400, 34, 16),
+        ]
+    }
+
+    /// Act on the Liquify Save/Load Mesh requests the button
+    /// handler flagged (they need &mut self beyond the dialog).
+    fn liquify_mesh_io(&mut self) {
+        let (save, load) = {
+            let d = self.dialog.as_mut().unwrap();
+            let r = (d.liq_save_req, d.liq_load_req);
+            d.liq_save_req = false;
+            d.liq_load_req = false;
+            r
+        };
+        if load {
+            self.file_panel_purpose = 6;
+            self.open_file_panel();
+        }
+        if save {
+            let bytes = {
+                let d = self.dialog.as_ref().unwrap();
+                let field = pictodesk_core::liquify::LiquifyField {
+                    w: self.doc.width,
+                    h: self.doc.height,
+                    disp: d.liq_disp.clone(),
+                };
+                pictodesk_core::liquify::field_to_bytes(&field)
+            };
+            self.mesh_bytes = bytes;
+            self.liq_return = self.dialog.take();
+            let mut d = Dialog::new(DialogKind::SaveAs, &self.doc);
+            d.save_mode = 6;
+            d.text = "mesh.pdmesh".into();
+            self.dialog = Some(d);
+        }
+    }
+
+    /// Install a loaded mesh into the open Liquify dialog,
+    /// resampling the field when the mesh size differs.
+    fn liquify_install_mesh(&mut self, field: pictodesk_core::liquify::LiquifyField) {
+        let (w, h) = (self.doc.width, self.doc.height);
+        let disp = if field.w == w && field.h == h {
+            field.disp
+        } else {
+            let (sw, sh) = (field.w.max(1) as f32, field.h.max(1) as f32);
+            let (xr, yr) = (w as f32 / sw, h as f32 / sh);
+            (0..(w * h) as usize)
+                .map(|i| {
+                    let (x, y) = ((i as u32 % w) as f32 / xr, (i as u32 / w) as f32 / yr);
+                    let (x0, y0) = (x.floor(), y.floor());
+                    let (fx, fy) = (x - x0, y - y0);
+                    let get = |xx: i32, yy: i32| {
+                        field
+                            .disp
+                            .get(
+                                (yy.clamp(0, sh as i32 - 1) as usize) * (sw as usize)
+                                    + xx.clamp(0, sw as i32 - 1) as usize,
+                            )
+                            .copied()
+                            .unwrap_or((0.0, 0.0))
+                    };
+                    let (ax, ay) = get(x0 as i32, y0 as i32);
+                    let (bx, by) = get(x0 as i32 + 1, y0 as i32);
+                    let (cx, cy) = get(x0 as i32, y0 as i32 + 1);
+                    let (dx, dy) = get(x0 as i32 + 1, y0 as i32 + 1);
+                    (
+                        (ax + (bx - ax) * fx + (cx - ax) * fy + (ax - bx - cx + dx) * fx * fy) * xr,
+                        (ay + (by - ay) * fx + (cy - ay) * fy + (ay - by - cy + dy) * fx * fy) * yr,
+                    )
+                })
+                .collect()
+        };
+        if let Some(d) = &mut self.dialog {
+            if d.kind == DialogKind::Liquify {
+                d.liq_undo.push(d.liq_disp.clone());
+                d.liq_disp = disp;
+                self.status = "Mesh loaded".into();
+            }
+        }
     }
 
     /// One Liquify brush stamp at a doc point.
     fn liquify_stamp(&mut self, dp: (f32, f32)) {
         let Some(d) = &mut self.dialog else { return };
+        // Hand tool: drag pans the view.
+        if d.liq_tool == 11 {
+            if let Some(l) = d.liq_last {
+                d.liq_pan.0 -= dp.0 - l.0;
+                d.liq_pan.1 -= dp.1 - l.1;
+            }
+            d.liq_last = Some(dp);
+            return;
+        }
+        // Multiple undo: snapshot the field at each drag start.
+        if d.liq_last.is_none() {
+            d.liq_undo.push(d.liq_disp.clone());
+            if d.liq_undo.len() > 24 {
+                d.liq_undo.remove(0);
+            }
+        }
         let (w, h) = (self.doc.width, self.doc.height);
         let mut field = pictodesk_core::liquify::LiquifyField {
             w,
@@ -20116,6 +22889,11 @@ impl App {
             5 => field.stamp_shift(last, dp, radius, pressure, &frozen),
             6 => field.stamp_reflect(last, dp, radius, pressure, &frozen),
             7 => field.reconstruct(2, &frozen),
+            10 => {
+                let seed = d.liq_seed;
+                d.liq_seed = d.liq_seed.wrapping_add(1);
+                field.stamp_turbulence(dp, radius, pressure, &frozen, seed);
+            }
             8 | 9 => {
                 // Freeze / Thaw: paint the mask directly.
                 let val = if d.liq_tool == 8 { 255u8 } else { 0u8 };
@@ -20258,6 +23036,8 @@ impl App {
     fn preset_rows(&self) -> Vec<String> {
         if self.preset_tab == 0 {
             self.style_presets.iter().map(|(n, _)| n.clone()).collect()
+        } else if self.preset_tab == 2 {
+            self.tool_presets.iter().map(|p| p.name.clone()).collect()
         } else {
             let mut v: Vec<String> = ["Star", "Arrow", "Heart"]
                 .iter()
@@ -20549,7 +23329,9 @@ impl App {
     /// stroke is held, each tick lays another low-opacity stamp at
     /// the current point, so color builds the longer you hold.
     pub fn airbrush_tick(&mut self) {
-        if self.tool != Tool::Airbrush || self.drag != DragMode::Paint {
+        let air = self.tool == Tool::Airbrush
+            || (matches!(self.tool, Tool::Brush | Tool::Pencil) && self.brush_dyn.airbrush);
+        if !air || self.drag != DragMode::Paint {
             return;
         }
         if self.alpha_cmd.is_some() {
@@ -20709,26 +23491,222 @@ impl App {
         } else {
             self.fg
         };
+        self.stroke_seed = self.stroke_seed.wrapping_add(1);
+        let tex = if self.brush_dyn.texture_on {
+            self.doc.pattern.as_ref().map(|p| {
+                let lum: Vec<f32> =
+                    p.px.iter()
+                        .map(|px| {
+                            let (r, g, b, _) = px.to_rgba8();
+                            (0.3 * r as f32 + 0.59 * g as f32 + 0.11 * b as f32) / 255.0
+                        })
+                        .collect();
+                std::rc::Rc::new(pictodesk_core::brush::BrushTexture {
+                    w: p.width,
+                    h: p.height,
+                    lum,
+                    scale: self.brush_dyn.tex_scale,
+                    depth: self.brush_dyn.tex_depth,
+                    min_depth: self.brush_dyn.tex_min_depth,
+                    mode: self.brush_dyn.tex_mode,
+                    invert: self.brush_dyn.tex_invert,
+                })
+            })
+        } else {
+            None
+        };
         self.stroke = Some(StrokeState {
             cmd: TileEditCommand::new(self.tool.name()),
             start_point: dp,
             last_point: dp,
             smudge_carry: carry,
             tiles_seen: Vec::new(),
+            rng: 0x9E37_79B9 ^ self.stroke_seed.wrapping_mul(7919),
+            stamps: 0,
+            smooth: dp,
+            tex,
         });
         // Snapshot BEFORE the first stamp lands, or undo would keep it.
         self.capture_segment_tiles(dp);
         self.stamp_at(dp);
     }
 
+    /// Phase 7 wrapper: apply the paint engine (dynamics,
+    /// scattering, color dynamics, flow) around stamp_once.
+    /// With default dynamics this is exactly one plain stamp.
     fn stamp_at(&mut self, center: (f32, f32)) {
+        let bd = self.brush_dyn.clone();
+        let tool = self.tool;
+        let driven = matches!(
+            tool,
+            Tool::Brush
+                | Tool::Airbrush
+                | Tool::Pencil
+                | Tool::Eraser
+                | Tool::Stamp
+                | Tool::PatternStamp
+                | Tool::Heal
+                | Tool::Blur
+                | Tool::Sharpen
+                | Tool::Smudge
+                | Tool::Dodge
+                | Tool::Burn
+                | Tool::Sponge
+                | Tool::HistoryBrush
+                | Tool::ArtHistoryBrush
+                | Tool::BackgroundEraser
+        );
+        if !driven {
+            self.stamp_once(center, self.tip.clone(), self.fg, self.opacity);
+            return;
+        }
+        let idx = self.stroke.as_ref().map(|s| s.stamps).unwrap_or(0);
+        if let Some(st) = &mut self.stroke {
+            st.stamps += 1;
+        }
+        let fade = |control: u8| -> f32 {
+            if control == 1 {
+                (1.0 - idx as f32 / bd.fade_steps.max(1) as f32).clamp(0.0, 1.0)
+            } else {
+                1.0
+            }
+        };
+        let mut rng = self.stroke.as_ref().map(|s| s.rng).unwrap_or(0x2545);
+        let mut n = bd.count.max(1) as i32;
+        if bd.count_jitter > 0.0 {
+            n = (n as f32 * (1.0 - bd.count_jitter * next_rand(&mut rng)))
+                .round()
+                .max(1.0) as i32;
+        }
+        let last = self.stroke.as_ref().map(|s| s.last_point).unwrap_or(center);
+        let (mut dirx, mut diry) = (center.0 - last.0, center.1 - last.1);
+        let dl = (dirx * dirx + diry * diry).sqrt();
+        if dl > 0.001 {
+            dirx /= dl;
+            diry /= dl;
+        } else {
+            dirx = 1.0;
+            diry = 0.0;
+        }
+        let (perpx, perpy) = (-diry, dirx);
+        let base_size = self.tip.size;
+        for _ in 0..n {
+            let mut tip = self.tip.clone();
+            // Shape dynamics.
+            let min_abs = bd.min_diameter * base_size;
+            let mut size = min_abs + (base_size - min_abs) * fade(bd.size_control);
+            if bd.size_jitter > 0.0 {
+                size *= 1.0 - bd.size_jitter * next_rand(&mut rng);
+            }
+            tip.size = size.max(1.0);
+            tip.angle = bd.angle_deg.to_radians()
+                + bd.angle_jitter
+                    * (next_rand(&mut rng) * 2.0 - 1.0)
+                    * std::f32::consts::PI
+                    * fade(bd.angle_control);
+            let min_r = bd.min_roundness;
+            let mut round = min_r + (bd.roundness - min_r) * fade(bd.round_control);
+            if bd.round_jitter > 0.0 {
+                round *= 1.0 - bd.round_jitter * next_rand(&mut rng);
+            }
+            tip.roundness = round.clamp(0.02, 1.0);
+            tip.flip_x = bd.flip_x;
+            tip.flip_y = bd.flip_y;
+            tip.noise = bd.noise;
+            tip.wet_edges = bd.wet_edges;
+            tip.tex = self.stroke.as_ref().and_then(|s| s.tex.clone());
+            if bd.dual_on {
+                let dmag = bd.dual_scatter * bd.dual_size;
+                tip.dual = Some(Box::new(pictodesk_core::brush::DualTip {
+                    size: bd.dual_size,
+                    hardness: bd.dual_hardness,
+                    mask: None,
+                    mode: bd.dual_mode,
+                    dx: (next_rand(&mut rng) * 2.0 - 1.0) * dmag,
+                    dy: (next_rand(&mut rng) * 2.0 - 1.0) * dmag,
+                }));
+            }
+            // Scattering: perpendicular to the stroke, or
+            // both axes.
+            let mag = bd.scatter * base_size;
+            let mut c = center;
+            if mag > 0.0 {
+                let a = (next_rand(&mut rng) * 2.0 - 1.0) * mag;
+                c.0 += perpx * a;
+                c.1 += perpy * a;
+                if bd.both_axes {
+                    let b = (next_rand(&mut rng) * 2.0 - 1.0) * mag;
+                    c.0 += dirx * b;
+                    c.1 += diry * b;
+                }
+            }
+            // Color dynamics (foreground painting tools).
+            let mut fg = self.fg;
+            if matches!(tool, Tool::Brush | Tool::Airbrush | Tool::Pencil)
+                && (bd.fb_jitter > 0.0
+                    || bd.hue_jitter > 0.0
+                    || bd.sat_jitter > 0.0
+                    || bd.bri_jitter > 0.0)
+            {
+                let (fr, fg_, fb, fa) = fg.to_rgba8();
+                let (br, bg_, bb, _) = self.bg.to_rgba8();
+                let t = bd.fb_jitter * next_rand(&mut rng);
+                let mix = |a: u8, b: u8| -> f32 { (a as f32 * (1.0 - t) + b as f32 * t) / 255.0 };
+                let (mut h, mut s_, mut l) =
+                    rgb_to_hsl_turns(mix(fr, br), mix(fg_, bg_), mix(fb, bb));
+                h += bd.hue_jitter * (next_rand(&mut rng) - 0.5);
+                s_ = (s_ * (1.0 + bd.sat_jitter * (next_rand(&mut rng) * 2.0 - 1.0)))
+                    .clamp(0.0, 1.0);
+                l = (l * (1.0 + bd.bri_jitter * (next_rand(&mut rng) * 2.0 - 1.0))).clamp(0.0, 1.0);
+                let (r, g, b) = hsl_turns_to_rgb(h, s_, l);
+                fg = Pixel16::from_rgba8(
+                    (r * 255.0) as u8,
+                    (g * 255.0) as u8,
+                    (b * 255.0) as u8,
+                    fa,
+                );
+            }
+            // Opacity + flow dynamics.
+            let mut op = self.opacity;
+            if matches!(
+                tool,
+                Tool::Brush
+                    | Tool::Airbrush
+                    | Tool::Pencil
+                    | Tool::Heal
+                    | Tool::Stamp
+                    | Tool::PatternStamp
+            ) {
+                let mut fl = self.flow;
+                if bd.flow_jitter > 0.0 {
+                    fl *= 1.0 - bd.flow_jitter * next_rand(&mut rng);
+                }
+                if bd.flow_control == 1 {
+                    fl *= fade(1);
+                }
+                op *= fl;
+            }
+            if bd.opacity_control == 1 {
+                op *= fade(1);
+            }
+            if bd.opacity_jitter > 0.0 {
+                op *= 1.0 - bd.opacity_jitter * next_rand(&mut rng);
+            }
+            if tool == Tool::Airbrush || (tool == Tool::Brush && bd.airbrush) {
+                op *= 0.35;
+            }
+            self.stamp_once(c, tip, fg, op);
+        }
+        if let Some(st) = &mut self.stroke {
+            st.rng = rng;
+        }
+    }
+
+    fn stamp_once(&mut self, center: (f32, f32), tip: BrushTip, fg: Pixel16, opacity: f32) {
         let layer = self.doc.active_layer;
         let sel = self.sel.clone();
-        let tip = self.tip.clone();
-        let opacity = self.opacity;
         let tool = self.tool;
-        let (fg, clone_src, start) = (
-            self.fg,
+        let (clone_src, start) = (
             self.clone_src,
             self.stroke
                 .as_ref()
@@ -20744,11 +23722,7 @@ impl App {
                 center.1,
                 fg,
                 &tip,
-                if tool == Tool::Airbrush {
-                    opacity * 0.35
-                } else {
-                    opacity
-                },
+                opacity,
             ),
             Tool::Pencil => brush::stamp_pencil(
                 &mut self.doc,
@@ -20870,6 +23844,32 @@ impl App {
                     )
                 } else {
                     brush::stamp_clone(
+                        &mut self.doc,
+                        layer,
+                        sel.as_ref(),
+                        center.0,
+                        center.1,
+                        aligned,
+                        &tip,
+                        opacity,
+                    )
+                }
+            }
+            Tool::Heal => {
+                if self.heal_use_pattern {
+                    pictodesk_core::heal::stamp_heal_pattern(
+                        &mut self.doc,
+                        layer,
+                        sel.as_ref(),
+                        center.0,
+                        center.1,
+                        &tip,
+                        opacity,
+                    )
+                } else {
+                    let src = self.heal_src.unwrap_or(center);
+                    let aligned = (src.0 + (center.0 - start.0), src.1 + (center.1 - start.1));
+                    pictodesk_core::heal::stamp_heal(
                         &mut self.doc,
                         layer,
                         sel.as_ref(),
@@ -21189,7 +24189,7 @@ impl App {
             DragMode::PenNew | DragMode::PenDrag | DragMode::PenConvert => {
                 self.pen_move(dp);
             }
-            DragMode::SelectRect | DragMode::GradientLine => {
+            DragMode::SelectRect | DragMode::GradientLine | DragMode::PatchDrag => {
                 self.drag_cur_doc = dp;
             }
             DragMode::Lasso => {
@@ -21317,10 +24317,25 @@ impl App {
                     self.alpha_last = dp;
                     return;
                 }
+                // Smoothing (Phase 7): the stroke chases a
+                // lagged point, which irons out hand jitter.
+                let dp = if self.brush_dyn.smoothing {
+                    let prev = self.stroke.as_ref().unwrap().smooth;
+                    let sm = (
+                        prev.0 + (dp.0 - prev.0) * 0.45,
+                        prev.1 + (dp.1 - prev.1) * 0.45,
+                    );
+                    if let Some(s) = &mut self.stroke {
+                        s.smooth = sm;
+                    }
+                    sm
+                } else {
+                    dp
+                };
                 // capture tiles BEFORE stamping this segment
                 self.capture_segment_tiles(dp);
                 let last = self.stroke.as_ref().unwrap().last_point;
-                let spacing = (self.tip.size * 0.25).max(1.0);
+                let spacing = (self.tip.size * self.brush_dyn.spacing).max(1.0);
                 for c in brush::stroke_centers(&[last, dp], spacing) {
                     if c != last {
                         self.stamp_at(c);
@@ -21338,7 +24353,7 @@ impl App {
     /// touch, so undo restores the pre-stroke pixels exactly.
     fn capture_segment_tiles(&mut self, to: (f32, f32)) {
         let layer = self.doc.active_layer;
-        let r = self.tip.size / 2.0 + 2.0;
+        let r = self.tip.size / 2.0 + self.brush_dyn.scatter * self.tip.size + 2.0;
         let (x0, y0) = ((to.0 - r).floor() as i32, (to.1 - r).floor() as i32);
         let (x1, y1) = ((to.0 + r).ceil() as i32, (to.1 + r).ceil() as i32);
         let tiles = Selection::tiles_in_rect(x0, y0, (x1 - x0) as u32, (y1 - y0) as u32);
@@ -21359,6 +24374,30 @@ impl App {
 
     pub fn mouse_up(&mut self, _x: f32, _y: f32) {
         self.mouse_down = false;
+        if self.drag == DragMode::PatchDrag {
+            self.drag = DragMode::None;
+            let (dx, dy) = (
+                (self.drag_cur_doc.0 - self.drag_start_doc.0).round() as i32,
+                (self.drag_cur_doc.1 - self.drag_start_doc.1).round() as i32,
+            );
+            if dx != 0 || dy != 0 {
+                if !matches!(
+                    self.doc.mode,
+                    pictodesk_core::document::ColorMode::Rgb
+                        | pictodesk_core::document::ColorMode::Grayscale
+                ) {
+                    self.status = "Patch works in RGB and Grayscale documents for now".into();
+                } else {
+                    self.filter_now("Patch", None, move |doc, layer, sel| {
+                        if let Some(s) = sel {
+                            pictodesk_core::heal::heal_patch(doc, layer, s, dx, dy);
+                        }
+                    });
+                    self.status = "Patched".into();
+                }
+            }
+            return;
+        }
         if let Some(ft) = &mut self.ft {
             ft.drag = FtDrag::None;
         }
@@ -22198,6 +25237,7 @@ fn run_shot(args: &[String]) -> i32 {
     let mut phase5test = false;
     let mut phase6test = false;
     let mut phase65test = false;
+    let mut phase7test = false;
     let mut tone = false;
     let mut tab: Option<String> = None;
     let mut cmyk = false;
@@ -22228,6 +25268,7 @@ fn run_shot(args: &[String]) -> i32 {
             "--phase5test" => phase5test = true,
             "--phase6test" => phase6test = true,
             "--phase65test" => phase65test = true,
+            "--phase7test" => phase7test = true,
             "--tone" => tone = true,
             "--cmyk" => cmyk = true,
             "--ft" => ft = true,
@@ -23160,6 +26201,428 @@ fn run_shot(args: &[String]) -> i32 {
             return 1;
         }
     }
+    if phase7test {
+        // Phase 7 Batch 7a: blend modes, Auto family, healing
+        // tools, Patch, Pattern Maker.
+        let mut ok = true;
+        let mut check = |name: &str, cond: bool| {
+            eprintln!("PHASE7 {name}: {}", if cond { "ok" } else { "FAIL" });
+            ok = ok && cond;
+        };
+        check(
+            "22 blend modes in the menu list",
+            pictodesk_core::blend::ALL_BLEND_MODES.len() == 22,
+        );
+        check("50 tools (Airbrush is a toggle now)", TOOLS.len() == 50);
+        // Low-contrast document: the Auto family stretches it.
+        let flat = || {
+            let mut doc = Document::new(30, 20);
+            doc.layers[0].fill_rect(0, 0, 30, 20, Pixel16::from_rgba8(110, 100, 90, 255));
+            doc.layers[0].fill_rect(3, 3, 8, 8, Pixel16::from_rgba8(140, 120, 100, 255));
+            doc
+        };
+        {
+            let mut app = App::new(flat(), None);
+            app.do_action(Action::AutoLevelsCmd);
+            let lo = app.doc.render_pixel(20, 15).to_rgba8();
+            let hi = app.doc.render_pixel(5, 5).to_rgba8();
+            check(
+                "auto levels stretches to black/white",
+                lo.0 == 0 && hi.0 == 255,
+            );
+        }
+        {
+            let mut app = App::new(flat(), None);
+            let before = app.doc.render_checksum();
+            app.do_action(Action::AutoContrastCmd);
+            check("auto contrast applies", app.doc.render_checksum() != before);
+            let mut app = App::new(flat(), None);
+            let before = app.doc.render_checksum();
+            app.do_action(Action::AutoColorCmd);
+            check("auto color applies", app.doc.render_checksum() != before);
+            check(
+                "auto steps serialize",
+                step_to_line(&RecordedStep::AutoColor).as_deref() == Some("autocolor")
+                    && line_to_step("autolevels")
+                        .and_then(|st| step_to_line(&st))
+                        .as_deref()
+                        == Some("autolevels"),
+            );
+        }
+        // Healing through the real tool path.
+        {
+            let mut doc = Document::new(60, 30);
+            for y in 0..30 {
+                for x in 0..60 {
+                    let v = if x < 30 {
+                        40 + (x * 2) as u8
+                    } else {
+                        (180i32 + if (x + y) % 2 == 0 { 20 } else { -20 }) as u8
+                    };
+                    doc.layers[0].set_pixel(x, y, Pixel16::from_rgba8(v, v, v, 255));
+                }
+            }
+            // A blemish in the destination half.
+            doc.layers[0].fill_rect(8, 12, 6, 6, Pixel16::from_rgba8(10, 10, 10, 255));
+            let mut app = App::new(doc, None);
+            app.tool = Tool::Heal;
+            app.heal_src = Some((45.0, 15.0));
+            app.begin_stroke((10.0, 15.0));
+            app.stamp_at((10.0, 15.0));
+            let healed = app.doc.layers[0].get_pixel(10, 15).to_rgba8().0;
+            check(
+                "healing brush repairs toward destination tone",
+                healed > 30 && healed < 130,
+            );
+            // Pattern-source healing needs a pattern.
+            app.doc.pattern = Some(pictodesk_core::document::PatternData {
+                name: "t".into(),
+                width: 4,
+                height: 4,
+                px: vec![Pixel16::from_rgba8(90, 90, 90, 255); 16],
+            });
+            app.heal_use_pattern = true;
+            let before = app.doc.render_checksum();
+            app.begin_stroke((20.0, 15.0));
+            app.stamp_at((20.0, 15.0));
+            check(
+                "pattern-source healing stamps",
+                app.doc.render_checksum() != before,
+            );
+        }
+        // Patch through the drag path.
+        {
+            let mut doc = Document::new(60, 30);
+            for y in 0..30 {
+                for x in 0..60 {
+                    let v = if x < 30 {
+                        40 + (x * 2) as u8
+                    } else {
+                        (180i32 + if (x + y) % 2 == 0 { 20 } else { -20 }) as u8
+                    };
+                    doc.layers[0].set_pixel(x, y, Pixel16::from_rgba8(v, v, v, 255));
+                }
+            }
+            doc.layers[0].fill_rect(8, 12, 6, 6, Pixel16::from_rgba8(10, 10, 10, 255));
+            let mut app = App::new(doc, None);
+            app.tool = Tool::Patch;
+            app.replace_sel(Some(Selection::rect(60, 30, 8, 12, 6, 6)));
+            app.drag = DragMode::PatchDrag;
+            app.drag_start_doc = (10.0, 15.0);
+            app.drag_cur_doc = (47.0, 15.0);
+            app.mouse_up(0.0, 0.0);
+            let patched = app.doc.layers[0].get_pixel(10, 15).to_rgba8().0;
+            check("patch tool heals the selection", patched > 35);
+        }
+        // Pattern Maker installs a pattern.
+        {
+            let mut app = App::new(flat(), None);
+            app.do_action(Action::PatternMakerDialog);
+            check("pattern maker dialog opens", app.dialog.is_some());
+            if let Some(d) = &mut app.dialog {
+                d.opt_a = true;
+            }
+            app.dialog_ok();
+            check("pattern installed", app.doc.pattern.is_some());
+            check(
+                "pattern maker fill painted the layer",
+                app.doc.render_pixel(3, 3).to_rgba8() != (140, 120, 100, 255),
+            );
+        }
+        // --- Batch 7b: paint engine ---
+        {
+            // Scatter throws stamps outside the tip radius.
+            let mut app = App::new(flat(), None);
+            app.tool = Tool::Brush;
+            app.tip = BrushTip::new(9.0, 1.0);
+            app.brush_dyn.scatter = 2.0;
+            app.brush_dyn.count = 8;
+            app.begin_stroke((20.0, 15.0));
+            let mut painted_far = false;
+            for y in 0..30 {
+                for x in 0..40 {
+                    let d = ((x as f32 - 20.0).powi(2) + (y as f32 - 15.0).powi(2)).sqrt();
+                    if d > 8.0 && app.doc.layers[0].get_pixel(x, y).to_rgba8().0 < 200 {
+                        painted_far = true;
+                    }
+                }
+            }
+            check("scatter paints outside the tip", painted_far);
+        }
+        {
+            // Elliptical tip via dynamics shape.
+            let mut big = Document::new(40, 40);
+            big.layers[0].fill_rect(0, 0, 40, 40, Pixel16::from_rgba8(200, 200, 200, 255));
+            let mut app = App::new(big, None);
+            app.tool = Tool::Brush;
+            app.tip = BrushTip::new(21.0, 1.0);
+            app.brush_dyn.roundness = 0.2;
+            app.fg = Pixel16::from_rgba8(0, 0, 0, 255);
+            app.begin_stroke((20.0, 20.0));
+            let wide = app.doc.layers[0].get_pixel(29, 20).to_rgba8().0;
+            let tall = app.doc.layers[0].get_pixel(20, 29).to_rgba8().0;
+            check("roundness squashes the stamp", wide < 100 && tall == 200);
+        }
+        {
+            // Flow scales the stamp's strength.
+            let mk = |flow: f32| {
+                let mut app = App::new(flat(), None);
+                app.tool = Tool::Brush;
+                app.tip = BrushTip::new(13.0, 1.0);
+                app.fg = Pixel16::from_rgba8(0, 0, 0, 255);
+                app.flow = flow;
+                app.begin_stroke((10.0, 10.0));
+                app.doc.layers[0].get_pixel(10, 10).to_rgba8().0
+            };
+            check("flow weakens the stamp", mk(0.2) > mk(1.0));
+        }
+        {
+            // A preset carries its dynamics with it.
+            let mut app = App::new(flat(), None);
+            app.brush_presets[3].dyn_.scatter = 1.5;
+            let cell = app.brushes_cell(3, 0);
+            app.panel_mouse(cell.x + 2, cell.y + 2);
+            check(
+                "preset applies its dynamics",
+                app.brush_dyn.scatter == 1.5 && app.tip.size == 9.0,
+            );
+        }
+        {
+            // ABR v2 round-trips dynamics.
+            let mut presets = vec![BrushPreset {
+                size: 9.0,
+                hardness: 1.0,
+                dyn_: BrushDynamics::default(),
+            }];
+            presets[0].dyn_.scatter = 0.75;
+            presets[0].dyn_.texture_on = true;
+            write_abr(std::path::Path::new("/tmp/pd-test2.abr"), &presets).unwrap();
+            let back = std::fs::read("/tmp/pd-test2.abr")
+                .ok()
+                .and_then(|b| read_abr(&b));
+            check(
+                "abr v2 keeps dynamics",
+                back.as_deref() == Some(&presets[..]),
+            );
+        }
+        // --- Batch 7c: Liquify round 2 ---
+        {
+            let mut app = App::new(flat(), None);
+            app.open_liquify_dialog();
+            check("liquify opens", app.dialog.is_some());
+            if let Some(d) = &mut app.dialog {
+                d.liq_tool = 10; // Turbulence
+            }
+            app.liquify_stamp((15.0, 10.0));
+            let (displaced, undos) = {
+                let d = app.dialog.as_ref().unwrap();
+                (
+                    d.liq_disp.iter().any(|v| *v != (0.0, 0.0)),
+                    d.liq_undo.len(),
+                )
+            };
+            check("turbulence displaces via the dialog", displaced);
+            check("drag start snapshots for undo", undos >= 1);
+            // Undo button (index 15) restores the identity field.
+            let layout = app.dialog_layout().unwrap();
+            let b = layout.range_buttons[15];
+            app.mouse_down((b.x + 4) as f32, (b.y + 4) as f32);
+            let restored = app
+                .dialog
+                .as_ref()
+                .map(|d| d.liq_disp.iter().all(|v| *v == (0.0, 0.0)))
+                .unwrap_or(false);
+            check("liquify undo button restores", restored);
+            // Mesh save request swaps in the SaveAs dialog and
+            // Cancel returns to Liquify.
+            let layout = app.dialog_layout().unwrap();
+            let b = layout.range_buttons[17];
+            app.mouse_down((b.x + 4) as f32, (b.y + 4) as f32);
+            check(
+                "save mesh opens save-as",
+                matches!(
+                    app.dialog.as_ref().map(|d| &d.kind),
+                    Some(DialogKind::SaveAs)
+                ) && app.liq_return.is_some(),
+            );
+            app.dialog_cancel();
+            check(
+                "cancel returns to liquify",
+                matches!(
+                    app.dialog.as_ref().map(|d| &d.kind),
+                    Some(DialogKind::Liquify)
+                ),
+            );
+            // Mesh install resamples a foreign-size field.
+            let mut f = pictodesk_core::liquify::LiquifyField::new(10, 10);
+            f.disp[0] = (2.0, 0.0);
+            app.liquify_install_mesh(f);
+            let got = app
+                .dialog
+                .as_ref()
+                .map(|d| d.liq_disp[0])
+                .unwrap_or((0.0, 0.0));
+            check("mesh install resamples", got.0 > 1.0);
+            app.dialog_cancel();
+        }
+        // --- Batch 7d: presets, workspaces, browser, rename ---
+        {
+            // Tool preset capture/apply round trip.
+            let mut app = App::new(flat(), None);
+            let n0 = app.tool_presets.len();
+            check("seed tool presets exist", n0 >= 5);
+            app.tool = Tool::Brush;
+            app.tip = BrushTip::new(34.5, 0.42);
+            let p = app.capture_tool_preset("Test Preset".into());
+            app.tool_presets.push(p);
+            app.tip = BrushTip::new(5.0, 1.0);
+            app.apply_tool_preset(n0);
+            check(
+                "tool preset applies tip + tool",
+                app.tip.size == 34.5 && app.tool == Tool::Brush,
+            );
+            check(
+                "current preset detected",
+                app.current_tool_preset() == Some(n0),
+            );
+            // Persistence round trip via the dyn block codec
+            // (the file format's only non-trivial part).
+            let mut bytes = Vec::new();
+            dyn_to_bytes(&app.brush_dyn, &mut bytes);
+            check(
+                "tool preset dyn block round-trips",
+                dyn_from_bytes(&bytes, 0).map(|(d, _)| d) == Some(app.brush_dyn.clone()),
+            );
+            // Workspace capture/apply.
+            app.show_histogram = false;
+            app.show_tool_presets = true;
+            let w = app.capture_workspace();
+            app.workspaces.push(("Test WS".into(), w));
+            app.show_histogram = true;
+            app.show_tool_presets = false;
+            app.apply_workspace(app.workspaces.len() - 1);
+            check(
+                "workspace applies panel set",
+                !app.show_histogram && app.show_tool_presets,
+            );
+            // Rename dialog renames the active layer.
+            app.open_rename(0, 0);
+            if let Some(d) = &mut app.dialog {
+                d.text = "Hero Layer".into();
+            }
+            app.dialog_ok();
+            check(
+                "rename renames the layer",
+                app.doc.layers[0].name == "Hero Layer",
+            );
+            // File Browser scans a folder of images.
+            let dir = std::path::Path::new("/tmp/pd-browser");
+            let _ = std::fs::create_dir_all(dir);
+            std::fs::write(dir.join("a.png"), b"\x89PNG").unwrap();
+            app.open_file_browser();
+            if let Some(d) = &mut app.dialog {
+                d.browser_dir = dir.to_string_lossy().into_owned();
+            }
+            app.browser_rescan();
+            let found = app
+                .dialog
+                .as_ref()
+                .map(|d| d.browser_entries.iter().any(|e| e.name == "a.png"))
+                .unwrap_or(false);
+            check("file browser lists images", found);
+            app.dialog_cancel();
+        }
+        // --- Batch 7e: spell, find/replace, web, package ---
+        {
+            let mut doc = flat();
+            doc.layers[0].text = Some(pictodesk_core::text::TextSpec::new(
+                "The quik brown fox jumps",
+            ));
+            let mut app = App::new(doc, None);
+            app.open_spell_check();
+            let found = app
+                .dialog
+                .as_ref()
+                .map(|d| {
+                    d.spell_items.iter().any(|(_, _, _, w)| w == "quik")
+                        && !d.spell_items.iter().any(|(_, _, _, w)| w == "brown")
+                })
+                .unwrap_or(false);
+            check("spell flags only the unknown word", found);
+            if let Some(d) = &mut app.dialog {
+                if let Some(pos) = d.spell_items.iter().position(|(_, _, _, w)| w == "quik") {
+                    d.spell_pos = pos;
+                    d.text = "quick".into();
+                }
+            }
+            app.spell_change();
+            check(
+                "spell change fixes the text",
+                app.doc.layers[0]
+                    .text
+                    .as_ref()
+                    .map(|t| t.text.contains("quick"))
+                    .unwrap_or(false),
+            );
+            app.dialog_cancel();
+            // Find and Replace across the same layer.
+            let mut d2 = Dialog::new(DialogKind::FindReplace, &app.doc);
+            d2.text = "fox".into();
+            d2.text2 = "wolf".into();
+            app.dialog = Some(d2);
+            let n = app.find_replace_all();
+            check(
+                "find/replace swaps the word",
+                n == 1
+                    && app.doc.layers[0]
+                        .text
+                        .as_ref()
+                        .map(|t| t.text.contains("wolf"))
+                        .unwrap_or(false),
+            );
+            app.dialog_cancel();
+        }
+        {
+            // Save for Web: WBMP header + knockout alpha.
+            let mut app = App::new(flat(), None);
+            let mut d = Dialog::new(DialogKind::SaveForWeb, &app.doc);
+            d.web_format = 3;
+            let wb = app.web_export_bytes(&d).unwrap_or_default();
+            check(
+                "wbmp export has the 1-bit header",
+                wb.len() > 4 && wb[0] == 0 && wb[1] == 0,
+            );
+            d.web_format = 1;
+            d.web_knockout = true;
+            app.bg = Pixel16::from_rgba8(110, 100, 90, 255);
+            let png = app.web_export_bytes(&d).unwrap_or_default();
+            let back = pictodesk_core::io::import_image(&png).unwrap();
+            check(
+                "knockout makes the bg color transparent",
+                back.layers[0].get_pixel(0, 0).to_rgba8().3 == 0
+                    && back.layers[0].get_pixel(5, 5).to_rgba8().3 == 255,
+            );
+        }
+        {
+            // Picture Package: layered + labeled from sources.
+            let tiny = Document::new(10, 10);
+            let bytes =
+                pictodesk_core::io::export_image(&tiny, pictodesk_core::io::ExportFormat::Png, 90)
+                    .unwrap();
+            std::fs::write("/tmp/pd-pkg-src.png", &bytes).unwrap();
+            let mut app = App::new(flat(), None);
+            app.pkg_sources = vec![std::path::PathBuf::from("/tmp/pd-pkg-src.png")];
+            app.run_picture_package(612, 792, 2, true, true);
+            check(
+                "picture package builds a layered page",
+                app.doc.width == 612 && app.doc.layers.len() == 5,
+            );
+        }
+        eprintln!("PHASE7TEST {}", if ok { "PASS" } else { "FAIL" });
+        if !ok {
+            std::process::exit(1);
+        }
+    }
     if phase65test {
         // Phase 6.5 Batch 1a: the new gallery filters apply
         // end-to-end through their dialogs / direct actions.
@@ -23797,7 +27260,14 @@ fn run_shot(args: &[String]) -> i32 {
                 .and_then(|b| read_aco(&b));
             check("aco round trip", back.as_deref() == Some(&cols[..]));
             // .ABR round trip
-            let presets = vec![(9.0f32, 1.0f32), (21.0, 0.0), (3.5, 0.5)];
+            let presets: Vec<BrushPreset> = [(9.0f32, 1.0f32), (21.0, 0.0), (3.5, 0.5)]
+                .iter()
+                .map(|(sz, h)| BrushPreset {
+                    size: *sz,
+                    hardness: *h,
+                    dyn_: BrushDynamics::default(),
+                })
+                .collect();
             write_abr(std::path::Path::new("/tmp/pd-test.abr"), &presets).unwrap();
             let back = std::fs::read("/tmp/pd-test.abr")
                 .ok()
@@ -23939,6 +27409,18 @@ fn run_shot(args: &[String]) -> i32 {
             "liquify" => {
                 app.do_action(Action::LiquifyDialog);
             }
+            "patternmaker" => {
+                app.do_action(Action::PatternMakerDialog);
+            }
+            "filebrowser" => {
+                app.do_action(Action::FileBrowserDialog);
+            }
+            "spellcheck" => {
+                app.do_action(Action::SpellCheckDialog);
+            }
+            "findreplace" => {
+                app.do_action(Action::FindReplaceDialog);
+            }
             "blending" => {
                 app.do_action(Action::BlendingDialog);
             }
@@ -24058,6 +27540,10 @@ fn run_shot(args: &[String]) -> i32 {
                 | "extract"
                 | "historypanel"
                 | "liquify"
+                | "patternmaker"
+                | "filebrowser"
+                | "spellcheck"
+                | "findreplace"
                 | "blending"
                 | "presets"
                 | "gradmap"

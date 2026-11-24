@@ -478,3 +478,78 @@ mod tests {
         assert_eq!(doc.layers[0].get_pixel(8, 3).to_rgba8().0, 220);
     }
 }
+
+/// Smooth value noise in [0, 1] over a hashed integer lattice.
+fn noise2(x: f32, y: f32) -> f32 {
+    let (xi, yi) = (x.floor(), y.floor());
+    let (xf, yf) = (x - xi, y - yi);
+    let h = |ix: i32, iy: i32| -> f32 {
+        let mut n = (ix as u32).wrapping_mul(374_761_393) ^ (iy as u32).wrapping_mul(668_265_263);
+        n = (n ^ (n >> 13)).wrapping_mul(1_274_126_177);
+        ((n ^ (n >> 16)) & 0xFFFF) as f32 / 65535.0
+    };
+    let (u, v) = (xf * xf * (3.0 - 2.0 * xf), yf * yf * (3.0 - 2.0 * yf));
+    let (a, b) = (h(xi as i32, yi as i32), h(xi as i32 + 1, yi as i32));
+    let (c, dd) = (h(xi as i32, yi as i32 + 1), h(xi as i32 + 1, yi as i32 + 1));
+    a + (b - a) * u + (c - a) * v + (a - b - c + dd) * u * v
+}
+
+impl LiquifyField {
+    /// Turbulence (7.0): displace sample points along a smooth
+    /// pseudo-random flow field — the smoky, marbled distortion.
+    pub fn stamp_turbulence(
+        &mut self,
+        c: (f32, f32),
+        radius: f32,
+        pressure: f32,
+        frozen: &[u8],
+        seed: u32,
+    ) {
+        let s = seed as f32;
+        for (i, f, rx, ry) in self.disc_offsets(c, radius) {
+            if is_frozen(frozen, i) {
+                continue;
+            }
+            let (px, py) = (c.0 + rx, c.1 + ry);
+            let nx = noise2(px * 0.045 + s * 13.7, py * 0.045 + 3.1) - 0.5;
+            let ny = noise2(px * 0.045 + 71.3, py * 0.045 + s * 7.9) - 0.5;
+            self.disp[i].0 += nx * f * pressure * radius * 0.5;
+            self.disp[i].1 += ny * f * pressure * radius * 0.5;
+        }
+    }
+}
+
+/// Serialize a mesh: "PDMESH1" + w + h + f32 LE pairs.
+pub fn field_to_bytes(field: &LiquifyField) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16 + field.disp.len() * 8);
+    out.extend_from_slice(b"PDMESH1\0");
+    out.extend_from_slice(&field.w.to_le_bytes());
+    out.extend_from_slice(&field.h.to_le_bytes());
+    for (dx, dy) in &field.disp {
+        out.extend_from_slice(&dx.to_le_bytes());
+        out.extend_from_slice(&dy.to_le_bytes());
+    }
+    out
+}
+
+/// Parse a mesh written by `field_to_bytes`.
+pub fn field_from_bytes(bytes: &[u8]) -> Option<LiquifyField> {
+    if bytes.len() < 16 || &bytes[0..8] != b"PDMESH1\0" {
+        return None;
+    }
+    let w = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
+    let h = u32::from_le_bytes(bytes[12..16].try_into().ok()?);
+    let n = (w as usize).checked_mul(h as usize)?;
+    if bytes.len() != 16 + n * 8 || n > 268_435_456 {
+        return None;
+    }
+    let mut disp = Vec::with_capacity(n);
+    for i in 0..n {
+        let o = 16 + i * 8;
+        disp.push((
+            f32::from_le_bytes(bytes[o..o + 4].try_into().ok()?),
+            f32::from_le_bytes(bytes[o + 4..o + 8].try_into().ok()?),
+        ));
+    }
+    Some(LiquifyField { w, h, disp })
+}

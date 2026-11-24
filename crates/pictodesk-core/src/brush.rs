@@ -26,6 +26,57 @@ pub struct BrushTip {
     /// present, the Brush/Pencil/Eraser stamps follow the
     /// mask instead of the round falloff.
     pub mask: Option<BrushMask>,
+    // Phase 7 paint engine (Brush Tip Shape + dynamics
+    // results land here per stamp; the App's engine computes
+    // jittered copies, the fields below are one stamp's
+    // effective shape).
+    /// 1.0 = round, approaching 0 = a flat blade.
+    pub roundness: f32,
+    /// Tip rotation, radians.
+    pub angle: f32,
+    pub flip_x: bool,
+    pub flip_y: bool,
+    /// Grain inside the stamp.
+    pub noise: bool,
+    /// Darker, stronger rim (wet-media look).
+    pub wet_edges: bool,
+    /// Pattern texture modulation (Texture section).
+    pub tex: Option<std::rc::Rc<BrushTexture>>,
+    /// Second tip combined with this one (Dual Brush).
+    pub dual: Option<Box<DualTip>>,
+}
+
+/// A brush texture: the document pattern's luminance,
+/// sampled in document coordinates (so every textured
+/// preset shares one registration — Protect Texture is
+/// therefore inherent).
+#[derive(Clone, Debug, PartialEq)]
+pub struct BrushTexture {
+    pub w: u32,
+    pub h: u32,
+    pub lum: Vec<f32>,
+    pub scale: f32,
+    /// 0..1 how strongly the texture modulates the stamp.
+    pub depth: f32,
+    /// Floor for the texture value (Minimum Depth).
+    pub min_depth: f32,
+    /// 0 = Multiply, 1 = Subtract.
+    pub mode: u8,
+    pub invert: bool,
+}
+
+/// The Dual Brush's second tip. `mode` is a blend-mode id
+/// combining the two tips' strengths (0/Normal acts as
+/// Multiply, the classic default interaction); (dx, dy)
+/// is this stamp's scatter offset for the second tip.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DualTip {
+    pub size: f32,
+    pub hardness: f32,
+    pub mask: Option<BrushMask>,
+    pub mode: u8,
+    pub dx: f32,
+    pub dy: f32,
 }
 
 /// A sampled brush mask: grayscale coverage, row-major,
@@ -38,12 +89,35 @@ pub struct BrushMask {
     pub data: Vec<f32>,
 }
 
+/// Bilinear sample of a brush mask at (u, v) in 0..1.
+fn sample_mask(m: &BrushMask, u: f32, v: f32) -> f32 {
+    let (fx, fy) = (u * m.w as f32 - 0.5, v * m.h as f32 - 0.5);
+    let (x0, y0) = (fx.floor() as i32, fy.floor() as i32);
+    let (tx, ty) = (fx - x0 as f32, fy - y0 as f32);
+    let smp = |x: i32, y: i32| -> f32 {
+        let x = x.clamp(0, m.w as i32 - 1) as usize;
+        let y = y.clamp(0, m.h as i32 - 1) as usize;
+        m.data[y * m.w as usize + x]
+    };
+    let top = smp(x0, y0) + (smp(x0 + 1, y0) - smp(x0, y0)) * tx;
+    let bot = smp(x0, y0 + 1) + (smp(x0 + 1, y0 + 1) - smp(x0, y0 + 1)) * tx;
+    (top + (bot - top) * ty).clamp(0.0, 1.0)
+}
+
 impl BrushTip {
     pub fn new(size: f32, hardness: f32) -> Self {
         BrushTip {
             size: size.max(1.0),
             hardness: hardness.clamp(0.0, 1.0),
             mask: None,
+            roundness: 1.0,
+            angle: 0.0,
+            flip_x: false,
+            flip_y: false,
+            noise: false,
+            wet_edges: false,
+            tex: None,
+            dual: None,
         }
     }
 
@@ -53,35 +127,124 @@ impl BrushTip {
             size: size.max(1.0),
             hardness: 1.0,
             mask: Some(mask),
+            roundness: 1.0,
+            angle: 0.0,
+            flip_x: false,
+            flip_y: false,
+            noise: false,
+            wet_edges: false,
+            tex: None,
+            dual: None,
         }
     }
 
-    /// Stamp strength at a pixel: the sampled mask when the
-    /// tip has one (bilinear over the tip bbox), else the
-    /// round falloff at distance `d`.
+    /// Stamp strength at a pixel (Phase 7 pipeline): the
+    /// tip shape (sampled mask or round falloff) evaluated
+    /// in the tip's rotated, roundness-squashed frame, then
+    /// texture modulation, the dual tip, noise, and wet
+    /// edges. With angle 0, roundness 1, and no extras this
+    /// is exactly the pre-7.0 behavior.
     pub fn strength(&self, xx: i32, yy: i32, cx: f32, cy: f32, d: f32) -> f32 {
-        let Some(m) = &self.mask else {
-            return self.falloff(d);
+        let _ = d; // the frame distance below supersedes it
+        let dx = xx as f32 + 0.5 - cx;
+        let dy = yy as f32 + 0.5 - cy;
+        let (ca, sa) = (self.angle.cos(), self.angle.sin());
+        let mut rx = dx * ca + dy * sa;
+        let mut ry = -dx * sa + dy * ca;
+        if self.flip_x {
+            rx = -rx;
+        }
+        if self.flip_y {
+            ry = -ry;
+        }
+        let round = self.roundness.clamp(0.02, 1.0);
+        let de = (rx * rx + (ry / round).powi(2)).sqrt();
+        let mut base = match &self.mask {
+            Some(m) => {
+                if m.w == 0 || m.h == 0 || self.size <= 0.0 {
+                    0.0
+                } else {
+                    let u = rx / self.size + 0.5;
+                    let v = ry / (self.size * round) + 0.5;
+                    if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
+                        0.0
+                    } else {
+                        sample_mask(m, u, v)
+                    }
+                }
+            }
+            None => self.falloff(de),
         };
-        if m.w == 0 || m.h == 0 || self.size <= 0.0 {
+        if base <= 0.0 {
             return 0.0;
         }
-        let u = (xx as f32 + 0.5 - (cx - self.size / 2.0)) / self.size;
-        let v = (yy as f32 + 0.5 - (cy - self.size / 2.0)) / self.size;
-        if !(0.0..1.0).contains(&u) || !(0.0..1.0).contains(&v) {
-            return 0.0;
+        if let Some(t) = &self.tex {
+            if t.w > 0 && t.h > 0 {
+                let tx = ((xx as f32 / t.scale.max(0.05)).floor() as i32).rem_euclid(t.w as i32)
+                    as usize;
+                let ty = ((yy as f32 / t.scale.max(0.05)).floor() as i32).rem_euclid(t.h as i32)
+                    as usize;
+                let mut tv = t.lum[ty * t.w as usize + tx];
+                if t.invert {
+                    tv = 1.0 - tv;
+                }
+                let f = if t.mode == 1 {
+                    // Subtract: dark texture areas eat the stamp.
+                    (1.0 - t.depth * (1.0 - tv) * 0.9).clamp(0.0, 1.0)
+                } else {
+                    // Multiply with a Minimum Depth floor.
+                    let tvf = t.min_depth + (1.0 - t.min_depth) * tv;
+                    (1.0 - t.depth) + t.depth * tvf
+                };
+                base *= f;
+            }
         }
-        let (fx, fy) = (u * m.w as f32 - 0.5, v * m.h as f32 - 0.5);
-        let (x0, y0) = (fx.floor() as i32, fy.floor() as i32);
-        let (tx, ty) = (fx - x0 as f32, fy - y0 as f32);
-        let smp = |x: i32, y: i32| -> f32 {
-            let x = x.clamp(0, m.w as i32 - 1) as usize;
-            let y = y.clamp(0, m.h as i32 - 1) as usize;
-            m.data[y * m.w as usize + x]
-        };
-        let top = smp(x0, y0) + (smp(x0 + 1, y0) - smp(x0, y0)) * tx;
-        let bot = smp(x0, y0 + 1) + (smp(x0 + 1, y0 + 1) - smp(x0, y0 + 1)) * tx;
-        (top + (bot - top) * ty).clamp(0.0, 1.0)
+        if let Some(du) = &self.dual {
+            let ddx = xx as f32 + 0.5 - (cx + du.dx);
+            let ddy = yy as f32 + 0.5 - (cy + du.dy);
+            let dd = (ddx * ddx + ddy * ddy).sqrt();
+            let dbase = match &du.mask {
+                Some(m) => {
+                    let u = ddx / du.size.max(1.0) + 0.5;
+                    let v = ddy / du.size.max(1.0) + 0.5;
+                    if (0.0..1.0).contains(&u) && (0.0..1.0).contains(&v) {
+                        sample_mask(m, u, v)
+                    } else {
+                        0.0
+                    }
+                }
+                None => {
+                    let r = du.size / 2.0;
+                    if dd >= r {
+                        0.0
+                    } else {
+                        let hard_r = r * du.hardness;
+                        if dd <= hard_r {
+                            1.0
+                        } else {
+                            let t = (dd - hard_r) / (r - hard_r);
+                            1.0 - t * t * (3.0 - 2.0 * t)
+                        }
+                    }
+                }
+            };
+            base = if du.mode == 0 {
+                base * dbase
+            } else {
+                crate::blend::BlendMode::from_id(du.mode)
+                    .map(|m| m.blend_channel(base, dbase))
+                    .unwrap_or(base * dbase)
+            };
+        }
+        if self.noise {
+            base *= 0.78 + 0.22 * crate::blend::dissolve_hash(xx, yy, 7);
+        }
+        if self.wet_edges {
+            let r = (self.size / 2.0).max(1.0);
+            let rim = ((de / r - 0.55) / 0.45).clamp(0.0, 1.0);
+            base = (base * (0.78 + 0.5 * rim)).min(1.0);
+        }
+        base.clamp(0.0, 1.0)
     }
 
     /// Falloff at distance `d` from stamp center: 1 inside the hard
@@ -100,7 +263,7 @@ impl BrushTip {
         1.0 - t * t * (3.0 - 2.0 * t)
     }
 
-    fn bbox(&self, cx: f32, cy: f32) -> (i32, i32, i32, i32) {
+    pub fn bbox(&self, cx: f32, cy: f32) -> (i32, i32, i32, i32) {
         let r = self.size / 2.0 + 1.0;
         (
             (cx - r).floor() as i32,
@@ -567,7 +730,7 @@ pub fn stamp_clone(
                 continue;
             }
             let d = ((xx as f32 + 0.5 - cx).powi(2) + (yy as f32 + 0.5 - cy).powi(2)).sqrt();
-            let st = tip.falloff(d) * opacity * sel_strength(sel, xx, yy);
+            let st = tip.strength(xx, yy, cx, cy, d) * opacity * sel_strength(sel, xx, yy);
             let f = |v: u16| v as f32 / 65535.0;
             over_ink(
                 doc,
@@ -594,7 +757,7 @@ pub fn stamp_clone(
             continue;
         }
         let d = ((xx as f32 + 0.5 - cx).powi(2) + (yy as f32 + 0.5 - cy).powi(2)).sqrt();
-        let s = tip.falloff(d) * opacity * sel_strength(sel, xx, yy);
+        let s = tip.strength(xx, yy, cx, cy, d) * opacity * sel_strength(sel, xx, yy);
         over_pixel(doc, layer, xx, yy, sp, s);
     }
     (x0, y0, x1, y1)
@@ -629,7 +792,7 @@ pub fn stamp_clone_merged(
             continue;
         }
         let d = ((xx as f32 + 0.5 - cx).powi(2) + (yy as f32 + 0.5 - cy).powi(2)).sqrt();
-        let s = tip.falloff(d) * opacity * sel_strength(sel, xx, yy);
+        let s = tip.strength(xx, yy, cx, cy, d) * opacity * sel_strength(sel, xx, yy);
         over_pixel(doc, layer, xx, yy, sp, s);
     }
     (x0, y0, x1, y1)
@@ -659,7 +822,7 @@ pub fn stamp_erase_to_history(
         for yy in y0..y1 {
             for xx in x0..x1 {
                 let d = ((xx as f32 + 0.5 - cx).powi(2) + (yy as f32 + 0.5 - cy).powi(2)).sqrt();
-                let s = tip.falloff(d) * opacity * sel_strength(sel, xx, yy);
+                let s = tip.strength(xx, yy, cx, cy, d) * opacity * sel_strength(sel, xx, yy);
                 if s <= 0.0 {
                     continue;
                 }
@@ -687,7 +850,7 @@ pub fn stamp_erase_to_history(
     for yy in y0..y1 {
         for xx in x0..x1 {
             let d = ((xx as f32 + 0.5 - cx).powi(2) + (yy as f32 + 0.5 - cy).powi(2)).sqrt();
-            let s = tip.falloff(d) * opacity * sel_strength(sel, xx, yy);
+            let s = tip.strength(xx, yy, cx, cy, d) * opacity * sel_strength(sel, xx, yy);
             if s <= 0.0 {
                 continue;
             }
@@ -729,7 +892,7 @@ pub fn stamp_blur(
         for yy in y0..y1 {
             for xx in x0..x1 {
                 let d = ((xx as f32 + 0.5 - cx).powi(2) + (yy as f32 + 0.5 - cy).powi(2)).sqrt();
-                let s = tip.falloff(d) * strength * sel_strength(sel, xx, yy);
+                let s = tip.strength(xx, yy, cx, cy, d) * strength * sel_strength(sel, xx, yy);
                 if s <= 0.0 {
                     continue;
                 }
@@ -773,7 +936,7 @@ pub fn stamp_blur(
     for yy in y0..y1 {
         for xx in x0..x1 {
             let d = ((xx as f32 + 0.5 - cx).powi(2) + (yy as f32 + 0.5 - cy).powi(2)).sqrt();
-            let s = tip.falloff(d) * strength * sel_strength(sel, xx, yy);
+            let s = tip.strength(xx, yy, cx, cy, d) * strength * sel_strength(sel, xx, yy);
             if s <= 0.0 {
                 continue;
             }
@@ -832,7 +995,7 @@ pub fn stamp_sharpen(
         for yy in y0..y1 {
             for xx in x0..x1 {
                 let d = ((xx as f32 + 0.5 - cx).powi(2) + (yy as f32 + 0.5 - cy).powi(2)).sqrt();
-                let s = tip.falloff(d) * strength * sel_strength(sel, xx, yy);
+                let s = tip.strength(xx, yy, cx, cy, d) * strength * sel_strength(sel, xx, yy);
                 if s <= 0.0 {
                     continue;
                 }
@@ -876,7 +1039,7 @@ pub fn stamp_sharpen(
     for yy in y0..y1 {
         for xx in x0..x1 {
             let d = ((xx as f32 + 0.5 - cx).powi(2) + (yy as f32 + 0.5 - cy).powi(2)).sqrt();
-            let s = tip.falloff(d) * strength * sel_strength(sel, xx, yy);
+            let s = tip.strength(xx, yy, cx, cy, d) * strength * sel_strength(sel, xx, yy);
             if s <= 0.0 {
                 continue;
             }
@@ -936,8 +1099,10 @@ pub fn stamp_smudge(
         for yy in y0..y1 {
             for xx in x0..x1 {
                 let d = ((xx as f32 + 0.5 - cx).powi(2) + (yy as f32 + 0.5 - cy).powi(2)).sqrt();
-                let s =
-                    tip.falloff(d) * strength.clamp(0.0, 1.0) * 0.85 * sel_strength(sel, xx, yy);
+                let s = tip.strength(xx, yy, cx, cy, d)
+                    * strength.clamp(0.0, 1.0)
+                    * 0.85
+                    * sel_strength(sel, xx, yy);
                 over_ink(doc, layer, xx, yy, ink, 1.0, s);
             }
         }
@@ -1228,7 +1393,7 @@ pub fn stamp_sample(
     for yy in y0..y1 {
         for xx in x0..x1 {
             let d = ((xx as f32 + 0.5 - cx).powi(2) + (yy as f32 + 0.5 - cy).powi(2)).sqrt();
-            let s = tip.falloff(d) * opacity * sel_strength(sel, xx, yy);
+            let s = tip.strength(xx, yy, cx, cy, d) * opacity * sel_strength(sel, xx, yy);
             if s > 0.0 {
                 over_pixel(doc, layer, xx, yy, sampler(xx, yy), s);
             }
@@ -1348,7 +1513,7 @@ pub fn stamp_tone(
     for yy in y0..y1 {
         for xx in x0..x1 {
             let d = ((xx as f32 + 0.5 - cx).powi(2) + (yy as f32 + 0.5 - cy).powi(2)).sqrt();
-            let cov = tip.falloff(d) * opacity * sel_strength(sel, xx, yy);
+            let cov = tip.strength(xx, yy, cx, cy, d) * opacity * sel_strength(sel, xx, yy);
             if cov <= 0.0 {
                 continue;
             }
@@ -1438,7 +1603,7 @@ pub fn stamp_channel(
                 continue;
             }
             let d = ((x as f32 + 0.5 - cx).powi(2) + (y as f32 + 0.5 - cy).powi(2)).sqrt();
-            let cov = tip.falloff(d) * opacity;
+            let cov = tip.strength(x, y, cx, cy, d) * opacity;
             if cov <= 0.0 {
                 continue;
             }
@@ -1470,7 +1635,7 @@ pub fn stamp_mask(
                 continue;
             }
             let d = ((x as f32 + 0.5 - cx).powi(2) + (y as f32 + 0.5 - cy).powi(2)).sqrt();
-            let cov = tip.falloff(d) * opacity;
+            let cov = tip.strength(x, y, cx, cy, d) * opacity;
             if cov <= 0.0 {
                 continue;
             }

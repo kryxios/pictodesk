@@ -3,11 +3,7 @@
 An open-source desktop photo and image editor — local files, no cloud,
 no account, no subscription. Built feature by feature, in the open.
 
-**Status: v0.6.5 — Phase 6.5 "the long tail": the classic filter gallery completed (99 filters), all eight color modes (RGB, CMYK, Grayscale, Lab, Indexed, Bitmap, Duotone, Multichannel), Apply Image and Calculations, Selective Color, Replace Color and Variations, full Print Options and Color Settings, the Options Bar and full-screen display modes, Fade and Last Filter, File Info, Preferences, PCX and Targa export, swatch (.ACO) and brush (.ABR) libraries, adjustment settings save/load, Actions that persist between sessions with Button Mode, Insert Stop and Insert Menu Item, and Paths export to Illustrator format. Phase 6 (v0.6.0/v0.6.1) is included: the full ten layer-style effects, shape and fill layers, layer sets, advanced blending, Liquify, slices, annotations, Warp Text, the Preset Manager and droplets.
-The UI follows the classic early-90s editor design: a File / Edit /
-Image / Mode / Filter / Select / Window menu bar, a compact
-two-column toolbox, modal dialogs with live preview, docked tabbed
-palettes, and a History panel with snapshots.
+**Status: v0.7.0 — Phase 7: the Healing Brush and Patch tool, five more blend modes (22 total), Auto Color alongside Auto Levels and Auto Contrast, Pattern Maker, a second-generation paint engine (brush dynamics: shape, scattering, texture, dual brush, color and flow dynamics in a sectioned Brushes palette, with Flow and an Airbrush toggle), Tool Presets (options-bar picker, palette, and a Preset Manager tab), Workspaces, a File Browser with ranks, rotation and EXIF, Liquify round two (Turbulence, Backdrop, zoom and pan, multiple undo, save/load meshes, now under Filter), Check Spelling with a bundled wordlist and personal dictionary, Find and Replace across type layers, Save for Web transparency knockout with dithered edges plus WBMP output, XMP metadata in JPEG exports from File Info, and Picture Package with multiple source images, page sizes, labels and layered output. Phase 6.5 (v0.6.5) is included: the classic filter gallery completed (99 filters), all eight color modes, Apply Image and Calculations, the Options Bar, Fade, durable Actions,.ACO/.ABR libraries, and Paths export. Phase 6 (v0.6.0/v0.6.1) is included: the full ten layer-style effects, shape and fill layers, layer sets, advanced blending, slices, annotations, Warp Text, the Preset Manager and droplets.
 
 What exists today:
 

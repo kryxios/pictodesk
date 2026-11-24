@@ -1167,6 +1167,170 @@ pub fn stroke_selection(
     }
 }
 
+/// Channel histograms of the layer's opaque, selected pixels
+/// (8-bit), shared by the Auto family (Phase 7).
+fn channel_hists(doc: &Document, layer: usize, sel: Option<&Selection>) -> ([[u32; 256]; 3], u32) {
+    let mut hist = [[0u32; 256]; 3];
+    let mut total: u32 = 0;
+    let l = &doc.layers[layer];
+    let offset = l.offset;
+    for coord in l.tiles.keys() {
+        let tile = &l.tiles[coord];
+        for ly in 0..256i32 {
+            for lx in 0..256i32 {
+                let p = tile.get(lx as u32, ly as u32);
+                if p.a == 0 {
+                    continue;
+                }
+                let (dx, dy) = (coord.0 * 256 + lx + offset.0, coord.1 * 256 + ly + offset.1);
+                let s = sel.map(|s| s.value(dx, dy)).unwrap_or(255);
+                if s < 128 {
+                    continue;
+                }
+                let (r, g, b, _) = p.to_rgba8();
+                hist[0][r as usize] += 1;
+                hist[1][g as usize] += 1;
+                hist[2][b as usize] += 1;
+                total += 1;
+            }
+        }
+    }
+    (hist, total)
+}
+
+/// The black/white points of a histogram at a clip fraction
+/// (the classic Auto commands clip 0.1% at each end).
+fn clip_points(hist: &[u32; 256], total: u32, clip: f32) -> (u8, u8) {
+    if total == 0 {
+        return (0, 255);
+    }
+    let budget = (total as f32 * clip) as u32;
+    let mut acc = 0u32;
+    let mut lo = 0u8;
+    for (i, &n) in hist.iter().enumerate() {
+        acc += n;
+        if acc > budget {
+            lo = i as u8;
+            break;
+        }
+    }
+    let mut acc = 0u32;
+    let mut hi = 255u8;
+    for (i, &n) in hist.iter().enumerate().rev() {
+        acc += n;
+        if acc > budget {
+            hi = i as u8;
+            break;
+        }
+    }
+    if hi <= lo {
+        (0, 255)
+    } else {
+        (lo, hi)
+    }
+}
+
+fn stretch_lut(lo: u8, hi: u8) -> [u8; 256] {
+    let mut lut = [0u8; 256];
+    for (i, v) in lut.iter_mut().enumerate() {
+        *v = (((i as f32 - lo as f32) / (hi as f32 - lo as f32).max(1.0)) * 255.0).clamp(0.0, 255.0)
+            as u8;
+    }
+    lut
+}
+
+/// Auto Levels (Phase 7): stretch each channel separately.
+pub fn auto_levels(doc: &mut Document, layer: usize, sel: Option<&Selection>) {
+    let (hist, total) = channel_hists(doc, layer, sel);
+    if total == 0 {
+        return;
+    }
+    let luts = [
+        stretch_lut_for(&hist[0], total),
+        stretch_lut_for(&hist[1], total),
+        stretch_lut_for(&hist[2], total),
+    ];
+    apply_channel_luts(doc, layer, sel, &luts);
+}
+
+fn stretch_lut_for(hist: &[u32; 256], total: u32) -> [u8; 256] {
+    let (lo, hi) = clip_points(hist, total, 0.001);
+    stretch_lut(lo, hi)
+}
+
+fn apply_channel_luts(
+    doc: &mut Document,
+    layer: usize,
+    sel: Option<&Selection>,
+    luts: &[[u8; 256]; 3],
+) {
+    map_layer_pixels(doc, layer, sel, |p| {
+        let (r, g, b, a) = p.to_rgba8();
+        Pixel16::from_rgba8(
+            luts[0][r as usize],
+            luts[1][g as usize],
+            luts[2][b as usize],
+            a,
+        )
+    });
+}
+
+/// Auto Contrast (Phase 7): one shared stretch from the
+/// combined channel range, so hues do not shift.
+pub fn auto_contrast(doc: &mut Document, layer: usize, sel: Option<&Selection>) {
+    let (hist, total) = channel_hists(doc, layer, sel);
+    if total == 0 {
+        return;
+    }
+    let mut all = [0u32; 256];
+    for chan in hist.iter().take(3) {
+        for (i, v) in chan.iter().enumerate() {
+            all[i] += v;
+        }
+    }
+    let lut = stretch_lut_for(&all, total * 3);
+    apply_channel_luts(doc, layer, sel, &[lut, lut, lut]);
+}
+
+/// Auto Color (Phase 7, new in 7.0): per-channel stretch like
+/// Auto Levels, then neutralize: gain each channel so the
+/// stretched channel means agree (gray-world on the result),
+/// which removes the overall cast.
+pub fn auto_color(doc: &mut Document, layer: usize, sel: Option<&Selection>) {
+    let (hist, total) = channel_hists(doc, layer, sel);
+    if total == 0 {
+        return;
+    }
+    let luts = [
+        stretch_lut_for(&hist[0], total),
+        stretch_lut_for(&hist[1], total),
+        stretch_lut_for(&hist[2], total),
+    ];
+    // Means after the stretch, from the histograms.
+    let mut means = [0f32; 3];
+    for c in 0..3 {
+        let mut sum = 0f64;
+        for i in 0..256 {
+            sum += hist[c][i] as f64 * luts[c][i] as f64;
+        }
+        means[c] = (sum / total as f64) as f32;
+    }
+    let target = (means[0] + means[1] + means[2]) / 3.0;
+    let mut gains = [1f32; 3];
+    for c in 0..3 {
+        if means[c] > 1.0 {
+            gains[c] = (target / means[c]).clamp(0.5, 2.0);
+        }
+    }
+    map_layer_pixels(doc, layer, sel, |p| {
+        let (r, g, b, a) = p.to_rgba8();
+        let m = |v: u8, c: usize| -> u8 {
+            (luts[c][v as usize] as f32 * gains[c]).clamp(0.0, 255.0) as u8
+        };
+        Pixel16::from_rgba8(m(r, 0), m(g, 1), m(b, 2), a)
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

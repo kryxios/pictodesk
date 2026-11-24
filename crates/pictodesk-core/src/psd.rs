@@ -89,6 +89,11 @@ fn blend_from_key(key: &[u8]) -> Option<BlendMode> {
         b"divn" => BlendMode::ColorDodge,
         b"idiv" => BlendMode::ColorBurn,
         b"excl" => BlendMode::Exclusion,
+        b"lbrn" => BlendMode::LinearBurn,
+        b"lddg" => BlendMode::LinearDodge,
+        b"vLit" => BlendMode::VividLight,
+        b"lLit" => BlendMode::LinearLight,
+        b"pLit" => BlendMode::PinLight,
         b"hue " => BlendMode::Hue,
         b"sat " => BlendMode::Saturation,
         b"colr" => BlendMode::Color,
@@ -743,6 +748,11 @@ fn blend_to_key(mode: BlendMode) -> &'static [u8; 4] {
         BlendMode::Saturation => b"sat ",
         BlendMode::Color => b"colr",
         BlendMode::Luminosity => b"lum ",
+        BlendMode::LinearBurn => b"lbrn",
+        BlendMode::LinearDodge => b"lddg",
+        BlendMode::VividLight => b"vLit",
+        BlendMode::LinearLight => b"lLit",
+        BlendMode::PinLight => b"pLit",
     }
 }
 
