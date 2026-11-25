@@ -48,6 +48,8 @@ pub(crate) fn run_shot(args: &[String]) -> i32 {
     let mut twotabs = false;
     let mut uitooltip = false;
     let mut prefshortcuts = false;
+    let mut prefpage: Option<usize> = None;
+    let mut uiscale2 = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -93,6 +95,11 @@ pub(crate) fn run_shot(args: &[String]) -> i32 {
             "--twotabs" => twotabs = true,
             "--uitooltip" => uitooltip = true,
             "--prefshortcuts" => prefshortcuts = true,
+            "--prefpage" => {
+                prefpage = args.get(i + 1).and_then(|s| s.parse().ok());
+                i += 1;
+            }
+            "--uiscale2" => uiscale2 = true,
             "--size" => {
                 if let Some(s) = args.get(i + 1) {
                     if let Some((w, h)) = s.split_once('x') {
@@ -276,7 +283,7 @@ pub(crate) fn run_shot(args: &[String]) -> i32 {
             name: "Web Resize + Warm".into(),
             set: "Default Set".into(),
             steps: vec![
-                RecordedStep::ImageSize(800, 600),
+                RecordedStep::ImageSize(800, 600, 1),
                 RecordedStep::AdjustmentLayer(pictodesk_core::adjust::Adjustment::PhotoFilter {
                     color: (255, 178, 84),
                     density: 30,
@@ -2006,15 +2013,22 @@ pub(crate) fn run_shot(args: &[String]) -> i32 {
             check(
                 "preferences opens on the General page",
                 app.dialog.as_ref().map(|d| d.fx_page) == Some(0)
-                    && layout.range_buttons.len() == 7,
+                    && layout.range_buttons.len() == 2 + crate::prefs::prefs_page_buttons(0).len()
+                    && layout.slider_rows.len() == 1,
             );
-            let tab = layout.range_buttons[1];
-            app.mouse_down(tab.x as f32 + 10.0, tab.y as f32 + 9.0);
-            app.mouse_up(tab.x as f32 + 10.0, tab.y as f32 + 9.0);
+            // Next through all seven panes to Shortcuts (page 7).
+            // Re-fetch the layout each time: the dialog re-centers
+            // when its height changes per page.
+            for _ in 0..7 {
+                let l = app.dialog_layout().unwrap();
+                let next = l.range_buttons[1];
+                app.mouse_down(next.x as f32 + 10.0, next.y as f32 + 9.0);
+                app.mouse_up(next.x as f32 + 10.0, next.y as f32 + 9.0);
+            }
             let layout2 = app.dialog_layout().unwrap();
             check(
-                "shortcuts tab shows the list, no sliders",
-                app.dialog.as_ref().map(|d| d.fx_page) == Some(1)
+                "shortcuts page shows the list, no sliders",
+                app.dialog.as_ref().map(|d| d.fx_page) == Some(7)
                     && layout2.range_buttons.len() == 2
                     && app.dialog.as_ref().map(|d| d.slider_defs().is_empty()) == Some(true),
             );
@@ -2029,6 +2043,114 @@ pub(crate) fn run_shot(args: &[String]) -> i32 {
             check(
                 "closing the dialog clears capture",
                 app.prefs_capture.is_none(),
+            );
+        }
+        // Preferences wiring: a real mouse click on a settings
+        // row flips the draft, and OK applies it to the app.
+        {
+            let mut app = App::new(flat(), None);
+            let before = app.show_options_bar;
+            app.open_dialog(DialogKind::Preferences);
+            let layout = app.dialog_layout().unwrap();
+            // General page: find the Options Bar button row and
+            // click it (rows start at the third range button).
+            let rows = crate::prefs::prefs_page_buttons(0);
+            let row_i = rows.iter().position(|r| r.label == "Options Bar").unwrap();
+            let btn = layout.range_buttons[2 + row_i];
+            app.mouse_down(btn.x as f32 + 10.0, btn.y as f32 + 9.0);
+            app.mouse_up(btn.x as f32 + 10.0, btn.y as f32 + 9.0);
+            app.dialog_ok();
+            check(
+                "preferences click toggles the options bar",
+                app.show_options_bar == !before,
+            );
+            // Restore, so later blocks see the default.
+            app.open_dialog(DialogKind::Preferences);
+            let layout = app.dialog_layout().unwrap();
+            let btn = layout.range_buttons[2 + row_i];
+            app.mouse_down(btn.x as f32 + 10.0, btn.y as f32 + 9.0);
+            app.mouse_up(btn.x as f32 + 10.0, btn.y as f32 + 9.0);
+            app.dialog_ok();
+            check(
+                "preferences toggle restores the options bar",
+                app.show_options_bar == before,
+            );
+        }
+        // Open Recent: saving records the file, and the menu
+        // action reopens it in a new tab. The real recent.txt is
+        // stashed and restored: this block must not leak a test
+        // entry into the user's list.
+        {
+            let recent_path = pictodesk_dir().join("recent.txt");
+            let recent_before = std::fs::read(&recent_path).ok();
+            let mut app = App::new(flat(), None);
+            let path = std::path::PathBuf::from("/tmp/pd-recent-test.pdk");
+            let _ = std::fs::remove_file(&path);
+            app.save_to(&path);
+            check(
+                "saving records the recent file",
+                app.recent_files.first() == Some(&path),
+            );
+            let tabs_before = app.tabs.len() + 1;
+            app.do_action(crate::actions::Action::OpenRecent(0));
+            check(
+                "open recent opens the file in a new tab",
+                app.file_path == Some(path.clone()) && app.tabs.len() + 1 == tabs_before + 1,
+            );
+            let _ = std::fs::remove_file(&path);
+            match recent_before {
+                Some(bytes) => {
+                    let _ = std::fs::write(&recent_path, bytes);
+                }
+                None => {
+                    let _ = std::fs::remove_file(&recent_path);
+                }
+            }
+        }
+        // Image-cache pyramid: a rendered doc builds the
+        // downsampled levels (default 4 levels = 3 extras).
+        {
+            let mut app = App::new(flat(), None);
+            app.ensure_render_cache();
+            check(
+                "render cache builds the pyramid",
+                app.cache_pyramid.len() == 3
+                    && app.cache_pyramid[0].0 == 15
+                    && app.cache_pyramid[0].1 == 10,
+            );
+        }
+        // Retina text: a scale-2 frame rasterizes glyphs at 2x,
+        // so the same text inks ~4x the pixels over ~2x the width.
+        {
+            let ink_w = |f: &Frame| {
+                let mut n = 0usize;
+                let mut max_x = 0i32;
+                for (i, px) in f.px.as_chunks::<4>().0.iter().enumerate() {
+                    if px[0] > 0 {
+                        n += 1;
+                        max_x = max_x.max((i % f.phys_w() as usize) as i32);
+                    }
+                }
+                (n, max_x)
+            };
+            let mut f1 = Frame::new(200, 40);
+            f1.text(10, 10, "Hg", 1, (255, 255, 255));
+            let (n1, w1) = ink_w(&f1);
+            let mut f2 = Frame::new(200, 40);
+            f2.set_size(200, 40, 2.0);
+            f2.text(10, 10, "Hg", 1, (255, 255, 255));
+            let (n2, w2) = ink_w(&f2);
+            check(
+                "scale-2 frame buffer is physical size",
+                f2.phys_w() == 400 && f2.phys_h() == 80,
+            );
+            check(
+                "scale-2 text inks more pixels (finer raster)",
+                n1 > 0 && n2 > n1 * 5 / 2 && n2 < n1 * 5,
+            );
+            check(
+                "scale-2 text spans about 2x the width",
+                w1 > 0 && w2 > w1 * 18 / 10 && w2 < w1 * 22 / 10,
             );
         }
 
@@ -2138,8 +2260,18 @@ pub(crate) fn run_shot(args: &[String]) -> i32 {
                 app.doc.info_title == "Sunset over the bay",
             );
             app.open_dialog(DialogKind::Preferences);
+            // Flip the Options Bar toggle in the draft (the dialog
+            // reads/writes the draft, not the old opt_b field).
             if let Some(d) = &mut app.dialog {
-                d.opt_b = false;
+                let row = crate::prefs::PREF_ROWS
+                    .iter()
+                    .find(|r| r.label == "Options Bar")
+                    .unwrap();
+                let idx = crate::prefs::prefs_toggle_idx(row);
+
+                if let Some(v) = d.pref_toggles.get_mut(idx) {
+                    *v = false;
+                }
             }
             app.dialog_ok();
             check("preferences toggle the options bar", !app.show_options_bar);
@@ -2310,7 +2442,7 @@ pub(crate) fn run_shot(args: &[String]) -> i32 {
                     Pixel16::from_rgba8(250, 251, 252, 255),
                 ),
                 RecordedStep::CanvasSize(100, 80, (5, -3)),
-                RecordedStep::ImageSize(64, 48),
+                RecordedStep::ImageSize(64, 48, 1),
                 RecordedStep::LayerSelect(2),
                 RecordedStep::Stop("Check the proof".into()),
                 RecordedStep::MenuCommand("Filter > Blur".into()),
@@ -3026,17 +3158,28 @@ pub(crate) fn run_shot(args: &[String]) -> i32 {
             app.open_dialog(kind);
         }
     }
-    if prefshortcuts {
-        if let Some(d) = &mut app.dialog {
-            if d.kind == DialogKind::Preferences {
-                d.fx_page = 1;
-            }
+    let prefs_open = app
+        .dialog
+        .as_ref()
+        .map(|d| d.kind == DialogKind::Preferences)
+        .unwrap_or(false);
+    if prefshortcuts && prefs_open {
+        // Shortcuts is the last pane (page 7).
+        app.prefs_set_page(crate::prefs::PREF_PAGES.len() - 1);
+    }
+    if let Some(page) = prefpage {
+        if prefs_open {
+            app.prefs_set_page(page % crate::prefs::PREF_PAGES.len());
         }
     }
     if tone {
         app.tool = Tool::Dodge;
     }
     let mut frame = Frame::new(size.0, size.1);
+    if uiscale2 {
+        // Retina shot: same logical layout, physical buffer.
+        frame.set_size(size.0, size.1, 2.0);
+    }
     if ft {
         // Free Transform shot: transform the Sun layer, box visible.
         app.doc.active_layer = 2;
@@ -3075,7 +3218,7 @@ pub(crate) fn run_shot(args: &[String]) -> i32 {
     // CPU-only shot (no GPU adapter in this environment): save
     // the CPU frame directly; the GPU cross-check is skipped.
     if std::env::var_os("PICTODESK_CPU_SHOT").is_some() {
-        return match write_ppm(&shot_path, size.0, size.1, &frame.px) {
+        return match write_ppm(&shot_path, frame.phys_w(), frame.phys_h(), &frame.px) {
             Ok(()) => {
                 println!("SHOT CPU: wrote {}", shot_path.display());
                 0
@@ -3140,8 +3283,8 @@ pub(crate) fn run_shot(args: &[String]) -> i32 {
     let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("shot-target"),
         size: wgpu::Extent3d {
-            width: size.0,
-            height: size.1,
+            width: frame.phys_w(),
+            height: frame.phys_h(),
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
@@ -3154,11 +3297,11 @@ pub(crate) fn run_shot(args: &[String]) -> i32 {
     let view = target.create_view(&Default::default());
     gpu.draw_to(&view);
     // readback
-    let pitch = size.0 * 4;
+    let pitch = frame.phys_w() * 4;
     let padded = pitch.div_ceil(256) * 256;
     let buf = gpu.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("shot-readback"),
-        size: (padded * size.1) as u64,
+        size: (padded * frame.phys_h()) as u64,
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
         mapped_at_creation: false,
     });
@@ -3175,7 +3318,7 @@ pub(crate) fn run_shot(args: &[String]) -> i32 {
             layout: wgpu::ImageDataLayout {
                 offset: 0,
                 bytes_per_row: Some(padded),
-                rows_per_image: Some(size.1),
+                rows_per_image: Some(frame.phys_h()),
             },
         },
         wgpu::Extent3d {

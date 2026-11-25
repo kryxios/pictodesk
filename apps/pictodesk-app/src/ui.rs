@@ -9,6 +9,13 @@
 //! fontdue, glyphs cached. Scale 1 = 12px regular, scale 2 =
 //! 18px bold. Callers keep the old (x, y, text, scale, color)
 //! signatures; widths are real advances now, not 9px/char.
+//!
+//! Display scale: `Frame` keeps its logical size (`w`/`h`, the
+//! size every layout call site reads) and a `scale` factor (2.0
+//! on Retina). The pixel buffer is physical size; every drawing
+//! primitive maps logical coordinates onto it, and glyphs are
+//! rasterized at `px * scale`, so text is 1:1 with the display
+//! instead of a logical-size image stretched 2x by the GPU.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -73,7 +80,10 @@ impl Rect {
 pub struct Frame {
     pub w: u32,
     pub h: u32,
-    pub px: Vec<u8>, // RGBA8
+    /// Logical-to-physical factor (2.0 on Retina). `w`/`h` stay
+    /// logical; `px` is the physical buffer, `phys_w` x `phys_h`.
+    pub scale: f32,
+    pub px: Vec<u8>, // RGBA8, physical size
 }
 
 impl Frame {
@@ -81,32 +91,78 @@ impl Frame {
         Frame {
             w,
             h,
+            scale: 1.0,
             px: vec![0; (w * h * 4) as usize],
         }
     }
 
-    pub fn resize(&mut self, w: u32, h: u32) {
-        self.w = w;
-        self.h = h;
-        self.px = vec![0; (w * h * 4) as usize];
+    /// Physical buffer width/height.
+    pub fn phys_w(&self) -> u32 {
+        (self.w as f32 * self.scale).round().max(1.0) as u32
+    }
+    pub fn phys_h(&self) -> u32 {
+        (self.h as f32 * self.scale).round().max(1.0) as u32
     }
 
-    #[inline]
-    pub fn set(&mut self, x: i32, y: i32, c: Rgb) {
-        if x < 0 || y < 0 || x >= self.w as i32 || y >= self.h as i32 {
+    /// Resize (logical) and rescale; reallocates only on change.
+    pub fn set_size(&mut self, w: u32, h: u32, scale: f32) {
+        let scale = if scale > 0.0 { scale } else { 1.0 };
+        if self.w == w && self.h == h && (self.scale - scale).abs() < f32::EPSILON {
             return;
         }
-        let i = ((y as u32 * self.w + x as u32) * 4) as usize;
+        self.w = w;
+        self.h = h;
+        self.scale = scale;
+        self.px = vec![0; (self.phys_w() * self.phys_h() * 4) as usize];
+    }
+
+    /// One physical pixel, bounds-checked.
+    #[inline]
+    fn set_at(&mut self, x: i32, y: i32, c: Rgb) {
+        if x < 0 || y < 0 || x >= self.phys_w() as i32 || y >= self.phys_h() as i32 {
+            return;
+        }
+        let i = ((y as u32 * self.phys_w() + x as u32) * 4) as usize;
         self.px[i] = c.0;
         self.px[i + 1] = c.1;
         self.px[i + 2] = c.2;
         self.px[i + 3] = 255;
     }
 
+    /// Logical pixel (x, y) covers the physical block
+    /// [x*s, (x+1)*s): adjacent logical pixels tile exactly,
+    /// at any scale.
+    #[inline]
+    pub fn set(&mut self, x: i32, y: i32, c: Rgb) {
+        let s = self.scale;
+        let (x0, x1) = (
+            (x as f32 * s).round() as i32,
+            ((x + 1) as f32 * s).round() as i32,
+        );
+        let (y0, y1) = (
+            (y as f32 * s).round() as i32,
+            ((y + 1) as f32 * s).round() as i32,
+        );
+        for yy in y0..y1 {
+            for xx in x0..x1 {
+                self.set_at(xx, yy, c);
+            }
+        }
+    }
+
     pub fn fill_rect(&mut self, r: Rect, c: Rgb) {
-        for yy in r.y..r.y + r.h {
-            for xx in r.x..r.x + r.w {
-                self.set(xx, yy, c);
+        let s = self.scale;
+        let (x0, x1) = (
+            (r.x as f32 * s).round() as i32,
+            ((r.x + r.w) as f32 * s).round() as i32,
+        );
+        let (y0, y1) = (
+            (r.y as f32 * s).round() as i32,
+            ((r.y + r.h) as f32 * s).round() as i32,
+        );
+        for yy in y0..y1 {
+            for xx in x0..x1 {
+                self.set_at(xx, yy, c);
             }
         }
     }
@@ -198,13 +254,16 @@ impl Frame {
         self.outline_rounded(r, rad, EDGE_SOFT);
     }
 
-    /// Blend one pixel of `c` over the frame at coverage `a`
-    /// (0..255): the antialiasing edge for rasterized type.
-    pub fn blend(&mut self, x: i32, y: i32, c: Rgb, a: u8) {
-        if a == 0 || x < 0 || y < 0 || x >= self.w as i32 || y >= self.h as i32 {
+    /// Blend one PHYSICAL pixel of `c` over the frame at
+    /// coverage `a` (0..255): the antialiasing edge for
+    /// rasterized type. `blend` below maps a logical pixel onto
+    /// the same block `set` uses.
+    #[inline]
+    fn blend_at(&mut self, x: i32, y: i32, c: Rgb, a: u8) {
+        if a == 0 || x < 0 || y < 0 || x >= self.phys_w() as i32 || y >= self.phys_h() as i32 {
             return;
         }
-        let i = ((y as u32 * self.w + x as u32) * 4) as usize;
+        let i = ((y as u32 * self.phys_w() + x as u32) * 4) as usize;
         let (a, inv) = (a as u32, 255 - a as u32);
         self.px[i] = ((c.0 as u32 * a + self.px[i] as u32 * inv) / 255) as u8;
         self.px[i + 1] = ((c.1 as u32 * a + self.px[i + 1] as u32 * inv) / 255) as u8;
@@ -229,17 +288,22 @@ impl Frame {
         w.ceil() as i32
     }
 
-    /// Draw antialiased text, top-left at (x, y).
+    /// Draw antialiased text, top-left at (x, y) in LOGICAL
+    /// coords. Glyphs rasterize at `px * display scale` and land
+    /// on physical pixels, so the type is 1:1 with the display.
     pub fn text(&mut self, x: i32, y: i32, text: &str, scale: i32, c: Rgb) {
         let (px, bold) = text_px(scale);
+        let s = self.scale;
+        let rpx = px * s;
         let font = ui_font(bold);
-        let baseline = y + font
-            .horizontal_line_metrics(px)
+        let ascent = font
+            .horizontal_line_metrics(rpx)
             .map(|m| m.ascent)
-            .unwrap_or(px * 0.8) as i32;
-        let mut pen = x as f32;
+            .unwrap_or(rpx * 0.8);
+        let baseline = (y as f32 * s + ascent) as i32;
+        let mut pen = x as f32 * s;
         for ch in text.chars() {
-            let g = glyph(ch, px, bold);
+            let g = glyph(ch, rpx, bold);
             if !g.bitmap.is_empty() {
                 // fontdue: the bitmap's bottom row sits at
                 // baseline - ymin - 1, so its top row is at
@@ -249,7 +313,7 @@ impl Frame {
                     for gx in 0..g.w {
                         let a = g.bitmap[(gy * g.w + gx) as usize];
                         if a > 0 {
-                            self.blend(pen as i32 + g.xmin + gx, top + gy, c, a);
+                            self.blend_at(pen as i32 + g.xmin + gx, top + gy, c, a);
                         }
                     }
                 }
@@ -263,14 +327,17 @@ impl Frame {
     /// corner of the rotated run.
     pub fn text_vertical(&mut self, x: i32, y: i32, text: &str, scale: i32, c: Rgb) {
         let (px, bold) = text_px(scale);
+        let s = self.scale;
+        let rpx = px * s;
         let font = ui_font(bold);
         let ascent = font
-            .horizontal_line_metrics(px)
+            .horizontal_line_metrics(rpx)
             .map(|m| m.ascent)
-            .unwrap_or(px * 0.8) as i32;
+            .unwrap_or(rpx * 0.8) as i32;
         let mut pen = 0.0f32; // advance along the run (upward after rotation)
+        let (ox, oy) = ((x as f32 * s) as i32, (y as f32 * s) as i32);
         for ch in text.chars() {
-            let g = glyph(ch, px, bold);
+            let g = glyph(ch, rpx, bold);
             for gy in 0..g.h {
                 for gx in 0..g.w {
                     let a = g.bitmap[(gy * g.w + gx) as usize];
@@ -280,7 +347,7 @@ impl Frame {
                         // Rotated 90° CCW: (x + v, y - u).
                         let u = pen as i32 + g.xmin + gx;
                         let v = ascent - g.h - g.ymin + gy;
-                        self.blend(x + v, y - u, c, a);
+                        self.blend_at(ox + v, oy - u, c, a);
                     }
                 }
             }

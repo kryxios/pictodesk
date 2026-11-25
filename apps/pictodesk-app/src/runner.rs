@@ -142,7 +142,10 @@ impl Gpu {
     }
 
     pub(crate) fn upload(&mut self, frame: &Frame) {
-        let size = (frame.w, frame.h);
+        // Physical size: the framebuffer is `scale` times the
+        // logical size, so the texture matches the surface 1:1
+        // and nothing is stretched.
+        let size = (frame.phys_w(), frame.phys_h());
         if self.texture.as_ref().map(|t| t.2) != Some(size) {
             let tex = self.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("ui-frame"),
@@ -260,11 +263,12 @@ pub(crate) struct Runner {
     pub(crate) frame: Frame,
     pub(crate) last_ants: std::time::Instant,
     pub(crate) last_air: std::time::Instant,
-    /// Display scale factor (2.0 on Retina). The UI is drawn on the
-    /// CPU at LOGICAL size and the GPU stretches it over the physical
-    /// surface — drawing at physical size made every control half
-    /// size on high-DPI displays and quadrupled the per-frame CPU
-    /// and upload cost.
+    /// Display scale factor (2.0 on Retina). The framebuffer is
+    /// PHYSICAL size: layout stays logical, but `Frame` scales
+    /// every primitive and rasterizes glyphs at `px * scale`, so
+    /// the texture meets the surface 1:1 and type stays crisp.
+    /// (The old build rendered at logical size and let the GPU
+    /// stretch it — that is what made the fonts fuzzy.)
     pub(crate) scale: f64,
 }
 
@@ -287,9 +291,7 @@ impl Runner {
         }
         let logical = self.logical_size(size.width, size.height);
         self.app.win_size = logical;
-        if self.frame.w != logical.0 || self.frame.h != logical.1 {
-            self.frame.resize(logical.0, logical.1);
-        }
+        self.frame.set_size(logical.0, logical.1, self.scale as f32);
         self.app.draw(&mut self.frame);
         if let (Some(gpu), Some(surface)) = (&mut self.gpu, &self.surface) {
             gpu.upload(&self.frame);
@@ -448,9 +450,19 @@ impl ApplicationHandler for Runner {
                 window.request_redraw();
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                let s = if self.scale > 0.0 {
+                    self.scale as f32
+                } else {
+                    1.0
+                };
                 let (dx, dy) = match delta {
                     MouseScrollDelta::LineDelta(x, y) => (x, y),
-                    MouseScrollDelta::PixelDelta(p) => (p.x as f32 / 50.0, p.y as f32 / 50.0),
+                    // PixelDelta is physical pixels; divide by the
+                    // scale so the scroll moves the same logical
+                    // distance on Retina as on a 1x display.
+                    MouseScrollDelta::PixelDelta(p) => {
+                        (p.x as f32 / 50.0 / s, p.y as f32 / 50.0 / s)
+                    }
                 };
                 self.app.scroll(dx, dy);
                 window.request_redraw();

@@ -530,6 +530,55 @@ pub(crate) fn draw_tool_icon(f: &mut Frame, tool: Tool, r: Rect) {
     }
 }
 
+/// One vertical guide/grid line in the Preferences style:
+/// 0 solid, 1 dashed (6 on / 6 off), 2 dots (1 on / 2 off).
+fn styled_vline(f: &mut Frame, x: i32, y0: i32, y1: i32, col: (u8, u8, u8), style: u8) {
+    match style {
+        1 => {
+            let mut y = y0;
+            while y < y1 {
+                let end = (y + 6).min(y1);
+                f.fill_rect(Rect::new(x, y, 1, end - y), col);
+                y += 12;
+            }
+        }
+        2 => {
+            let mut y = y0;
+            while y < y1 {
+                f.fill_rect(Rect::new(x, y, 1, 1), col);
+                y += 3;
+            }
+        }
+        _ => {
+            f.fill_rect(Rect::new(x, y0, 1, y1 - y0), col);
+        }
+    }
+}
+
+/// One horizontal guide/grid line in the Preferences style.
+fn styled_hline(f: &mut Frame, y: i32, x0: i32, x1: i32, col: (u8, u8, u8), style: u8) {
+    match style {
+        1 => {
+            let mut x = x0;
+            while x < x1 {
+                let end = (x + 6).min(x1);
+                f.fill_rect(Rect::new(x, y, end - x, 1), col);
+                x += 12;
+            }
+        }
+        2 => {
+            let mut x = x0;
+            while x < x1 {
+                f.fill_rect(Rect::new(x, y, 1, 1), col);
+                x += 3;
+            }
+        }
+        _ => {
+            f.fill_rect(Rect::new(x0, y, x1 - x0, 1), col);
+        }
+    }
+}
+
 impl App {
     /// Y coordinate where the work area starts: menu bar
     /// (hidden in full screen), plus the Options Bar in
@@ -752,11 +801,105 @@ impl App {
                 // printable primaries (one heavy ink) stay clean.
                 let heavy = [c, m, y].iter().filter(|v| **v >= 0.75).count();
                 if c + m + y + k > 2.8 || heavy >= 2 {
-                    px[0] = 160;
-                    px[1] = 160;
-                    px[2] = 160;
+                    let (gr, gg, gb) = self.prefs.gamut_overlay();
+                    px[0] = gr;
+                    px[1] = gg;
+                    px[2] = gb;
                 }
             }
+        }
+        self.rebuild_pyramid();
+    }
+
+    /// Total installed RAM, for the Memory & Image Cache budget
+    /// (Linux /proc/meminfo, macOS sysctl, else a 4 GiB guess).
+    fn available_ram_bytes() -> u64 {
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
+                for line in meminfo.lines() {
+                    if let Some(rest) = line.strip_prefix("MemTotal:") {
+                        if let Ok(kb) = rest.trim().trim_end_matches("kB").trim().parse::<u64>() {
+                            return kb * 1024;
+                        }
+                    }
+                }
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            if let Ok(out) = std::process::Command::new("sysctl")
+                .args(["-n", "hw.memsize"])
+                .output()
+            {
+                if let Ok(n) = String::from_utf8_lossy(&out.stdout).trim().parse::<u64>() {
+                    return n;
+                }
+            }
+        }
+        4 * 1024 * 1024 * 1024
+    }
+
+    /// Rebuild the downsampled render pyramid from the fresh
+    /// full-res cache (Memory & Image Cache prefs: level count
+    /// capped by the RAM budget, ~4/3x the full image at most).
+    fn rebuild_pyramid(&mut self) {
+        self.cache_pyramid.clear();
+        self.pyramid_version = self.rendered_version;
+        let mut levels = self.prefs.cache_levels.clamp(1, 8) as usize;
+        let (w, h) = (self.doc.width as u64, self.doc.height as u64);
+        let full = w * h * 4;
+        if full == 0 {
+            return;
+        }
+        let budget = Self::available_ram_bytes() * self.prefs.ram_pct.clamp(5, 100) as u64 / 100;
+        // Pyramid total is full * (1 + 1/4 + 1/16 + ...); drop
+        // levels until it fits the budget (level 1 = full only).
+        while levels > 1 {
+            let mut total = full as f64;
+            let mut f = 0.25;
+            for _ in 1..levels {
+                total += full as f64 * f;
+                f /= 4.0;
+            }
+            if total <= budget as f64 {
+                break;
+            }
+            levels -= 1;
+        }
+        let mut prev = self.cached_render.clone();
+        let (mut pw, mut ph) = (self.doc.width, self.doc.height);
+        for _ in 1..levels {
+            let (nw, nh) = ((pw / 2).max(1), (ph / 2).max(1));
+            if nw == pw && nh == ph {
+                break;
+            }
+            let mut next = vec![0u8; (nw * nh * 4) as usize];
+            for y in 0..nh {
+                for x in 0..nw {
+                    let mut acc = [0u32; 4];
+                    let mut n = 0u32;
+                    for dy in 0..2 {
+                        for dx in 0..2 {
+                            let sx = (x * 2 + dx).min(pw - 1);
+                            let sy = (y * 2 + dy).min(ph - 1);
+                            let i = ((sy * pw + sx) * 4) as usize;
+                            for c in 0..4 {
+                                acc[c] += prev[i + c] as u32;
+                            }
+                            n += 1;
+                        }
+                    }
+                    let o = ((y * nw + x) * 4) as usize;
+                    for c in 0..4 {
+                        next[o + c] = (acc[c] / n) as u8;
+                    }
+                }
+            }
+            prev = next.clone();
+            self.cache_pyramid.push((nw, nh, next));
+            pw = nw;
+            ph = nh;
         }
     }
 
@@ -788,15 +931,74 @@ impl App {
             ui::DARK,
         );
         let scale = self.viewport.scale;
-        let steps = [1i32, 2, 5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000];
-        let step = steps
-            .iter()
-            .copied()
-            .find(|s| *s as f32 * scale >= 48.0)
-            .unwrap_or(10000);
+        // Ruler units (Preferences > Units & Rulers): the tick
+        // step is picked in unit space so labels land on round
+        // numbers; pixels per unit comes from the document
+        // resolution (points use the PostScript/Traditional pref).
+        let ppi = self.prefs.points_per_inch();
+        let res = self.doc.resolution.max(1.0);
+        let unit = self.prefs.ruler_units;
+        let div = |axis_len: u32| -> f32 {
+            match unit {
+                0 => 1.0,
+                1 => res,
+                2 => res / 2.54,
+                3 => res / 25.4,
+                4 => res / ppi,
+                5 => res / ppi / 12.0,
+                _ => axis_len as f32 / 100.0,
+            }
+        };
+        let unit_steps: &[f32] = match unit {
+            0 => &[
+                1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0,
+            ],
+            6 => &[1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0],
+            _ => &[0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0],
+        };
+        // Pixels per tick for one axis, from its divisor.
+        let step_for = |d: f32| -> i32 {
+            let u = unit_steps
+                .iter()
+                .copied()
+                .find(|u| u * d * scale >= 48.0)
+                .unwrap_or(*unit_steps.last().unwrap());
+            (u * d).round().max(1.0) as i32
+        };
+        // One tick's label in the current unit.
+        let label_for = |px: i32, d: f32| -> String {
+            let v = px as f32 / d;
+            match unit {
+                0 => px.to_string(),
+                4 => format!("{}", v.round() as i32),
+                5 => {
+                    // Classic pica notation: whole picas + points.
+                    let pts = v * 12.0;
+                    let whole = (pts / 12.0).floor() as i32;
+                    let mut rem = (pts % 12.0).round() as i32;
+                    let mut whole = whole;
+                    if rem == 12 {
+                        whole += 1;
+                        rem = 0;
+                    }
+                    format!("{whole}p{rem}")
+                }
+                6 => format!("{}%", v.round() as i32),
+                _ => {
+                    let r = (v * 100.0).round() / 100.0;
+                    if r == r.trunc() {
+                        format!("{}", r as i32)
+                    } else {
+                        format!("{r:.2}").trim_end_matches('0').to_string()
+                    }
+                }
+            }
+        };
         // Horizontal ticks + labels.
+        let hdiv = div(self.doc.width);
+        let hstep = step_for(hdiv);
         let d0 = self.viewport.screen_to_doc((0.0, 0.0)).0;
-        let mut p = (d0 / step as f32).floor() as i32 * step;
+        let mut p = (d0 / hstep as f32).floor() as i32 * hstep;
         loop {
             let sx = c.x + (p as f32 * scale + self.viewport.offset.0) as i32;
             if sx > c.right() {
@@ -804,13 +1006,15 @@ impl App {
             }
             if sx >= c.x {
                 f.fill_rect(Rect::new(sx, ty + ui::RULER_H - 6, 1, 6), ui::DARK);
-                f.text(sx + 3, ty + 3, &p.to_string(), 1, ui::TEXT);
+                f.text(sx + 3, ty + 3, &label_for(p, hdiv), 1, ui::TEXT);
             }
-            p += step;
+            p += hstep;
         }
         // Vertical ticks + labels.
+        let vdiv = div(self.doc.height);
+        let vstep = step_for(vdiv);
         let e0 = self.viewport.screen_to_doc((0.0, 0.0)).1;
-        let mut q = (e0 / step as f32).floor() as i32 * step;
+        let mut q = (e0 / vstep as f32).floor() as i32 * vstep;
         loop {
             let sy = c.y + (q as f32 * scale + self.viewport.offset.1) as i32;
             if sy > c.bottom() {
@@ -823,11 +1027,11 @@ impl App {
                 );
                 // Vertical labels read bottom-to-top, rotated like
                 // the classic rulers, centered on their tick.
-                let label = q.to_string();
+                let label = label_for(q, vdiv);
                 let lw = Frame::text_width(&label, 1);
                 f.text_vertical(ui::TOOLBAR_W + 5, sy + lw / 2, &label, 1, ui::TEXT);
             }
-            q += step;
+            q += vstep;
         }
         // Cursor markers.
         let (mx, my) = (self.cursor.0 as i32, self.cursor.1 as i32);
@@ -877,7 +1081,45 @@ impl App {
                         255 - [d(c), d(m), d(y), d(k)][ci.min(3)]
                     }
                 };
-                (v, v, v)
+                // Show Channels in Color (Preferences > Display &
+                // Cursors): single channels render in their ink
+                // color instead of grayscale.
+                if self.prefs.channels_in_color {
+                    match self.doc.mode {
+                        ColorMode::Rgb | ColorMode::Indexed => {
+                            let mut c = [0u8; 3];
+                            c[ci.min(2)] = v;
+                            (c[0], c[1], c[2])
+                        }
+                        ColorMode::Cmyk => {
+                            let ink =
+                                [(0, 174, 239), (236, 0, 140), (255, 242, 0), (0, 0, 0)][ci.min(3)];
+                            let d = 255 - v as i32;
+                            (
+                                (ink.0 * d / 255 + 255 * (255 - d) / 255) as u8,
+                                (ink.1 * d / 255 + 255 * (255 - d) / 255) as u8,
+                                (ink.2 * d / 255 + 255 * (255 - d) / 255) as u8,
+                            )
+                        }
+                        ColorMode::Multichannel => {
+                            let ink = self
+                                .doc
+                                .multi_channels
+                                .get(ci)
+                                .map(|m| m.color)
+                                .unwrap_or((0, 0, 0));
+                            let d = 255 - v as i32;
+                            (
+                                (ink.0 as i32 * d / 255 + 255 * (255 - d) / 255) as u8,
+                                (ink.1 as i32 * d / 255 + 255 * (255 - d) / 255) as u8,
+                                (ink.2 as i32 * d / 255 + 255 * (255 - d) / 255) as u8,
+                            )
+                        }
+                        _ => (v, v, v),
+                    }
+                } else {
+                    (v, v, v)
+                }
             }
             ChannelView::Alpha(ai) => {
                 let Some(ch) = self.doc.alphas.get(ai) else {
@@ -920,36 +1162,84 @@ impl App {
         let y0 = doc_rect.y.max(c.y);
         let x1 = doc_rect.right().min(c.right());
         let y1 = doc_rect.bottom().min(c.bottom());
-        let (docw, doch) = (self.doc.width as i32, self.doc.height as i32);
-        for sy in y0..y1 {
-            for sx in x0..x1 {
-                let dx = ((sx - doc_rect.x) as f32 / scale) as i32;
-                let dy = ((sy - doc_rect.y) as f32 / scale) as i32;
+        // Image-cache pyramid: when zoomed out, sample the level
+        // nearest the screen scale (Composite view only — channel
+        // views and Quick Mask need exact document pixels).
+        let use_pyramid = self.channel_view == ChannelView::Composite
+            && !self.quick_mask
+            && scale < 1.0
+            && !self.cache_pyramid.is_empty();
+        let (buf, docw, doch, eff_scale) = if use_pyramid {
+            let k = ((-scale.log2()).round() as usize).clamp(1, self.cache_pyramid.len());
+            let (w, h, b) = &self.cache_pyramid[k - 1];
+            (
+                b.as_slice(),
+                *w as i32,
+                *h as i32,
+                scale * (1u32 << k) as f32,
+            )
+        } else {
+            (
+                self.cached_render.as_slice(),
+                self.doc.width as i32,
+                self.doc.height as i32,
+                scale,
+            )
+        };
+        let (light, dark) = self.prefs.checker_colors();
+        let cell_size = self.prefs.checker_cell();
+        // Pixel doubling (Preferences > Display & Cursors):
+        // while dragging or a pixel dialog is open, paint the
+        // canvas at half resolution (2x2 screen blocks) for speed.
+        let dbl = self.prefs.pixel_doubling
+            && (self.drag != DragMode::None
+                || self
+                    .dialog
+                    .as_ref()
+                    .map(|d| d.kind.is_pixel_dialog())
+                    .unwrap_or(false));
+        let step = if dbl { 2 } else { 1 };
+        for sy in (y0..y1).step_by(step) {
+            for sx in (x0..x1).step_by(step) {
+                let dx = ((sx - doc_rect.x) as f32 / eff_scale) as i32;
+                let dy = ((sy - doc_rect.y) as f32 / eff_scale) as i32;
                 if dx < 0 || dy < 0 || dx >= docw || dy >= doch {
                     continue;
                 }
                 let i = ((dy * docw + dx) * 4) as usize;
-                let (r, g, b, a) = (
-                    self.cached_render[i],
-                    self.cached_render[i + 1],
-                    self.cached_render[i + 2],
-                    self.cached_render[i + 3],
-                );
+                let (r, g, b, a) = (buf[i], buf[i + 1], buf[i + 2], buf[i + 3]);
                 if self.channel_view != ChannelView::Composite {
                     let v = self.view_pixel(dx, dy, r, g, b);
-                    f.set(sx, sy, v);
+                    if dbl {
+                        f.fill_rect(Rect::new(sx, sy, 2, 2), v);
+                    } else {
+                        f.set(sx, sy, v);
+                    }
                     continue;
                 }
                 let shown = if a == 255 {
                     (r, g, b)
                 } else {
-                    let cell = (((sx / 8) + (sy / 8)) % 2 == 0) as u8;
-                    let bgc = if cell == 0 { 255 } else { 192 };
+                    // Transparency checkerboard (Preferences >
+                    // Transparency & Gamut): document-space cells;
+                    // Grid Size None composites over the light color.
+                    let bg = if cell_size == 0 {
+                        light
+                    } else {
+                        let ddx = ((sx - doc_rect.x) as f32 / scale) as i32;
+                        let ddy = ((sy - doc_rect.y) as f32 / scale) as i32;
+                        let cell = ((ddx / cell_size) + (ddy / cell_size)) % 2 == 0;
+                        if cell {
+                            light
+                        } else {
+                            dark
+                        }
+                    };
                     let af = a as f32 / 255.0;
                     (
-                        (r as f32 * af + bgc as f32 * (1.0 - af)) as u8,
-                        (g as f32 * af + bgc as f32 * (1.0 - af)) as u8,
-                        (b as f32 * af + bgc as f32 * (1.0 - af)) as u8,
+                        (r as f32 * af + bg.0 as f32 * (1.0 - af)) as u8,
+                        (g as f32 * af + bg.1 as f32 * (1.0 - af)) as u8,
+                        (b as f32 * af + bg.2 as f32 * (1.0 - af)) as u8,
                     )
                 };
                 // Quick Mask rubylith: red over the areas the
@@ -970,7 +1260,11 @@ impl App {
                 } else {
                     shown
                 };
-                f.set(sx, sy, shown);
+                if dbl {
+                    f.fill_rect(Rect::new(sx, sy, 2, 2), shown);
+                } else {
+                    f.set(sx, sy, shown);
+                }
             }
         }
         // drop shadow edge, like a sheet of paper on the surround
@@ -984,18 +1278,56 @@ impl App {
         );
 
         // Guides and grid (Phase 4), drawn over the document.
+        // Colors, styles, spacing, and subdivisions come from
+        // Preferences > Guides, Grid & Slices.
+        let preset = |i: u8| crate::prefs::COLOR_PRESETS[i as usize % 8].1;
         if self.show_grid {
-            let mut step = 64i32;
+            let mut step = self.prefs.grid_every.max(1) as i32;
             while (step as f32 * scale) < 10.0 {
                 step *= 2;
             }
-            let gc = (176, 176, 176);
+            let gc = preset(self.prefs.grid_color);
+            let gstyle = self.prefs.grid_style;
+            // Subdivisions: fainter lines (grid color halfway to
+            // white) at step/subdiv, drawn first so the major
+            // lines overwrite where they meet.
+            let subdiv = self.prefs.grid_subdiv.max(1) as i32;
+            let sub_step = if subdiv > 1 { step / subdiv } else { 0 };
+            let sub_c = (
+                ((gc.0 as u16 + 255) / 2) as u8,
+                ((gc.1 as u16 + 255) / 2) as u8,
+                ((gc.2 as u16 + 255) / 2) as u8,
+            );
+            if sub_step >= 1 {
+                let start_x = ((-self.viewport.offset.0) / scale).floor() as i32;
+                let mut wx = start_x - start_x.rem_euclid(sub_step);
+                while (wx as f32) < (self.doc.width as f32) {
+                    if wx % step != 0 {
+                        let sx = doc_rect.x + (wx as f32 * scale) as i32;
+                        if sx >= c.x && sx < c.right() {
+                            styled_vline(f, sx, y0.max(c.y), y1, sub_c, gstyle);
+                        }
+                    }
+                    wx += sub_step;
+                }
+                let start_y = ((-self.viewport.offset.1) / scale).floor() as i32;
+                let mut wy = start_y - start_y.rem_euclid(sub_step);
+                while (wy as f32) < (self.doc.height as f32) {
+                    if wy % step != 0 {
+                        let sy = doc_rect.y + (wy as f32 * scale) as i32;
+                        if sy >= c.y && sy < c.bottom() {
+                            styled_hline(f, sy, x0.max(c.x), x1, sub_c, gstyle);
+                        }
+                    }
+                    wy += sub_step;
+                }
+            }
             let start_x = ((-self.viewport.offset.0) / scale).floor() as i32;
             let mut wx = start_x - start_x.rem_euclid(step);
             while (wx as f32) < (self.doc.width as f32) {
                 let sx = doc_rect.x + (wx as f32 * scale) as i32;
                 if sx >= c.x && sx < c.right() {
-                    f.fill_rect(Rect::new(sx, y0.max(c.y), 1, y1 - y0.max(c.y)), gc);
+                    styled_vline(f, sx, y0.max(c.y), y1, gc, gstyle);
                 }
                 wx += step;
             }
@@ -1004,23 +1336,24 @@ impl App {
             while (wy as f32) < (self.doc.height as f32) {
                 let sy = doc_rect.y + (wy as f32 * scale) as i32;
                 if sy >= c.y && sy < c.bottom() {
-                    f.fill_rect(Rect::new(x0.max(c.x), sy, x1 - x0.max(c.x), 1), gc);
+                    styled_hline(f, sy, x0.max(c.x), x1, gc, gstyle);
                 }
                 wy += step;
             }
         }
         if self.show_guides {
-            let gc = (64, 156, 255);
+            let gc = preset(self.prefs.guide_color);
+            let gstyle = self.prefs.guide_style;
             for g in &self.doc.guides_x {
                 let sx = doc_rect.x + (*g as f32 * scale) as i32;
                 if sx >= c.x && sx < c.right() {
-                    f.fill_rect(Rect::new(sx, c.y, 1, c.h), gc);
+                    styled_vline(f, sx, c.y, c.bottom(), gc, gstyle);
                 }
             }
             for g in &self.doc.guides_y {
                 let sy = doc_rect.y + (*g as f32 * scale) as i32;
                 if sy >= c.y && sy < c.bottom() {
-                    f.fill_rect(Rect::new(c.x, sy, c.w, 1), gc);
+                    styled_hline(f, sy, c.x, c.right(), gc, gstyle);
                 }
             }
             if let Some((vertical, pos, _)) = self.guide_drag {
@@ -1050,10 +1383,12 @@ impl App {
                 let col = if self.slice_selected == Some(i) {
                     (255, 64, 64)
                 } else {
-                    (64, 156, 255)
+                    preset(self.prefs.slice_color)
                 };
                 f.outline_rect(r, col);
-                f.text(r.x + 2, r.y + 2, &format!("{}", i + 1), 1, col);
+                if self.prefs.slice_numbers {
+                    f.text(r.x + 2, r.y + 2, &format!("{}", i + 1), 1, col);
+                }
             }
         }
         for n in &self.doc.notes {
@@ -1299,18 +1634,44 @@ impl App {
                         | Tool::Burn
                         | Tool::Sponge
                 );
-                if paint_tool {
-                    // White ring with a black outer ring so it reads
-                    // on light and dark image areas alike.
-                    let r = ((self.tip.size * scale / 2.0) as i32).max(2);
-                    let steps = (r * 4).clamp(24, 128);
-                    for a in 0..steps {
-                        let t = a as f32 / steps as f32 * std::f32::consts::TAU;
-                        let (dx, dy) = (t.cos() * r as f32, t.sin() * r as f32);
-                        f.set(mx + dx as i32, my + dy as i32, ui::WHITE);
-                        let (dx2, dy2) = (t.cos() * (r + 1) as f32, t.sin() * (r + 1) as f32);
-                        f.set(mx + dx2 as i32, my + dy2 as i32, ui::BLACK);
+                // Painting cursors (Preferences > Display &
+                // Cursors): Standard and Brush Size show the tip
+                // outline; Precise shows a crosshair only; the
+                // Show Crosshair in Brush Tip option adds a
+                // crosshair inside the outline.
+                let precise = self.prefs.paint_cursor == 1;
+                let cross = |f: &mut Frame, mx: i32, my: i32, r: i32| {
+                    // White arms with a black shadow offset so the
+                    // crosshair reads on light and dark areas alike.
+                    for (ox, oy) in [(1, 1), (0, 0)] {
+                        let col = if ox == 0 { ui::WHITE } else { ui::BLACK };
+                        f.line(mx - r + ox, my + oy, mx + r + ox, my + oy, col);
+                        f.line(mx + ox, my - r + oy, mx + ox, my + r + oy, col);
                     }
+                };
+                if paint_tool {
+                    let r = ((self.tip.size * scale / 2.0) as i32).max(2);
+                    if precise {
+                        cross(f, mx, my, r.max(6));
+                    } else {
+                        // White ring with a black outer ring so it
+                        // reads on light and dark image areas alike.
+                        let steps = (r * 4).clamp(24, 128);
+                        for a in 0..steps {
+                            let t = a as f32 / steps as f32 * std::f32::consts::TAU;
+                            let (dx, dy) = (t.cos() * r as f32, t.sin() * r as f32);
+                            f.set(mx + dx as i32, my + dy as i32, ui::WHITE);
+                            let (dx2, dy2) = (t.cos() * (r + 1) as f32, t.sin() * (r + 1) as f32);
+                            f.set(mx + dx2 as i32, my + dy2 as i32, ui::BLACK);
+                        }
+                        if self.prefs.brush_crosshair {
+                            cross(f, mx, my, r.max(6));
+                        }
+                    }
+                } else if self.prefs.other_cursor == 1 {
+                    // Other cursors: Precise draws a crosshair for
+                    // non-paint tools too.
+                    cross(f, mx, my, 8);
                 }
                 // Clone / heal source crosshair: during a stroke the
                 // source tracks the cursor by the stroke offset;

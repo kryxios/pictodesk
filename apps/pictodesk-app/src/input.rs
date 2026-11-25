@@ -271,7 +271,7 @@ impl App {
                     let d = self.dialog.as_ref().unwrap();
                     (d.fx_page, d.list_offset)
                 };
-                if fx_page == 1 {
+                if fx_page == crate::prefs::PREF_PAGES.len() - 1 {
                     let r = layout.rect;
                     for j in 0..12usize {
                         let row = Rect::new(r.x + 12, r.y + 52 + j as i32 * 15, r.w - 24, 15);
@@ -781,18 +781,44 @@ impl App {
                                 let d = self.dialog.as_mut().unwrap();
                                 d.fx_a = i as u8;
                             }
-                            DialogKind::Preferences => {
-                                let d = self.dialog.as_mut().unwrap();
-                                match i {
-                                    0 => d.fx_page = 0,
-                                    1 => d.fx_page = 1,
-                                    2 => d.opt_a = !d.opt_a,
-                                    3 => d.opt_b = !d.opt_b,
-                                    4 => d.opt_c = !d.opt_c,
-                                    5 => d.opt_d = !d.opt_d,
-                                    _ => d.fx_a = (d.fx_a + 1) % 3,
+                            DialogKind::Preferences => match i {
+                                0 => {
+                                    let page = self.dialog.as_ref().map(|d| d.fx_page).unwrap_or(0);
+                                    let n = crate::prefs::PREF_PAGES.len();
+                                    self.prefs_set_page((page + n - 1) % n);
                                 }
-                            }
+                                1 => {
+                                    let page = self.dialog.as_ref().map(|d| d.fx_page).unwrap_or(0);
+                                    self.prefs_set_page(
+                                        (page + 1) % crate::prefs::PREF_PAGES.len(),
+                                    );
+                                }
+                                _ => {
+                                    let page = self.dialog.as_ref().map(|d| d.fx_page).unwrap_or(0);
+                                    let rows = crate::prefs::prefs_page_buttons(page);
+                                    if let Some(row) = rows.get(i - 2) {
+                                        match row.kind {
+                                            crate::prefs::PrefKind::Toggle(_) => {
+                                                let idx = crate::prefs::prefs_toggle_idx(row);
+                                                if let Some(d) = &mut self.dialog {
+                                                    if let Some(v) = d.pref_toggles.get_mut(idx) {
+                                                        *v = !*v;
+                                                    }
+                                                }
+                                            }
+                                            crate::prefs::PrefKind::Cycle(_k, opts, _sw) => {
+                                                let idx = crate::prefs::prefs_cycle_idx(row);
+                                                if let Some(d) = &mut self.dialog {
+                                                    if let Some(v) = d.pref_cycles.get_mut(idx) {
+                                                        *v = (*v + 1) % opts.len() as u8;
+                                                    }
+                                                }
+                                            }
+                                            crate::prefs::PrefKind::Slider(..) => {}
+                                        }
+                                    }
+                                }
+                            },
                             DialogKind::FileInfo => {
                                 let d = self.dialog.as_mut().unwrap();
                                 if i != d.fx_page && i < 5 {

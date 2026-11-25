@@ -88,7 +88,7 @@ fn phase1_task_test() {
     assert_eq!((doc.width, doc.height), (160, 120));
 
     let mut cmd = DocumentCommand::begin("Image Size", &doc);
-    transform::resize_image(&mut doc, 80, 60);
+    transform::resize_image(&mut doc, 80, 60, 1);
     cmd.finish(&doc);
     hist.push(Box::new(cmd));
     assert_eq!((doc.width, doc.height), (80, 60));

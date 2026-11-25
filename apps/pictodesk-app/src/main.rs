@@ -15,15 +15,16 @@
 mod tabs;
 
 use crate::actions::{
-    apply_step, line_to_step, load_actions_state, load_shortcuts, load_tool_presets,
-    load_workspaces, AudioRec, BrushPreset, FadeSource, RecordedAction, RecordedStep, ShortcutDef,
-    ToolPreset, Workspace,
+    apply_step, line_to_step, load_actions_state, load_recent_files, load_shortcuts,
+    load_tool_presets, load_workspaces, AudioRec, BrushPreset, FadeSource, RecordedAction,
+    RecordedStep, ShortcutDef, ToolPreset, Workspace,
 };
 use crate::dialogs::Dialog;
 use crate::file_panel::last_open_dir;
 use crate::headless::run_shot;
 use crate::input::ContextMenu;
 use crate::panels::{HistRow, HistSource, PanelDrop, PanelKind, PanelSlot, SlotLoc};
+use crate::prefs::Prefs;
 use crate::runner::run_window;
 use crate::tabs::DocTab;
 use crate::tools::{
@@ -36,6 +37,7 @@ mod headless;
 mod input;
 mod menus;
 mod panels;
+mod prefs;
 mod render;
 mod runner;
 mod tools;
@@ -679,6 +681,11 @@ struct App {
     show_options_bar: bool,
     /// Tooltips on hover (Preferences > General).
     show_tooltips: bool,
+    /// The Photoshop 7.0 settings (prefs.rs).
+    prefs: Prefs,
+    /// File > Open Recent (Preferences > File Handling sets
+    /// how many are kept).
+    recent_files: Vec<std::path::PathBuf>,
     /// Plain scroll wheel zooms instead of panning (Preferences).
     zoom_with_scroll: bool,
     /// Keyboard shortcuts: (id, label, combo). Combos are
@@ -840,6 +847,11 @@ struct App {
     cached_render: Vec<u8>,
     cached_size: (u32, u32),
     rendered_version: u64,
+    /// Downsampled render levels (level k = 1/2^k size), built
+    /// in ensure_render_cache per the Memory & Image Cache
+    /// prefs; draw_canvas picks one when zoomed out.
+    cache_pyramid: Vec<(u32, u32, Vec<u8>)>,
+    pyramid_version: u64,
     ants_phase: i32,
     quit: bool,
 }
@@ -939,6 +951,8 @@ impl App {
             last_filter_step: None,
             show_options_bar: true,
             show_tooltips: true,
+            prefs: Prefs::default(),
+            recent_files: load_recent_files(),
             zoom_with_scroll: false,
             shortcuts: load_shortcuts(),
             prefs_capture: None,
@@ -1050,6 +1064,8 @@ impl App {
             cached_render: Vec::new(),
             cached_size: (0, 0),
             rendered_version: u64::MAX,
+            cache_pyramid: Vec::new(),
+            pyramid_version: u64::MAX,
             ants_phase: 0,
             quit: false,
         };

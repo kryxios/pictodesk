@@ -735,6 +735,9 @@ fn serialize_ext(w: &mut Writer, doc: &Document) {
     write_str(w, &doc.info_keywords);
     write_str(w, &doc.info_copyright);
     write_str(w, &doc.info_credit);
+    // Resolution (Preferences wiring): trailing, so older
+    // readers stop at the File Info block above.
+    w.f32(doc.resolution);
 }
 
 /// The current (v3) serialization: header + DEFLATE-compressed
@@ -1422,6 +1425,11 @@ fn parse_ext(payload: &[u8], doc: &mut Document) -> Result<(), FormatError> {
                 doc.info_copyright = read_str6(&mut r)?;
                 doc.info_credit = read_str6(&mut r)?;
             }
+            // Resolution (Preferences wiring): files written
+            // before it end at File Info; default stays 72.
+            if r.pos < r.buf.len() {
+                doc.resolution = r.f32()?;
+            }
         }
     }
     Ok(())
@@ -1528,6 +1536,14 @@ mod tests {
         let back = deserialize(&bytes).unwrap();
         assert_eq!(doc, back);
         assert_eq!(doc.render_checksum(), back.render_checksum());
+    }
+
+    #[test]
+    fn resolution_round_trips() {
+        let mut doc = sample_doc();
+        doc.resolution = 300.0;
+        let back = deserialize(&serialize(&doc)).unwrap();
+        assert_eq!(back.resolution, 300.0);
     }
 
     #[test]

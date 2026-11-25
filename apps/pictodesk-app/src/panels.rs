@@ -810,6 +810,11 @@ impl App {
 
     /// Persist the panel layout (dock order + floats).
     pub(crate) fn save_panel_layout(&self) {
+        // Save Palette Locations (Preferences > General): when
+        // off, panel positions are never written to disk.
+        if !self.prefs.save_palette_locs {
+            return;
+        }
         let dir = pictodesk_dir();
         let mut text = String::new();
         for slot in &self.dock_slots {
@@ -829,6 +834,11 @@ impl App {
     }
 
     pub(crate) fn load_panel_layout(&mut self) {
+        // Save Palette Locations (Preferences > General): when
+        // off, a saved layout is ignored on launch.
+        if !self.prefs.save_palette_locs {
+            return;
+        }
         let Ok(text) = std::fs::read_to_string(pictodesk_dir().join("layout.txt")) else {
             return;
         };
@@ -1546,8 +1556,19 @@ impl App {
         };
         f.panel(r);
         f.text(r.x + 6, r.y + 5, "Histogram", 1, ui::TEXT);
+        // Image cache for histograms (Preferences > Memory &
+        // Image Cache): the deepest pyramid level when on,
+        // full resolution when off.
+        let hist_src: &[u8] = if self.prefs.cache_histograms {
+            self.cache_pyramid
+                .last()
+                .map(|(_, _, b)| b.as_slice())
+                .unwrap_or(&self.cached_render)
+        } else {
+            &self.cached_render
+        };
         let mut lum = [0u32; 256];
-        for px in self.cached_render.as_chunks::<4>().0 {
+        for px in hist_src.as_chunks::<4>().0 {
             let l = (0.299 * px[0] as f32 + 0.587 * px[1] as f32 + 0.114 * px[2] as f32) as usize;
             lum[l.min(255)] += 1;
         }

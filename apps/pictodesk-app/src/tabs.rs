@@ -364,6 +364,7 @@ impl App {
                     None
                 };
                 self.file_path = Some(path.to_path_buf());
+                self.record_recent(path);
                 self.doc_name = path
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
@@ -501,6 +502,7 @@ impl App {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "Untitled".into());
+                self.record_recent(path);
                 self.new_tab_with_doc(doc, Some(path.to_path_buf()), name);
                 self.status = psd_note.unwrap_or_else(|| format!("Opened {}", path.display()));
             }

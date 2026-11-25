@@ -953,7 +953,23 @@ pub fn rotate_selection(
 /// Image > Image Size: resample every layer to the new dimensions
 /// (bilinear). This is the Phase 1 resampler; fancier kernels are a
 /// later refinement.
-pub fn resize_image(doc: &mut Document, new_w: u32, new_h: u32) {
+/// Catmull-Rom cubic weights for a fractional offset t in [0, 1).
+/// The four taps sit at -1, 0, +1, +2 relative to the floor pixel.
+fn cubic_weights(t: f32) -> [f32; 4] {
+    let t2 = t * t;
+    let t3 = t2 * t;
+    [
+        -0.5 * t + t2 - 0.5 * t3,
+        1.0 - 2.5 * t2 + 1.5 * t3,
+        0.5 * t + 2.0 * t2 - 1.5 * t3,
+        -0.5 * t2 + 0.5 * t3,
+    ]
+}
+
+/// Resize the whole document (all layers + masks).
+/// `interp`: 0 = Nearest Neighbor, 1 = Bilinear, 2 = Bicubic
+/// (Catmull-Rom) — the General-preferences Interpolation setting.
+pub fn resize_image(doc: &mut Document, new_w: u32, new_h: u32, interp: u8) {
     if new_w == 0 || new_h == 0 || (new_w == doc.width && new_h == doc.height) {
         return;
     }
@@ -973,21 +989,34 @@ pub fn resize_image(doc: &mut Document, new_w: u32, new_h: u32) {
             out.mask_enabled = src.mask_enabled;
             for yy in 0..new_h as i32 {
                 for xx in 0..new_w as i32 {
-                    let fx = ((xx as f32 + 0.5) * sx - 0.5).round() as i32;
-                    let fy = ((yy as f32 + 0.5) * sy - 0.5).round() as i32;
-                    let mv = src.mask_value(fx.clamp(0, ow as i32 - 1), fy.clamp(0, oh as i32 - 1));
+                    let fx = (xx as f32 + 0.5) * sx - 0.5;
+                    let fy = (yy as f32 + 0.5) * sy - 0.5;
+                    let mv = if interp == 0 {
+                        src.mask_value(
+                            (fx.round() as i32).clamp(0, ow as i32 - 1),
+                            (fy.round() as i32).clamp(0, oh as i32 - 1),
+                        )
+                    } else {
+                        let (x0, y0) = (fx.floor() as i32, fy.floor() as i32);
+                        let (tx, ty) = (fx - x0 as f32, fy - y0 as f32);
+                        let m = |x: i32, y: i32| {
+                            src.mask_value(x.clamp(0, ow as i32 - 1), y.clamp(0, oh as i32 - 1))
+                                as f32
+                        };
+                        let top = m(x0, y0) + (m(x0 + 1, y0) - m(x0, y0)) * tx;
+                        let bot = m(x0, y0 + 1) + (m(x0 + 1, y0 + 1) - m(x0, y0 + 1)) * tx;
+                        (top + (bot - top) * ty).round().clamp(0.0, 255.0) as u8
+                    };
                     out.set_mask_value(xx, yy, mv);
                 }
             }
         }
         if cmyk {
-            // Bilinear over the five CMYK values (inks + alpha).
+            // Five CMYK values (inks + alpha) per sample.
             for yy in 0..new_h as i32 {
                 for xx in 0..new_w as i32 {
                     let fx = (xx as f32 + 0.5) * sx - 0.5;
                     let fy = (yy as f32 + 0.5) * sy - 0.5;
-                    let (x0, y0) = (fx.floor() as i32, fy.floor() as i32);
-                    let (tx, ty) = (fx - x0 as f32, fy - y0 as f32);
                     let smp = |x: i32, y: i32| -> [f32; 5] {
                         let vx = x.clamp(0, ow as i32 - 1);
                         let vy = y.clamp(0, oh as i32 - 1);
@@ -995,17 +1024,38 @@ pub fn resize_image(doc: &mut Document, new_w: u32, new_h: u32) {
                         let a = src.get_alpha(vx, vy) as f32 / 65535.0;
                         [p.0, p.1, p.2, p.3, a]
                     };
-                    let (sa, sb, sc, sd) = (
-                        smp(x0, y0),
-                        smp(x0 + 1, y0),
-                        smp(x0, y0 + 1),
-                        smp(x0 + 1, y0 + 1),
-                    );
                     let mut v = [0.0f32; 5];
-                    for c in 0..5 {
-                        let top = sa[c] + (sb[c] - sa[c]) * tx;
-                        let bot = sc[c] + (sd[c] - sc[c]) * tx;
-                        v[c] = top + (bot - top) * ty;
+                    if interp == 0 {
+                        v = smp(fx.round() as i32, fy.round() as i32);
+                    } else if interp == 2 {
+                        let (x0, y0) = (fx.floor() as i32, fy.floor() as i32);
+                        let (wx, wy) =
+                            (cubic_weights(fx - x0 as f32), cubic_weights(fy - y0 as f32));
+                        for (c, vc) in v.iter_mut().enumerate() {
+                            let mut acc = 0.0f32;
+                            for (j, wyj) in wy.iter().enumerate() {
+                                let mut row = 0.0f32;
+                                for (i, wxi) in wx.iter().enumerate() {
+                                    row += wxi * smp(x0 + i as i32 - 1, y0 + j as i32 - 1)[c];
+                                }
+                                acc += wyj * row;
+                            }
+                            *vc = acc;
+                        }
+                    } else {
+                        let (x0, y0) = (fx.floor() as i32, fy.floor() as i32);
+                        let (tx, ty) = (fx - x0 as f32, fy - y0 as f32);
+                        let (sa, sb, sc, sd) = (
+                            smp(x0, y0),
+                            smp(x0 + 1, y0),
+                            smp(x0, y0 + 1),
+                            smp(x0 + 1, y0 + 1),
+                        );
+                        for c in 0..5 {
+                            let top = sa[c] + (sb[c] - sa[c]) * tx;
+                            let bot = sc[c] + (sd[c] - sc[c]) * tx;
+                            v[c] = top + (bot - top) * ty;
+                        }
                     }
                     if v[4] > 0.0 {
                         let e = |q: f32| (q.clamp(0.0, 1.0) * 65535.0 + 0.5) as u16;
@@ -1021,29 +1071,52 @@ pub fn resize_image(doc: &mut Document, new_w: u32, new_h: u32) {
             for xx in 0..new_w as i32 {
                 let fx = (xx as f32 + 0.5) * sx - 0.5;
                 let fy = (yy as f32 + 0.5) * sy - 0.5;
-                let (x0, y0) = (fx.floor() as i32, fy.floor() as i32);
-                let (tx, ty) = (fx - x0 as f32, fy - y0 as f32);
                 let sample = |x: i32, y: i32| {
                     src.get_pixel(x.clamp(0, ow as i32 - 1), y.clamp(0, oh as i32 - 1))
                         .to_f32s()
                 };
-                let (a, b, c, d) = (
-                    sample(x0, y0),
-                    sample(x0 + 1, y0),
-                    sample(x0, y0 + 1),
-                    sample(x0 + 1, y0 + 1),
-                );
-                let lerp2 = |p: (f32, f32, f32, f32), q: (f32, f32, f32, f32), t: f32| {
-                    (
-                        p.0 + (q.0 - p.0) * t,
-                        p.1 + (q.1 - p.1) * t,
-                        p.2 + (q.2 - p.2) * t,
-                        p.3 + (q.3 - p.3) * t,
-                    )
+                let v = if interp == 0 {
+                    sample(fx.round() as i32, fy.round() as i32)
+                } else if interp == 2 {
+                    let (x0, y0) = (fx.floor() as i32, fy.floor() as i32);
+                    let (wx, wy) = (cubic_weights(fx - x0 as f32), cubic_weights(fy - y0 as f32));
+                    let mut acc = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+                    for (j, wyj) in wy.iter().enumerate() {
+                        let mut row = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+                        for (i, wxi) in wx.iter().enumerate() {
+                            let s = sample(x0 + i as i32 - 1, y0 + j as i32 - 1);
+                            row.0 += wxi * s.0;
+                            row.1 += wxi * s.1;
+                            row.2 += wxi * s.2;
+                            row.3 += wxi * s.3;
+                        }
+                        acc.0 += wyj * row.0;
+                        acc.1 += wyj * row.1;
+                        acc.2 += wyj * row.2;
+                        acc.3 += wyj * row.3;
+                    }
+                    acc
+                } else {
+                    let (x0, y0) = (fx.floor() as i32, fy.floor() as i32);
+                    let (tx, ty) = (fx - x0 as f32, fy - y0 as f32);
+                    let (a, b, c, d) = (
+                        sample(x0, y0),
+                        sample(x0 + 1, y0),
+                        sample(x0, y0 + 1),
+                        sample(x0 + 1, y0 + 1),
+                    );
+                    let lerp2 = |p: (f32, f32, f32, f32), q: (f32, f32, f32, f32), t: f32| {
+                        (
+                            p.0 + (q.0 - p.0) * t,
+                            p.1 + (q.1 - p.1) * t,
+                            p.2 + (q.2 - p.2) * t,
+                            p.3 + (q.3 - p.3) * t,
+                        )
+                    };
+                    let top = lerp2(a, b, tx);
+                    let bot = lerp2(c, d, tx);
+                    lerp2(top, bot, ty)
                 };
-                let top = lerp2(a, b, tx);
-                let bot = lerp2(c, d, tx);
-                let v = lerp2(top, bot, ty);
                 let p = Pixel16::from_f32s(v.0, v.1, v.2, v.3);
                 if p != Pixel16::TRANSPARENT {
                     out.set_pixel(xx, yy, p);
@@ -1095,6 +1168,21 @@ mod tests {
     }
 
     #[test]
+    fn resize_interp_modes_differ() {
+        // Nearest picks the source pixel exactly; bicubic blends.
+        let mut near = marked_doc();
+        resize_image(&mut near, 8, 4, 0);
+        assert_eq!(near.layers[0].get_pixel(1, 0).to_rgba8().0, 255);
+        let mut cubic = marked_doc();
+        resize_image(&mut cubic, 8, 4, 2);
+        assert_ne!(cubic.layers[0].get_pixel(1, 0).to_rgba8().0, 255);
+        assert_ne!(near.render_checksum(), cubic.render_checksum());
+        let mut linear = marked_doc();
+        resize_image(&mut linear, 8, 4, 1);
+        assert_eq!((linear.width, linear.height), (8, 4));
+    }
+
+    #[test]
     fn canvas_size_grows_with_anchor() {
         let mut doc = marked_doc();
         canvas_size(&mut doc, 6, 4, (0, 0)); // center: dx=1, dy=1
@@ -1124,7 +1212,7 @@ mod tests {
     #[test]
     fn resize_up_keeps_colors_present() {
         let mut doc = marked_doc();
-        resize_image(&mut doc, 8, 4);
+        resize_image(&mut doc, 8, 4, 1);
         assert_eq!((doc.width, doc.height), (8, 4));
         assert!(doc.layers[0].get_pixel(0, 0).to_rgba8().0 > 200);
     }

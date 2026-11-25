@@ -5,6 +5,9 @@ use crate::actions::{
     Action, BrowserEntry, FadeSource, RecordedStep,
 };
 use crate::menus::OptAct;
+use crate::prefs::{
+    prefs_page_sliders, PrefBool, PrefCycle, PrefKind, PrefNum, PREF_PAGES, PREF_ROWS,
+};
 use crate::tools::{audio_play, audio_record_start, wav_encode, ChannelView, PaintTarget};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -370,8 +373,13 @@ pub(crate) struct Dialog {
     pub(crate) opt_a: bool,
     pub(crate) opt_b: bool,
     /// Preferences extras: tooltips, scroll-wheel zoom.
-    pub(crate) opt_c: bool,
-    pub(crate) opt_d: bool,
+    /// Preferences draft (prefs.rs): one entry per row of the
+    /// matching kind in PREF_ROWS order. Toggles and cycles hold
+    /// the whole dialog's values; sliders hold only the current
+    /// page's (reloaded on page switch).
+    pub(crate) pref_toggles: Vec<bool>,
+    pub(crate) pref_cycles: Vec<u8>,
+    pub(crate) pref_sliders: Vec<f32>,
     /// Hue/Saturation edit range: 0 Master, 1 Reds, 2 Yellows,
     /// 3 Greens, 4 Cyans, 5 Blues, 6 Magentas.
     pub(crate) hs_range: usize,
@@ -393,6 +401,9 @@ pub(crate) struct Dialog {
     /// Type dialog opened by a Type Mask tool: OK produces a
     /// selection instead of a layer.
     pub(crate) type_mask: bool,
+    pub(crate) type_unit_k: f32,
+    pub(crate) type_size_min: f32,
+    pub(crate) type_size_max: f32,
     pub(crate) font_scroll: usize,
     /// Extract dialog masks (document-sized) + tool mode
     /// (0 highlight brush, 1 fill, 2 eraser) + preview flag.
@@ -549,9 +560,11 @@ impl Dialog {
             DialogKind::GaussianBlur => vec![1.0],
             DialogKind::Unsharp => vec![0.5, 1.0, 0.0],
             DialogKind::AddNoise => vec![0.25],
-            DialogKind::ImageSize | DialogKind::CanvasSize | DialogKind::NewDoc => {
-                vec![doc.width as f32, doc.height as f32]
+            DialogKind::CanvasSize => vec![doc.width as f32, doc.height as f32],
+            DialogKind::ImageSize => {
+                vec![doc.width as f32, doc.height as f32, doc.resolution]
             }
+            DialogKind::NewDoc => vec![doc.width as f32, doc.height as f32, 300.0],
             DialogKind::Feather => vec![5.0],
             DialogKind::GrowSel | DialogKind::SimilarSel => vec![32.0],
             DialogKind::SavePath => vec![],
@@ -719,8 +732,9 @@ impl Dialog {
             kernel_offset: 0,
             opt_a: false,
             opt_b: false,
-            opt_c: false,
-            opt_d: false,
+            pref_toggles: Vec::new(),
+            pref_cycles: Vec::new(),
+            pref_sliders: Vec::new(),
             hs_range: 0,
             fill_history: false,
             mixer: adjust::ChannelMixer::default(),
@@ -731,6 +745,12 @@ impl Dialog {
             type_anchor: (0, 0),
             type_spec: None,
             type_mask: false,
+            // Type Units (Preferences > Units & Rulers): px per
+            // display unit for the Size slider, and its range in
+            // display units (set by open_type_dialog).
+            type_unit_k: 1.0,
+            type_size_min: 6.0,
+            type_size_max: 288.0,
             font_scroll: 0,
             extract_hi: Vec::new(),
             extract_fill: Vec::new(),
@@ -850,8 +870,15 @@ impl Dialog {
                 ("Threshold", 0.0, 255.0),
             ],
             DialogKind::AddNoise => vec![("Amount", 0.0, 1.0)],
-            DialogKind::ImageSize | DialogKind::CanvasSize | DialogKind::NewDoc => {
+            DialogKind::CanvasSize => {
                 vec![("Width", 1.0, 10000.0), ("Height", 1.0, 10000.0)]
+            }
+            DialogKind::ImageSize | DialogKind::NewDoc => {
+                vec![
+                    ("Width", 1.0, 10000.0),
+                    ("Height", 1.0, 10000.0),
+                    ("Resolution", 1.0, 1200.0),
+                ]
             }
             DialogKind::Feather => vec![("Radius", 0.0, 250.0)],
             DialogKind::Fill => vec![("Opacity", 0.0, 100.0)],
@@ -886,7 +913,7 @@ impl Dialog {
                 ("Constant", -100.0, 100.0),
             ],
             DialogKind::Type => vec![
-                ("Size", 6.0, 288.0),
+                ("Size", self.type_size_min, self.type_size_max),
                 ("Tracking", -100.0, 1000.0),
                 ("Leading (0=auto)", 0.0, 500.0),
                 ("From char", 0.0, 10000.0),
@@ -1022,13 +1049,13 @@ impl Dialog {
             DialogKind::StrokeSel => vec![("Width px", 1.0, 64.0), ("Opacity %", 0.0, 100.0)],
             DialogKind::RotateArbitrary => vec![("Angle deg", 0.0, 180.0)],
             DialogKind::FileInfo => vec![],
-            DialogKind::Preferences => {
-                if self.fx_page == 1 {
-                    vec![]
-                } else {
-                    vec![("History states", 1.0, 100.0)]
-                }
-            }
+            DialogKind::Preferences => prefs_page_sliders(self.fx_page)
+                .iter()
+                .map(|r| match r.kind {
+                    PrefKind::Slider(_, min, max, _) => (r.label, min, max),
+                    _ => ("", 0.0, 0.0),
+                })
+                .collect(),
             DialogKind::Defringe => vec![("Width px", 1.0, 10.0)],
             DialogKind::ChannelOptions => vec![
                 ("Spot Red", 0.0, 255.0),
@@ -1289,6 +1316,20 @@ impl Dialog {
             DialogKind::HighPass => format!("{v:.1}"),
             DialogKind::Unsharp if i <= 1 => format!("{v:.2}"),
             DialogKind::AddNoise => format!("{:.0}%", v * 100.0),
+            DialogKind::Preferences => {
+                let unit = crate::prefs::prefs_page_sliders(self.fx_page)
+                    .get(i)
+                    .and_then(|r| match r.kind {
+                        crate::prefs::PrefKind::Slider(_, _, _, u) => Some(u),
+                        _ => None,
+                    })
+                    .unwrap_or("");
+                if unit.is_empty() {
+                    format!("{}", v.round() as i32)
+                } else {
+                    format!("{}{}", v.round() as i32, unit)
+                }
+            }
             _ => format!("{}", v.round() as i32),
         }
     }
@@ -2167,6 +2208,285 @@ impl App {
         self.status = "Settings loaded".into();
     }
 
+    // ------------------------------------------------------------ preferences
+    /// Read one draft toggle by its key.
+    pub(crate) fn prefs_bool(&self, k: PrefBool) -> bool {
+        match k {
+            PrefBool::Tooltips => self.show_tooltips,
+            PrefBool::BeepDone => self.prefs.beep_done,
+            PrefBool::DynSliders => self.prefs.dyn_sliders,
+            PrefBool::SavePaletteLocs => self.prefs.save_palette_locs,
+            PrefBool::ShiftToolSwitch => self.prefs.shift_tool_switch,
+            PrefBool::PasteResize => self.prefs.paste_resize,
+            PrefBool::AutoSnapshot => self.hist_auto_snapshot,
+            PrefBool::OptionsBar => self.show_options_bar,
+            PrefBool::ZoomScroll => self.zoom_with_scroll,
+            PrefBool::ChannelsInColor => self.prefs.channels_in_color,
+            PrefBool::PixelDoubling => self.prefs.pixel_doubling,
+            PrefBool::BrushCrosshair => self.prefs.brush_crosshair,
+            PrefBool::SliceNumbers => self.prefs.slice_numbers,
+            PrefBool::CacheHistograms => self.prefs.cache_histograms,
+        }
+    }
+
+    pub(crate) fn prefs_set_bool(&mut self, k: PrefBool, v: bool) {
+        match k {
+            PrefBool::Tooltips => self.show_tooltips = v,
+            PrefBool::BeepDone => self.prefs.beep_done = v,
+            PrefBool::DynSliders => self.prefs.dyn_sliders = v,
+            PrefBool::SavePaletteLocs => self.prefs.save_palette_locs = v,
+            PrefBool::ShiftToolSwitch => self.prefs.shift_tool_switch = v,
+            PrefBool::PasteResize => self.prefs.paste_resize = v,
+            PrefBool::AutoSnapshot => self.hist_auto_snapshot = v,
+            PrefBool::OptionsBar => self.show_options_bar = v,
+            PrefBool::ZoomScroll => self.zoom_with_scroll = v,
+            PrefBool::ChannelsInColor => self.prefs.channels_in_color = v,
+            PrefBool::PixelDoubling => self.prefs.pixel_doubling = v,
+            PrefBool::BrushCrosshair => self.prefs.brush_crosshair = v,
+            PrefBool::SliceNumbers => self.prefs.slice_numbers = v,
+            PrefBool::CacheHistograms => self.prefs.cache_histograms = v,
+        }
+    }
+
+    /// Read one draft cycle by its key.
+    pub(crate) fn prefs_cycle(&self, k: PrefCycle) -> u8 {
+        match k {
+            PrefCycle::Interp => self.prefs.interp,
+            PrefCycle::RedoKey => self.prefs.redo_key,
+            PrefCycle::DefaultSpace => match self.default_space {
+                pictodesk_core::color::WorkingSpace::Srgb => 0,
+                pictodesk_core::color::WorkingSpace::AdobeRgb => 1,
+                pictodesk_core::color::WorkingSpace::ProPhoto => 2,
+            },
+            PrefCycle::ImgPreviews => self.prefs.img_previews,
+            PrefCycle::FileExtCase => self.prefs.file_ext_case,
+            PrefCycle::PaintCursor => self.prefs.paint_cursor,
+            PrefCycle::OtherCursor => self.prefs.other_cursor,
+            PrefCycle::GridSize => self.prefs.grid_size,
+            PrefCycle::GridColors => self.prefs.grid_colors,
+            PrefCycle::RulerUnits => self.prefs.ruler_units,
+            PrefCycle::TypeUnits => self.prefs.type_units,
+            PrefCycle::PointPica => self.prefs.point_pica,
+            PrefCycle::GuideColor => self.prefs.guide_color,
+            PrefCycle::GuideStyle => self.prefs.guide_style,
+            PrefCycle::GridColor => self.prefs.grid_color,
+            PrefCycle::GridStyle => self.prefs.grid_style,
+            PrefCycle::SliceColor => self.prefs.slice_color,
+            PrefCycle::GamutColor => self.prefs.gamut_color,
+        }
+    }
+
+    pub(crate) fn prefs_set_cycle(&mut self, k: PrefCycle, v: u8) {
+        match k {
+            PrefCycle::Interp => self.prefs.interp = v.min(2),
+            PrefCycle::RedoKey => self.prefs.redo_key = v.min(1),
+            PrefCycle::DefaultSpace => {
+                self.default_space = match v {
+                    1 => pictodesk_core::color::WorkingSpace::AdobeRgb,
+                    2 => pictodesk_core::color::WorkingSpace::ProPhoto,
+                    _ => pictodesk_core::color::WorkingSpace::Srgb,
+                }
+            }
+            PrefCycle::ImgPreviews => self.prefs.img_previews = v.min(2),
+            PrefCycle::FileExtCase => self.prefs.file_ext_case = v.min(1),
+            PrefCycle::PaintCursor => self.prefs.paint_cursor = v.min(2),
+            PrefCycle::OtherCursor => self.prefs.other_cursor = v.min(1),
+            PrefCycle::GridSize => self.prefs.grid_size = v.min(3),
+            PrefCycle::GridColors => self.prefs.grid_colors = v.min(3),
+            PrefCycle::RulerUnits => self.prefs.ruler_units = v.min(6),
+            PrefCycle::TypeUnits => self.prefs.type_units = v.min(2),
+            PrefCycle::PointPica => self.prefs.point_pica = v.min(1),
+            PrefCycle::GuideColor => self.prefs.guide_color = v.min(7),
+            PrefCycle::GuideStyle => self.prefs.guide_style = v.min(1),
+            PrefCycle::GridColor => self.prefs.grid_color = v.min(7),
+            PrefCycle::GridStyle => self.prefs.grid_style = v.min(2),
+            PrefCycle::SliceColor => self.prefs.slice_color = v.min(7),
+            PrefCycle::GamutColor => self.prefs.gamut_color = v.min(7),
+        }
+    }
+
+    /// Read one draft slider by its key.
+    pub(crate) fn prefs_num(&self, k: PrefNum) -> f32 {
+        match k {
+            PrefNum::HistStates => self.hist.limit().unwrap_or(20) as f32,
+            PrefNum::RecentCount => self.prefs.recent_count as f32,
+            PrefNum::GamutOpacity => self.prefs.gamut_opacity as f32,
+            PrefNum::NewPrintRes => self.prefs.new_print_res as f32,
+            PrefNum::NewScreenRes => self.prefs.new_screen_res as f32,
+            PrefNum::GridEvery => self.prefs.grid_every as f32,
+            PrefNum::GridSubdiv => self.prefs.grid_subdiv as f32,
+            PrefNum::RamPct => self.prefs.ram_pct as f32,
+            PrefNum::CacheLevels => self.prefs.cache_levels as f32,
+        }
+    }
+
+    pub(crate) fn prefs_set_num(&mut self, k: PrefNum, v: f32) {
+        match k {
+            PrefNum::HistStates => self.hist.set_limit(Some((v.round() as usize).max(1))),
+            PrefNum::RecentCount => {
+                self.prefs.recent_count = (v.round() as u8).min(30);
+            }
+            PrefNum::GamutOpacity => {
+                self.prefs.gamut_opacity = (v.round() as u8).min(100);
+            }
+            PrefNum::NewPrintRes => {
+                self.prefs.new_print_res = (v.round() as u16).clamp(72, 1200);
+            }
+            PrefNum::NewScreenRes => {
+                self.prefs.new_screen_res = (v.round() as u16).clamp(72, 1200);
+            }
+            PrefNum::GridEvery => {
+                self.prefs.grid_every = (v.round() as u16).clamp(1, 2000);
+            }
+            PrefNum::GridSubdiv => {
+                self.prefs.grid_subdiv = (v.round() as u8).clamp(1, 100);
+            }
+            PrefNum::RamPct => self.prefs.ram_pct = (v.round() as u8).clamp(5, 100),
+            PrefNum::CacheLevels => {
+                self.prefs.cache_levels = (v.round() as u8).clamp(1, 8);
+            }
+        }
+    }
+
+    /// All slider rows in PREF_ROWS order (the draft's slider order).
+    fn prefs_all_sliders() -> Vec<&'static crate::prefs::PrefRowDef> {
+        PREF_ROWS
+            .iter()
+            .filter(|r| matches!(r.kind, PrefKind::Slider(..)))
+            .collect()
+    }
+
+    /// Fill the dialog draft from the app (open). Takes the
+    /// local dialog: open_dialog assigns self.dialog only after
+    /// the init block runs, so the draft cannot go through it.
+    pub(crate) fn prefs_load_draft(&mut self, d: &mut Dialog) {
+        d.pref_toggles = PREF_ROWS
+            .iter()
+            .filter_map(|r| match r.kind {
+                PrefKind::Toggle(k) => Some(self.prefs_bool(k)),
+                _ => None,
+            })
+            .collect();
+        d.pref_cycles = PREF_ROWS
+            .iter()
+            .filter_map(|r| match r.kind {
+                PrefKind::Cycle(k, _, _) => Some(self.prefs_cycle(k)),
+                _ => None,
+            })
+            .collect();
+        d.pref_sliders = PREF_ROWS
+            .iter()
+            .filter_map(|r| match r.kind {
+                PrefKind::Slider(k, _, _, _) => Some(self.prefs_num(k)),
+                _ => None,
+            })
+            .collect();
+        // Page 0's slider values live in d.vals.
+        let all = Self::prefs_all_sliders();
+        d.vals = prefs_page_sliders(d.fx_page)
+            .iter()
+            .map(|row| {
+                let idx = all.iter().position(|r| std::ptr::eq(*r, *row)).unwrap_or(0);
+                d.pref_sliders.get(idx).copied().unwrap_or(0.0)
+            })
+            .collect();
+    }
+
+    /// Load d.vals from the draft for the dialog's current page.
+    pub(crate) fn prefs_load_page_vals(&mut self) {
+        let page = self.dialog.as_ref().map(|d| d.fx_page).unwrap_or(0);
+        let vals: Vec<f32> = prefs_page_sliders(page)
+            .iter()
+            .map(|row| {
+                let idx = crate::prefs::prefs_slider_idx(row);
+                self.dialog
+                    .as_ref()
+                    .and_then(|d| d.pref_sliders.get(idx).copied())
+                    .unwrap_or(0.0)
+            })
+            .collect();
+        if let Some(d) = &mut self.dialog {
+            d.vals = vals;
+        }
+    }
+
+    /// Save d.vals into the draft for the current page.
+    pub(crate) fn prefs_save_page_vals(&mut self) {
+        let page = self.dialog.as_ref().map(|d| d.fx_page).unwrap_or(0);
+        let vals = self
+            .dialog
+            .as_ref()
+            .map(|d| d.vals.clone())
+            .unwrap_or_default();
+        let Some(d) = &mut self.dialog else {
+            return;
+        };
+        for (i, row) in prefs_page_sliders(page).iter().enumerate() {
+            let idx = crate::prefs::prefs_slider_idx(row);
+            if let (Some(v), Some(slot)) = (vals.get(i), d.pref_sliders.get_mut(idx)) {
+                *slot = *v;
+            }
+        }
+    }
+
+    /// Switch the Preferences page, carrying the draft's slider
+    /// values across (they live per-page in d.vals).
+    pub(crate) fn prefs_set_page(&mut self, page: usize) {
+        self.prefs_save_page_vals();
+        if let Some(d) = &mut self.dialog {
+            d.fx_page = page % PREF_PAGES.len();
+        }
+        self.prefs_load_page_vals();
+    }
+
+    /// Write the whole draft back to the app (OK). Takes the
+    /// dialog: dialog_ok takes it out of self.dialog first.
+    pub(crate) fn prefs_apply_draft(&mut self, d: &Dialog) {
+        // Save the current page's slider values into the draft.
+        let all = Self::prefs_all_sliders();
+        let mut sliders = d.pref_sliders.clone();
+        for (i, row) in prefs_page_sliders(d.fx_page).iter().enumerate() {
+            if let Some(idx) = all.iter().position(|r| std::ptr::eq(*r, *row)) {
+                if let Some(v) = d.vals.get(i) {
+                    if let Some(slot) = sliders.get_mut(idx) {
+                        *slot = *v;
+                    }
+                }
+            }
+        }
+        let toggles = d.pref_toggles.clone();
+        let cycles = d.pref_cycles.clone();
+        let (mut ti, mut ci, mut si) = (0usize, 0usize, 0usize);
+        for row in PREF_ROWS {
+            match row.kind {
+                PrefKind::Toggle(k) => {
+                    if let Some(v) = toggles.get(ti) {
+                        self.prefs_set_bool(k, *v);
+                    }
+                    ti += 1;
+                }
+                PrefKind::Cycle(k, opts, _) => {
+                    if let Some(v) = cycles.get(ci) {
+                        self.prefs_set_cycle(k, *v % opts.len() as u8);
+                    }
+                    ci += 1;
+                }
+                PrefKind::Slider(k, _, _, _) => {
+                    if let Some(v) = sliders.get(si) {
+                        self.prefs_set_num(k, *v);
+                    }
+                    si += 1;
+                }
+            }
+        }
+        // Live effect: palette locations are saved on exit when the
+        // setting is on — save them now too, so the choice sticks
+        // even if the app quits without a clean shutdown path.
+        if self.prefs.save_palette_locs {
+            self.save_panel_layout();
+        }
+    }
+
     pub(crate) fn open_dialog(&mut self, kind: DialogKind) {
         let mut d = Dialog::new(kind.clone(), &self.doc);
         if kind == DialogKind::LegacyFilter(28) {
@@ -2264,17 +2584,11 @@ impl App {
             d.text_focus = true;
         }
         if kind == DialogKind::Preferences {
-            d.vals = vec![self.hist.limit().unwrap_or(20) as f32];
-            d.opt_a = self.hist_auto_snapshot;
-            d.opt_b = self.show_options_bar;
-            d.opt_c = self.show_tooltips;
-            d.opt_d = self.zoom_with_scroll;
             d.fx_page = 0;
-            d.fx_a = match self.default_space {
-                pictodesk_core::color::WorkingSpace::Srgb => 0,
-                pictodesk_core::color::WorkingSpace::AdobeRgb => 1,
-                pictodesk_core::color::WorkingSpace::ProPhoto => 2,
-            };
+            self.prefs_load_draft(&mut d);
+        }
+        if kind == DialogKind::NewDoc {
+            d.vals[2] = self.prefs.new_print_res as f32;
         }
         if kind == DialogKind::ColorTable {
             d.table_sel = 0;
@@ -3218,8 +3532,13 @@ impl App {
                     d.vals[0].round().max(1.0) as u32,
                     d.vals[1].round().max(1.0) as u32,
                 );
-                self.structural("Image Size", |doc| transform::resize_image(doc, w, h));
-                self.record_step(RecordedStep::ImageSize(w, h));
+                let interp = self.prefs.interp;
+                let res = d.vals[2].clamp(1.0, 1200.0);
+                self.structural("Image Size", move |doc| {
+                    transform::resize_image(doc, w, h, interp);
+                    doc.resolution = res;
+                });
+                self.record_step(RecordedStep::ImageSize(w, h, interp));
                 self.sel = None;
                 self.fit_view(self.win_size.0, self.win_size.1);
             }
@@ -3403,7 +3722,7 @@ impl App {
                     d.vals[3].round().max(0.0) as usize,
                     d.vals[4].round().max(0.0) as usize,
                 );
-                let (size, tracking) = (d.vals[0], d.vals[1]);
+                let (size, tracking) = (d.vals[0] * d.type_unit_k, d.vals[1]);
                 if from < to && to <= spec.text.len() {
                     let mut st = spec.style_at(from);
                     st.size = size;
@@ -3669,8 +3988,9 @@ impl App {
                     ((h * scale).round() as u32).max(1),
                 );
                 if (nw, nh) != (self.doc.width, self.doc.height) {
-                    self.structural("Fit Image", |doc| {
-                        pictodesk_core::transform::resize_image(doc, nw, nh);
+                    let interp = self.prefs.interp;
+                    self.structural("Fit Image", move |doc| {
+                        pictodesk_core::transform::resize_image(doc, nw, nh, interp);
                     });
                     self.status = format!("Fit Image: {nw}x{nh}");
                 } else {
@@ -4012,12 +4332,15 @@ impl App {
                     .as_ref()
                     .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
                     .unwrap_or_else(|| "untitled".into());
-                let path = PathBuf::from(format!("{name}-web.{ext}"));
+                let path = PathBuf::from(format!("{name}-web.{}", self.ext_case(ext)));
                 match self.web_export_bytes(&d) {
                     Some(bytes) => {
                         let n = bytes.len();
                         match std::fs::write(&path, bytes) {
-                            Ok(()) => self.status = format!("Saved {} ({n} bytes)", path.display()),
+                            Ok(()) => {
+                                self.status = format!("Saved {} ({n} bytes)", path.display());
+                                self.beep_done();
+                            }
                             Err(e) => self.status = format!("Save for Web failed: {e}"),
                         }
                     }
@@ -4098,6 +4421,7 @@ impl App {
                     d.vals[1].round().max(1.0) as u32,
                 );
                 let mut doc = Document::new(w, h);
+                doc.resolution = d.vals[2].clamp(1.0, 1200.0);
                 doc.working_space = self.default_space;
                 doc.layers[0].fill_rect(0, 0, w, h, self.bg);
                 doc.log_event("Created");
@@ -4201,17 +4525,7 @@ impl App {
                 self.touch();
             }
             DialogKind::Preferences => {
-                self.hist
-                    .set_limit(Some((d.vals[0].round() as usize).max(1)));
-                self.hist_auto_snapshot = d.opt_a;
-                self.show_options_bar = d.opt_b;
-                self.show_tooltips = d.opt_c;
-                self.zoom_with_scroll = d.opt_d;
-                self.default_space = match d.fx_a {
-                    0 => pictodesk_core::color::WorkingSpace::Srgb,
-                    1 => pictodesk_core::color::WorkingSpace::AdobeRgb,
-                    _ => pictodesk_core::color::WorkingSpace::ProPhoto,
-                };
+                self.prefs_apply_draft(&d);
                 self.save_prefs_file();
                 self.status = "Preferences updated".into();
             }
@@ -4419,9 +4733,13 @@ impl App {
             h += 44; // two button rows
         }
         if d.kind == DialogKind::Preferences {
-            // Page tabs + control rows (General) or tabs + the
-            // shortcut list + Reset row (Shortcuts).
-            h += if d.fx_page == 1 { 210 } else { 88 };
+            // Header row + one row per control (settings pages),
+            // or header + the shortcut list (Shortcuts page).
+            h += if d.fx_page == PREF_PAGES.len() - 1 {
+                22 + 210
+            } else {
+                22 + crate::prefs::prefs_page_buttons(d.fx_page).len() as i32 * 22
+            };
         }
         if d.kind == DialogKind::FileInfo {
             h += 46; // text field + field tabs
@@ -4626,7 +4944,11 @@ impl App {
             y += 44;
         }
         if d.kind == DialogKind::Preferences {
-            y += if d.fx_page == 1 { 22 } else { 88 };
+            y += if d.fx_page == PREF_PAGES.len() - 1 {
+                22
+            } else {
+                22 + crate::prefs::prefs_page_buttons(d.fx_page).len() as i32 * 22
+            };
         }
         if d.kind == DialogKind::SelectiveColor {
             y += 44;
@@ -4760,24 +5082,25 @@ impl App {
                 .map(|i| Rect::new(rect.x + 12 + i * 128, rect.y + 30, 124, 18))
                 .collect::<Vec<Rect>>()
         } else if d.kind == DialogKind::Preferences {
-            if d.fx_page == 1 {
-                // Page tabs only; the list is drawn + clicked by
-                // the custom Preferences block.
-                vec![
-                    Rect::new(rect.x + 12, rect.y + 30, 182, 18),
-                    Rect::new(rect.x + 200, rect.y + 30, 182, 18),
-                ]
-            } else {
-                vec![
-                    Rect::new(rect.x + 12, rect.y + 30, 182, 18),
-                    Rect::new(rect.x + 200, rect.y + 30, 182, 18),
-                    Rect::new(rect.x + 12, rect.y + 52, 182, 18),
-                    Rect::new(rect.x + 200, rect.y + 52, 182, 18),
-                    Rect::new(rect.x + 12, rect.y + 74, 182, 18),
-                    Rect::new(rect.x + 200, rect.y + 74, 182, 18),
-                    Rect::new(rect.x + 122, rect.y + 96, 200, 18),
-                ]
+            // Prev / Next header, then one full-width row rect per
+            // button control on the page (the Shortcuts list is
+            // drawn + clicked by the custom Preferences block).
+            let mut v = vec![
+                Rect::new(rect.x + 12, rect.y + 30, 60, 18),
+                Rect::new(rect.right() - 72, rect.y + 30, 60, 18),
+            ];
+            if d.fx_page != PREF_PAGES.len() - 1 {
+                let n = crate::prefs::prefs_page_buttons(d.fx_page).len();
+                for i in 0..n {
+                    v.push(Rect::new(
+                        rect.x + 12,
+                        rect.y + 52 + i as i32 * 22,
+                        rect.w - 24,
+                        18,
+                    ));
+                }
             }
+            v
         } else if d.kind == DialogKind::FileInfo {
             (0..5)
                 .map(|i| Rect::new(rect.x + 12 + i * 75, rect.y + 52, 73, 18))
@@ -5072,7 +5395,13 @@ impl App {
     pub(crate) fn open_save_dialog(&mut self, mode: u8, default_name: &str) {
         let mut d = Dialog::new(DialogKind::SaveAs, &self.doc);
         d.save_mode = mode;
-        d.text = default_name.into();
+        d.text = if default_name.contains('/') {
+            default_name.into()
+        } else if let Some((stem, ext)) = default_name.rsplit_once('.') {
+            format!("{stem}.{}", self.ext_case(ext))
+        } else {
+            default_name.into()
+        };
         d.text_focus = true;
         self.dialog = Some(d);
     }
@@ -5586,53 +5915,20 @@ impl App {
             }
         }
         if d.kind == DialogKind::Preferences {
-            let spaces = ["sRGB", "Adobe RGB", "ProPhoto"];
-            for (i, br) in layout.range_buttons.iter().enumerate() {
-                let (label, sel) = match i {
-                    0 => ("General".to_string(), d.fx_page == 0),
-                    1 => ("Shortcuts".to_string(), d.fx_page == 1),
-                    2 => (
-                        if d.opt_a {
-                            "Auto Snapshot: On".to_string()
-                        } else {
-                            "Auto Snapshot: Off".to_string()
-                        },
-                        d.opt_a,
-                    ),
-                    3 => (
-                        if d.opt_b {
-                            "Options Bar: On".to_string()
-                        } else {
-                            "Options Bar: Off".to_string()
-                        },
-                        d.opt_b,
-                    ),
-                    4 => (
-                        if d.opt_c {
-                            "Tooltips: On".to_string()
-                        } else {
-                            "Tooltips: Off".to_string()
-                        },
-                        d.opt_c,
-                    ),
-                    5 => (
-                        if d.opt_d {
-                            "Scroll Wheel Zooms: On".to_string()
-                        } else {
-                            "Scroll Wheel Zooms: Off".to_string()
-                        },
-                        d.opt_d,
-                    ),
-                    _ => (
-                        format!("Default space: {}", spaces[d.fx_a as usize % 3]),
-                        false,
-                    ),
-                };
-                f.button(*br, &label, sel, true);
+            // Header: Prev / pane name / Next (the 7.0 dialog's own
+            // pattern: a pane menu with Next/Prev buttons).
+            let r = layout.rect;
+            let name = PREF_PAGES[d.fx_page % PREF_PAGES.len()];
+            if let Some(br) = layout.range_buttons.first() {
+                f.button(*br, "< Prev", false, true);
             }
-            if d.fx_page == 1 {
+            if let Some(br) = layout.range_buttons.get(1) {
+                f.button(*br, "Next >", false, true);
+            }
+            let nw = Frame::text_width(name, 2);
+            f.text(r.x + (r.w - nw) / 2, r.y + 33, name, 2, ui::TEXT);
+            if d.fx_page == PREF_PAGES.len() - 1 {
                 // Shortcut list: 12 rows, scrollable.
-                let r = layout.rect;
                 for j in 0..12usize {
                     let idx = d.list_offset + j;
                     let Some(def) = self.shortcuts.get(idx) else {
@@ -5644,7 +5940,7 @@ impl App {
                         f.fill_rect(row, ui::ACCENT);
                     }
                     let combo = if def.combo.is_empty() {
-                        "—".to_string()
+                        "\u{2014}".to_string()
                     } else {
                         combo_display(&def.combo)
                     };
@@ -5661,11 +5957,11 @@ impl App {
                     let mut label = label;
                     if Frame::text_width(&label, 1) > max_w {
                         while !label.is_empty()
-                            && Frame::text_width(&format!("{label}…"), 1) > max_w
+                            && Frame::text_width(&format!("{label}\u{2026}"), 1) > max_w
                         {
                             label.pop();
                         }
-                        label.push('…');
+                        label.push('\u{2026}');
                     }
                     f.text(row.x + 4, row.y + 2, &label, 1, tc);
                     f.text(
@@ -5684,7 +5980,7 @@ impl App {
                         r.x + 110,
                         r.y + 242,
                         &format!(
-                            "{} is taken — press it again to steal it.",
+                            "{} is taken \u{2014} press it again to steal it.",
                             combo_display(c)
                         ),
                         1,
@@ -5698,6 +5994,53 @@ impl App {
                         1,
                         ui::TEXT_DIM,
                     );
+                }
+            } else {
+                // Settings rows: label left, control right.
+                let rows = crate::prefs::prefs_page_buttons(d.fx_page);
+                for (j, row) in rows.iter().enumerate() {
+                    let Some(br) = layout.range_buttons.get(j + 2) else {
+                        continue;
+                    };
+                    f.text(br.x + 4, br.y + 3, row.label, 1, ui::TEXT);
+                    let ctl = Rect::new(br.right() - 150, br.y, 140, 18);
+                    match row.kind {
+                        PrefKind::Toggle(k) => {
+                            let idx = crate::prefs::prefs_toggle_idx(row);
+                            let on = d.pref_toggles.get(idx).copied().unwrap_or(false);
+                            let _ = k;
+                            f.button(ctl, if on { "On" } else { "Off" }, on, true);
+                        }
+                        PrefKind::Cycle(k, opts, swatch) => {
+                            let idx = crate::prefs::prefs_cycle_idx(row);
+                            let v = d.pref_cycles.get(idx).copied().unwrap_or(0) as usize
+                                % opts.len().max(1);
+                            let _ = k;
+                            if swatch {
+                                let (name, col) = crate::prefs::COLOR_PRESETS
+                                    [v % crate::prefs::COLOR_PRESETS.len()];
+                                let _ = name;
+                                f.button(ctl, "", false, true);
+                                let sw = Rect::new(ctl.x + 6, ctl.y + 3, 12, 12);
+                                f.fill_rect(sw, col);
+                                f.outline_rect(sw, ui::EDGE_MID);
+                                f.text(ctl.x + 24, ctl.y + 3, opts[v], 1, ui::TEXT);
+                            } else {
+                                let mut label = opts[v].to_string();
+                                let max_w = ctl.w - 12;
+                                if Frame::text_width(&label, 1) > max_w {
+                                    while !label.is_empty()
+                                        && Frame::text_width(&format!("{label}\u{2026}"), 1) > max_w
+                                    {
+                                        label.pop();
+                                    }
+                                    label.push('\u{2026}');
+                                }
+                                f.button(ctl, &label, false, true);
+                            }
+                        }
+                        PrefKind::Slider(..) => {}
+                    }
                 }
             }
         }
@@ -7250,6 +7593,17 @@ impl App {
     /// Type tool: click empty canvas for a new type layer, click
     /// an existing type layer to re-edit it.
     pub(crate) fn open_type_dialog(&mut self, dp: (f32, f32), vertical: bool, mask: bool) {
+        // Type Units (Preferences > Units & Rulers): the Size
+        // slider shows points / pixels / millimeters; the stored
+        // size stays in pixels. k = px per display unit.
+        let res = self.doc.resolution.max(1.0);
+        let k = match self.prefs.type_units {
+            0 => res / 72.0,
+            2 => res / 25.4,
+            _ => 1.0,
+        };
+        // Range: 6..288 pt in display units.
+        let (tmin, tmax) = (6.0 * (res / 72.0) / k, 288.0 * (res / 72.0) / k);
         use pictodesk_core::text::TextSpec;
         let (px, py) = (dp.0.floor() as i32, dp.1.floor() as i32);
         let mut target = None;
@@ -7266,7 +7620,7 @@ impl App {
             d.type_mask = true;
             d.text_focus = true;
             d.vals = vec![
-                s.default_style.size,
+                s.default_style.size / k,
                 0.0,
                 0.0,
                 0.0,
@@ -7278,6 +7632,9 @@ impl App {
                 0.0,
                 0.0,
             ];
+            d.type_unit_k = k;
+            d.type_size_min = tmin;
+            d.type_size_max = tmax;
             d.type_spec = Some(s);
             self.dialog = Some(d);
             return;
@@ -7308,8 +7665,11 @@ impl App {
         };
         d.text = spec.text.clone();
         d.text_focus = true;
+        d.type_unit_k = k;
+        d.type_size_min = tmin;
+        d.type_size_max = tmax;
         d.vals = vec![
-            spec.default_style.size,
+            spec.default_style.size / k,
             spec.default_style.tracking,
             spec.leading,
             0.0,

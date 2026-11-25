@@ -2,12 +2,13 @@
 use super::*;
 use crate::dialogs::{Dialog, DialogKind};
 use crate::panels::{HistRow, HistSource};
-use crate::tools::{BrushDynamics, ChannelView, PaintTarget, Tool};
+use crate::tools::{audio_play, wav_encode, BrushDynamics, ChannelView, PaintTarget, Tool};
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Action {
     New,
     OpenPanel,
+    OpenRecent(usize),
     Save,
     SaveAsPanel,
     HistoryLog,
@@ -243,7 +244,7 @@ pub(crate) enum RecordedStep {
     GaussianBlur(f32),
     Unsharp(f32, f32, u8),
     AddNoise(f32),
-    ImageSize(u32, u32),
+    ImageSize(u32, u32, u8),
     CanvasSize(u32, u32, (i32, i32)),
     Rotate180,
     Rotate90Cw,
@@ -547,7 +548,7 @@ pub(crate) fn step_to_line(step: &RecordedStep) -> Option<String> {
         RecordedStep::AutoLevels => "autolevels".into(),
         RecordedStep::AutoContrast => "autocontrast".into(),
         RecordedStep::AutoColor => "autocolor".into(),
-        RecordedStep::ImageSize(v0, v1) => format!("imagesize {} {}", *v0, *v1),
+        RecordedStep::ImageSize(v0, v1, v2) => format!("imagesize {} {} {}", *v0, *v1, *v2),
         RecordedStep::CanvasSize(w, h, a) => format!("canvassize {w} {h} {} {}", a.0, a.1),
         RecordedStep::Rotate180 => "rot180".into(),
         RecordedStep::Rotate90Cw => "rot90cw".into(),
@@ -967,7 +968,7 @@ pub(crate) fn line_to_step(line: &str) -> Option<RecordedStep> {
         "autolevels" => RecordedStep::AutoLevels,
         "autocontrast" => RecordedStep::AutoContrast,
         "autocolor" => RecordedStep::AutoColor,
-        "imagesize" => RecordedStep::ImageSize(pu(1)?, pu(2)?),
+        "imagesize" => RecordedStep::ImageSize(pu(1)?, pu(2)?, p(3).unwrap_or(1)),
         "canvassize" => RecordedStep::CanvasSize(pu(1)?, pu(2)?, (pi(3)?, pi(4)?)),
         "rot180" => RecordedStep::Rotate180,
         "rot90cw" => RecordedStep::Rotate90Cw,
@@ -1384,6 +1385,8 @@ pub(crate) fn default_shortcuts() -> Vec<ShortcutDef> {
     let cmds: &[(&str, &str, &str)] = &[
         ("undo", "Undo", "primary+z"),
         ("redo", "Redo", "primary+shift+z"),
+        ("step-backward", "Step Backward", "primary+alt+z"),
+        ("preferences", "Preferences…", "primary+k"),
         ("cut", "Cut", "primary+x"),
         ("copy", "Copy", "primary+c"),
         ("paste", "Paste", "primary+v"),
@@ -1422,6 +1425,18 @@ pub(crate) fn default_shortcuts() -> Vec<ShortcutDef> {
         });
     }
     defs
+}
+
+pub(crate) fn load_recent_files() -> Vec<std::path::PathBuf> {
+    let path = pictodesk_dir().join("recent.txt");
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .map(std::path::PathBuf::from)
+        .collect()
 }
 
 pub(crate) fn load_shortcuts() -> Vec<ShortcutDef> {
@@ -2186,7 +2201,7 @@ pub(crate) fn apply_step(doc: &mut Document, step: &RecordedStep, sel: Option<&S
         RecordedStep::GaussianBlur(r) => filter::gaussian_blur(doc, layer, sel, *r),
         RecordedStep::Unsharp(a, r, t) => filter::unsharp_mask(doc, layer, sel, *a, *r, *t),
         RecordedStep::AddNoise(a) => filter::add_noise(doc, layer, sel, *a, 12345),
-        RecordedStep::ImageSize(w, h) => transform::resize_image(doc, *w, *h),
+        RecordedStep::ImageSize(w, h, interp) => transform::resize_image(doc, *w, *h, *interp),
         RecordedStep::CanvasSize(w, h, anchor) => transform::canvas_size(doc, *w, *h, *anchor),
         RecordedStep::Rotate180 => transform::rotate_180(doc),
         RecordedStep::Rotate90Cw => transform::rotate_90_cw(doc),
@@ -2752,7 +2767,7 @@ impl App {
                 };
                 apply_steps(&mut doc, &action.steps, None);
                 let stem = path.file_stem().unwrap_or_default().to_string_lossy();
-                let out = dir.join(format!("{stem}-edited.png"));
+                let out = dir.join(format!("{stem}-edited.{}", self.ext_case("png")));
                 match io::export_image(&doc, ExportFormat::Png, 90) {
                     Ok(png) => {
                         if std::fs::write(&out, png).is_ok() {
@@ -2769,6 +2784,7 @@ impl App {
             "Batch '{}' : {done} file(s) processed, {failed} failed",
             action.name
         );
+        self.beep_done();
     }
 
     pub(crate) fn save_actions_file(&self) {
@@ -2924,6 +2940,7 @@ impl App {
         match result {
             Ok(()) => {
                 self.file_path = Some(path.to_path_buf());
+                self.record_recent(path);
                 self.dirty = false;
                 self.clear_recovery();
                 self.status = format!("Saved {}{}", path.display(), psd_note);
@@ -3016,6 +3033,18 @@ impl App {
                 self.file_panel_purpose = 0;
                 self.open_file_panel();
             }
+            Action::OpenRecent(i) => {
+                let Some(path) = self.recent_files.get(i).cloned() else {
+                    return;
+                };
+                if !path.exists() {
+                    self.recent_files.remove(i);
+                    self.save_recent_files();
+                    self.status = format!("Recent file no longer exists: {}", path.display());
+                    return;
+                }
+                self.open_path(&path);
+            }
             Action::CloseTab => {
                 self.close_tab(self.active_tab);
             }
@@ -3037,7 +3066,7 @@ impl App {
                     .file_path
                     .as_ref()
                     .map(|p| p.display().to_string())
-                    .unwrap_or_else(|| "untitled.pdk".into());
+                    .unwrap_or_else(|| format!("untitled.{}", self.ext_case("pdk")));
                 d.text_focus = true;
                 self.dialog = Some(d);
             }
@@ -3050,10 +3079,13 @@ impl App {
                     .as_ref()
                     .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
                     .unwrap_or_else(|| "untitled".into());
-                let path = PathBuf::from(format!("{name}.png"));
+                let path = PathBuf::from(format!("{name}.{}", self.ext_case("png")));
                 match io::export_image(&self.doc, ExportFormat::Png, 92) {
                     Ok(bytes) => match std::fs::write(&path, bytes) {
-                        Ok(()) => self.status = format!("Exported {}", path.display()),
+                        Ok(()) => {
+                            self.status = format!("Exported {}", path.display());
+                            self.beep_done();
+                        }
                         Err(e) => self.status = format!("Export failed: {e}"),
                     },
                     Err(e) => self.status = format!("Export failed: {e}"),
@@ -3644,6 +3676,30 @@ impl App {
             Action::Paste => {
                 let clip = CLIPBOARD.with(|c| c.borrow().clone());
                 if let Some((block, w, h)) = clip {
+                    // Resize Image During Paste (Preferences >
+                    // General): an oversized block scales down to
+                    // fit the canvas instead of spilling past it.
+                    let (block, w, h) =
+                        if self.prefs.paste_resize && (w > self.doc.width || h > self.doc.height) {
+                            let s = ((self.doc.width as f32 / w as f32)
+                                .min(self.doc.height as f32 / h as f32))
+                            .min(1.0);
+                            let (nw, nh) = (
+                                ((w as f32 * s).round() as u32).max(1),
+                                ((h as f32 * s).round() as u32).max(1),
+                            );
+                            let mut scaled = Vec::with_capacity((nw * nh) as usize);
+                            for yy in 0..nh {
+                                for xx in 0..nw {
+                                    let sx = ((xx as f32 / s).round() as u32).min(w - 1);
+                                    let sy = ((yy as f32 / s).round() as u32).min(h - 1);
+                                    scaled.push(block[(sy * w + sx) as usize]);
+                                }
+                            }
+                            (scaled, nw, nh)
+                        } else {
+                            (block, w, h)
+                        };
                     let tiles = Selection::tiles_in_rect(0, 0, w, h);
                     run_tile_edit(&mut self.doc, &mut self.hist, "Paste", layer, &tiles, |d| {
                         for yy in 0..h as i32 {
@@ -3928,9 +3984,9 @@ impl App {
                     .as_ref()
                     .map(|p| {
                         let stem = p.file_stem().unwrap_or_default().to_string_lossy();
-                        format!("{stem} copy.pdk")
+                        format!("{stem} copy.{}", self.ext_case("pdk"))
                     })
-                    .unwrap_or_else(|| "untitled copy.pdk".into());
+                    .unwrap_or_else(|| format!("untitled copy.{}", self.ext_case("pdk")));
                 d.text_focus = true;
                 self.dialog = Some(d);
             }
@@ -4907,7 +4963,7 @@ impl App {
                     ((img.width as f32 * scale) as u32).max(1),
                     ((img.height as f32 * scale) as u32).max(1),
                 );
-                pictodesk_core::transform::resize_image(&mut small, nw, nh);
+                pictodesk_core::transform::resize_image(&mut small, nw, nh, 1);
             }
             if let Ok(bytes) = io::export_image(&small, ExportFormat::Jpeg, 80) {
                 let _ = std::fs::write(thumbs.join(&thumb_name), bytes);
@@ -5430,7 +5486,7 @@ impl App {
             pictodesk_core::color::WorkingSpace::AdobeRgb => "adobe",
             pictodesk_core::color::WorkingSpace::ProPhoto => "prophoto",
         };
-        let out = format!(
+        let mut out = format!(
             "hist_limit={}\nauto_snapshot={}\noptions_bar={}\ntooltips={}\nzoom_scroll={}\ndefault_space={}\n",
             self.hist.limit().unwrap_or(20),
             self.hist_auto_snapshot as u8,
@@ -5439,6 +5495,7 @@ impl App {
             self.zoom_with_scroll as u8,
             space,
         );
+        out.push_str(&self.prefs.to_lines());
         let _ = std::fs::write(pictodesk_dir().join("prefs.txt"), out);
     }
 
@@ -5468,12 +5525,64 @@ impl App {
                         _ => pictodesk_core::color::WorkingSpace::Srgb,
                     };
                 }
-                _ => {}
+                _ => self.prefs.apply_line(k, v),
             }
         }
     }
 
     /// Persist the shortcut map to ~/.pictodesk/shortcuts.txt.
+    /// Extension case (Preferences > File Handling): the
+    /// case of extensions the app appends to file names it
+    /// suggests (0 = lower, 1 = UPPER).
+    pub(crate) fn ext_case(&self, ext: &str) -> String {
+        if self.prefs.file_ext_case == 1 {
+            ext.to_ascii_uppercase()
+        } else {
+            ext.to_ascii_lowercase()
+        }
+    }
+
+    /// Read the recent-files list (one path per line).
+    pub(crate) fn save_recent_files(&self) {
+        let _ = std::fs::create_dir_all(pictodesk_dir());
+        let mut out = String::new();
+        for p in &self.recent_files {
+            out.push_str(&format!("{}\n", p.display()));
+        }
+        let _ = std::fs::write(pictodesk_dir().join("recent.txt"), out);
+    }
+
+    /// Short completion beep (Preferences > General: Beep
+    /// When Done): a 880 Hz sine, 150 ms, fading out so it
+    /// doesn't click, through the existing cpal audio path.
+    /// Silent when the pref is off or no audio device exists.
+    pub(crate) fn beep_done(&mut self) {
+        if !self.prefs.beep_done {
+            return;
+        }
+        let rate = 22050u32;
+        let n = (rate as f32 * 0.15) as usize;
+        let samples: Vec<f32> = (0..n)
+            .map(|i| {
+                let t = i as f32 / rate as f32;
+                (t * 880.0 * std::f32::consts::TAU).sin() * 0.4 * (1.0 - i as f32 / n as f32)
+            })
+            .collect();
+        if let Ok(stream) = audio_play(&wav_encode(&samples, rate, 1)) {
+            self.audio_out = Some(stream);
+        }
+    }
+
+    /// Record a successfully opened/saved file at the head of
+    /// the recent list (deduped, capped by the pref).
+    pub(crate) fn record_recent(&mut self, path: &Path) {
+        self.recent_files.retain(|p| p != path);
+        self.recent_files.insert(0, path.to_path_buf());
+        let cap = self.prefs.recent_count.max(1) as usize;
+        self.recent_files.truncate(cap);
+        self.save_recent_files();
+    }
+
     pub(crate) fn save_shortcuts_file(&self) {
         let _ = std::fs::create_dir_all(pictodesk_dir());
         let mut out = String::new();
@@ -5503,7 +5612,12 @@ impl App {
             let k = key.chars().next().unwrap_or(' ');
             let group: Vec<Tool> = TOOLS.iter().copied().filter(|t| t.key() == k).collect();
             if !group.is_empty() {
-                if let Some(pos) = group.iter().position(|t| *t == self.tool) {
+                if self.prefs.shift_tool_switch && !self.shift_down {
+                    // Use Shift Key for Tool Switch (PS 7.0 General):
+                    // the plain letter picks the group's first tool;
+                    // only Shift+letter cycles.
+                    self.tool = group[0];
+                } else if let Some(pos) = group.iter().position(|t| *t == self.tool) {
                     self.tool = group[(pos + 1) % group.len()];
                 } else {
                     self.tool = group[0];
@@ -5513,7 +5627,17 @@ impl App {
             return;
         }
         match id {
-            "undo" => self.do_action(Action::Undo),
+            "undo" => {
+                // Redo Key preference (PS 7.0 General): Ctrl+Z
+                // toggles undo/redo, or steps back only.
+                if self.prefs.redo_key == 0 {
+                    self.do_action(Action::UndoToggle)
+                } else {
+                    self.do_action(Action::Undo)
+                }
+            }
+            "step-backward" => self.do_action(Action::Undo),
+            "preferences" => self.do_action(Action::PreferencesDialog),
             "redo" => self.do_action(Action::Redo),
             "cut" => self.do_action(Action::Cut),
             "copy" => self.do_action(Action::Copy),

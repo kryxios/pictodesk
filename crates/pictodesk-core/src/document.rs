@@ -155,6 +155,9 @@ type SetGroup<T> = (u16, crate::blend::BlendMode, f32, T);
 pub struct Document {
     pub width: u32,
     pub height: u32,
+    /// Pixels per inch (metadata for rulers/printing; the
+    /// canvas itself is always pixel-addressed). Default 72.
+    pub resolution: f32,
     pub layers: Vec<Layer>,
     pub active_layer: usize,
     pub working_space: WorkingSpace,
@@ -295,6 +298,7 @@ impl Document {
         Document {
             width,
             height,
+            resolution: 72.0,
             layers: vec![Layer::new("Background")],
             active_layer: 0,
             working_space: WorkingSpace::Srgb,

@@ -140,6 +140,24 @@ impl App {
                 items: vec![
                     MenuItem::new("New...", Action::New).key("N"),
                     MenuItem::new("Open...", Action::OpenPanel).key("O"),
+                    MenuItem::new("Open Recent", Action::None).sub(
+                        if self.recent_files.is_empty() {
+                            vec![MenuItem::new("(No recent files)", Action::None)]
+                        } else {
+                            self.recent_files
+                                .iter()
+                                .enumerate()
+                                .map(|(i, p)| {
+                                    MenuItem::new(
+                                        p.file_name()
+                                            .map(|n| n.to_string_lossy().into_owned())
+                                            .unwrap_or_else(|| p.display().to_string()),
+                                        Action::OpenRecent(i),
+                                    )
+                                })
+                                .collect()
+                        },
+                    ),
                     MenuItem::new("Close", Action::CloseTab).key("W"),
                     MenuItem::new("Save", Action::Save).key("S"),
                     MenuItem::new("Save As...", Action::SaveAsPanel),
