@@ -483,6 +483,56 @@ launched from.
 
 and cursor for screenshots.
 
+## Six fixes (v0.7.1 follow-up, from Mac testing)
+
+- Menus paint last: `draw_menu_bar` (and the tool-preset popup) now draw after `draw_status`, so a dropdown is never covered by the Options Bar or tab bar. Tooltips draw after everything.
+- Panels drag by their whole title row: `panel_strip_mouse` starts a drag from anywhere on a float's header (not only the tab text), and `title_handle_at` covers the full title row for single panels. `compute_drop` checks every strip rect first (float-to-float merge) and only then the dock column, so a float can join another float's group or snap back to the dock; the drop target is highlighted in `ACCENT` while dragging. Layout still persists in `~/.pictodesk/layout.txt`.
+- Scroll: `scroll(dx, dy)` pans the canvas by 24px per notch (Shift+wheel pans horizontally); zoom happens only with the primary modifier held or the "Scroll Wheel Zooms" preference on. The Runner passes both wheel axes; the Layers panel keeps its own wheel scroll.
+- Tab bar auto-hides: `top_y()` adds `TAB_H` only when `tab_count() > 1`, and `draw_tab_bar`/`tab_bar_mouse` early-return with one document, so a single document gets the 24px back.
+- Tooltips: hovering the toolbox or an Options Bar control for 600ms shows `Name (KEY)` (tools) or the control's purpose (Options Bar, via `opt_act_tooltip`). The Runner wakes the loop at the delay with `ControlFlow::WaitUntil`, so the bubble appears without another event. Gated by the "Tooltips" preference.
+- Shortcuts engine: `default_shortcuts()` (one def per tool group + 31 commands), `combo_for_key`/`combo_display` (canonical combos, platform labels), `dispatch_combo`/`run_shortcut`, all driven from a rewritten `key_char` — the old hardcoded match is gone. `~/.pictodesk/shortcuts.txt` persists reassignments. Capturing a taken key asks first; pressing it again steals it (the other entry is cleared). Preferences (`Edit > Preferences...`) is two pages: General (history states, auto snapshot, Options Bar, tooltips, scroll-wheel zoom, default working space — now persisted in `~/.pictodesk/prefs.txt`) and Shortcuts (12-row scrollable list, click a row and press a key, Backspace clears, Reset All restores defaults; long group names truncate with an ellipsis).
+- A real pre-existing bug found by the Preferences work: an unguarded range-button loop in `mouse_down` returned on any range-button click, so the later Block A loop (Fade, StrokeSel, FileInfo, NewLayer, Preferences, and others) was dead code — those dialogs' range buttons never worked on a real click. The loop is now gated to the seven dialogs it owns (ColorBalance, Fill, HistoryOptions, PhotoFilter, Blending, GradientMap, Liquify).
+- Test hygiene: the phase65test Preferences block used to leave `options_bar=0` in the real `~/.pictodesk/prefs.txt`, which broke the later Options Bar checks; it now restores the bar and re-saves.
+
+## Module split (v0.7.1 follow-up, unpushed)
+
+The app shell was one 30,900-line `main.rs`; it is now a 1,234-line root plus
+eleven modules, one `impl App` block each (the root keeps the `App` struct,
+`App::new`, `main`, `demo_document`, `pictodesk_dir`, all constants and type
+aliases, and the small widely-used helpers). Moved methods are `pub(crate)`;
+moved types are `pub(crate)` with `pub(crate)` fields; each module starts
+with `use super::*` plus targeted `use crate::<module>::{...}` imports
+(`cargo fix` prunes the unused ones). Child modules can use the root's
+private items (descendant privacy rule), so no `App` field needed widening.
+No behavior changed: 268 workspace tests, clippy clean, and all six
+headless suites pass after the split.
+
+- `tabs.rs` (512): `DocTab` + the tab bar and tab switching.
+- `file_panel.rs` (269): the Open panel, folder navigation, file loaders.
+- `panels.rs` (3,417): panel slots/strips/grouping/layout + every panel's
+  draw/click code, snapshots, workspaces, tool presets.
+- `dialogs.rs` (7,953): `DialogKind`/`Dialog`, layout, drawing, and every
+  dialog's OK path, including spell check, find/replace, File Browser,
+  Liquify, and the note-audio capture/playback.
+- `menus.rs` (887): `MenuItem`/`Menu`/`OptAct`, the menu builder, dropdowns.
+- `actions.rs` (5,625): `Action`, recorded steps, shortcuts, persistence
+  codecs, exports, print, and `do_action`.
+- `tools.rs` (2,240): `Tool`, brush dynamics, strokes, free transform,
+  paths, shapes, Extract, and the audio-note free functions.
+- `input.rs` (3,028): mouse, keyboard, wheel, context menu.
+- `render.rs` (1,994): the frame, canvas, rulers, toolbox, Options Bar,
+  menu bar, status, and `draw_tool_icon`.
+- `runner.rs` (605): `Gpu`, `Runner`, the winit event loop, `run_window`.
+- `headless.rs` (3,230): `run_shot` + `write_ppm` (all `--phaseNtest` suites).
+
+The split tooling lives outside the repo at `~/workspace/pictodesk-split/`
+(`split.py`, `fix_imports.py`, one JSON spec per module), and the pre-split
+`main.rs` is backed up at `~/workspace/pictodesk-backup/main.rs.pre-split-0.7.1-fixes`.
+Two parser notes: the inventory script counted the WGSL `SHADER` raw string
+wrong (its span swallowed `struct Gpu`), so that span was patched by hand;
+and `impl Trait for Type` methods take no visibility qualifier (the first
+`menus.rs` attempt proved it).
+
 ## Phase 7 additions (v0.7.0)
 
 - Healing is texture transfer, not blurring: a heal stamp or
