@@ -241,6 +241,8 @@ const TOOLS: [Tool; 50] = [
 ];
 
 pub const DOCK_W: i32 = 216;
+/// Document tab bar height (always shown in standard mode).
+pub const TAB_H: i32 = 24;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum FtDrag {
@@ -304,6 +306,77 @@ enum PanelKind {
     Info,
 }
 
+impl PanelKind {
+    fn title(self) -> &'static str {
+        match self {
+            PanelKind::Cp => "Layers",
+            PanelKind::Brushes => "Brushes",
+            PanelKind::ToolPresets => "Tool Presets",
+            PanelKind::Histogram => "Histogram",
+            PanelKind::Color => "Color",
+            PanelKind::Navigator => "Navigator",
+            PanelKind::Actions => "Actions",
+            PanelKind::History => "History",
+            PanelKind::Info => "Info",
+        }
+    }
+
+    fn from_title(t: &str) -> Option<PanelKind> {
+        Some(match t {
+            "Layers" => PanelKind::Cp,
+            "Brushes" => PanelKind::Brushes,
+            "Tool Presets" => PanelKind::ToolPresets,
+            "Histogram" => PanelKind::Histogram,
+            "Color" => PanelKind::Color,
+            "Navigator" => PanelKind::Navigator,
+            "Actions" => PanelKind::Actions,
+            "History" => PanelKind::History,
+            "Info" => PanelKind::Info,
+            _ => return None,
+        })
+    }
+
+    fn all() -> [PanelKind; 9] {
+        [
+            PanelKind::Cp,
+            PanelKind::Brushes,
+            PanelKind::ToolPresets,
+            PanelKind::Histogram,
+            PanelKind::Color,
+            PanelKind::Navigator,
+            PanelKind::Actions,
+            PanelKind::History,
+            PanelKind::Info,
+        ]
+    }
+}
+
+/// Height of a panel tab strip / float header bar.
+const PANEL_TAB_H: i32 = 16;
+
+/// A tab group of panels: one or more kinds sharing one rect, with
+/// the active kind visible. Docked groups stack in the dock column;
+/// floating groups have their own rect.
+#[derive(Clone, Debug)]
+struct PanelSlot {
+    kinds: Vec<PanelKind>,
+    active: usize,
+}
+
+/// Where a panel group lives.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum SlotLoc {
+    Dock(usize),
+    Float(usize),
+}
+
+/// Drop target highlighted while a panel is dragged.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum PanelDrop {
+    Merge(SlotLoc),
+    DockAt(i32),
+}
+
 /// Which frozen moment the History Brush paints from: a history
 /// state (by index) or a snapshot (by index).
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -338,6 +411,7 @@ enum Action {
     HistoryLog,
     ExportPng,
     Revert,
+    CloseTab,
     Quit,
     UndoToggle,
     Cut,
@@ -717,6 +791,7 @@ enum DialogKind {
     InsertStop,
     InsertMenuItem,
     ActionStop,
+    ConfirmClose,
     FtNumeric,
     // Phase 6 kinds.
     Blending,
@@ -887,6 +962,7 @@ impl DialogKind {
             DialogKind::InsertStop => "Insert Stop",
             DialogKind::InsertMenuItem => "Insert Menu Item",
             DialogKind::ActionStop => "Action Paused",
+            DialogKind::ConfirmClose => "Close without saving?",
             DialogKind::FtNumeric => "Free Transform",
             DialogKind::Blending => "Blending Options",
             DialogKind::Liquify => "Liquify",
@@ -1129,6 +1205,7 @@ struct Dialog {
 impl Dialog {
     fn new(kind: DialogKind, doc: &Document) -> Self {
         let vals = match kind {
+            DialogKind::ConfirmClose => vec![],
             DialogKind::SaveWorkspace
             | DialogKind::RenameItem
             | DialogKind::FileBrowser
@@ -1412,7 +1489,8 @@ impl Dialog {
             | DialogKind::RenameItem
             | DialogKind::FileBrowser
             | DialogKind::SpellCheck
-            | DialogKind::FindReplace => {
+            | DialogKind::FindReplace
+            | DialogKind::ConfirmClose => {
                 vec![]
             }
             DialogKind::BrightnessContrast => {
@@ -3413,6 +3491,33 @@ fn pictodesk_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(home).join(".pictodesk")
 }
 
+/// Folder the Open panel starts in: the last folder used, else
+/// the user's Pictures folder when it exists, else ".".
+fn last_open_dir() -> std::path::PathBuf {
+    let saved = pictodesk_dir().join("last-dir.txt");
+    if let Ok(text) = std::fs::read_to_string(&saved) {
+        let p = std::path::PathBuf::from(text.trim());
+        if p.is_dir() {
+            return p;
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    let pictures = std::path::PathBuf::from(home).join("Pictures");
+    if pictures.is_dir() {
+        pictures
+    } else {
+        std::path::PathBuf::from(".")
+    }
+}
+
+fn save_last_open_dir(dir: &std::path::Path) {
+    let _ = std::fs::create_dir_all(pictodesk_dir());
+    let _ = std::fs::write(
+        pictodesk_dir().join("last-dir.txt"),
+        dir.display().to_string(),
+    );
+}
+
 /// Tool Presets on disk: one per line, tab-separated, the
 /// dynamics block hex-encoded (the .ABR v2 layout).
 fn load_tool_presets() -> Vec<ToolPreset> {
@@ -4993,6 +5098,96 @@ fn is_filter_step(step: &RecordedStep) -> bool {
     )
 }
 
+/// One open document, as stashed while another tab is active.
+/// The live fields on App are the active tab's working copy;
+/// switching tabs swaps them with the stored one (mem::swap),
+/// so every per-document value — history, selection, zoom,
+/// render cache, autosave bookkeeping — travels with its doc.
+/// Tool/palette/panel state stays global on App.
+struct DocTab {
+    doc: Document,
+    hist: History,
+    sel: Option<Selection>,
+    clone_src: Option<(f32, f32)>,
+    heal_src: Option<(f32, f32)>,
+    viewport: Viewport,
+    file_path: Option<PathBuf>,
+    name: String,
+    dirty: bool,
+    status: String,
+    last_label: Option<String>,
+    active_path: Option<PathRef>,
+    pen_anchor: Option<(usize, usize)>,
+    snapshots: Vec<Snapshot>,
+    hist_scroll: usize,
+    hist_selected: Option<HistRow>,
+    hist_source: HistSource,
+    hist_src_cache: Option<(HistSource, usize, usize, Document)>,
+    measure: Option<((f32, f32), (f32, f32))>,
+    fade_source: Option<FadeSource>,
+    split_docs: Vec<(String, pictodesk_core::document::Document)>,
+    quick_mask: bool,
+    autosave_at: std::time::Instant,
+    autosaved_version: u64,
+    recovery_file: Option<PathBuf>,
+    doc_version: u64,
+    cached_render: Vec<u8>,
+    cached_size: (u32, u32),
+    rendered_version: u64,
+    last_ft: Option<LastFt>,
+    layers_scroll: usize,
+    channel_view: ChannelView,
+    paint_target: PaintTarget,
+    slice_selected: Option<usize>,
+}
+
+impl DocTab {
+    /// Placeholder values used while a tab's real state lives
+    /// in the App's live fields (swap target only — a placeholder
+    /// tab is never drawn or saved).
+    fn placeholder() -> Self {
+        DocTab {
+            doc: Document::new(1, 1),
+            hist: History::new(),
+            sel: None,
+            clone_src: None,
+            heal_src: None,
+            viewport: Viewport {
+                scale: 1.0,
+                offset: (0.0, 0.0),
+            },
+            file_path: None,
+            name: String::new(),
+            dirty: false,
+            status: String::new(),
+            last_label: None,
+            active_path: None,
+            pen_anchor: None,
+            snapshots: Vec::new(),
+            hist_scroll: 0,
+            hist_selected: None,
+            hist_source: HistSource::State(0),
+            hist_src_cache: None,
+            measure: None,
+            fade_source: None,
+            split_docs: Vec::new(),
+            quick_mask: false,
+            autosave_at: std::time::Instant::now(),
+            autosaved_version: 0,
+            recovery_file: None,
+            doc_version: 0,
+            cached_render: Vec::new(),
+            cached_size: (0, 0),
+            rendered_version: u64::MAX,
+            last_ft: None,
+            layers_scroll: 0,
+            channel_view: ChannelView::Composite,
+            paint_target: PaintTarget::Image,
+            slice_selected: None,
+        }
+    }
+}
+
 struct App {
     doc: Document,
     hist: History,
@@ -5173,6 +5368,16 @@ struct App {
     palette: Vec<(u8, u8, u8)>,
     brush_presets: Vec<BrushPreset>,
     tool_presets: Vec<ToolPreset>,
+    /// Docked tab groups, top-down; floats: (slot, x, y, w).
+    dock_slots: Vec<PanelSlot>,
+    float_slots: Vec<(PanelSlot, i32, i32, i32)>,
+    /// Panel drag in progress: float index + grab offset.
+    panel_drag: Option<(usize, i32, i32)>,
+    /// Pressed on a tab/title, not yet past the drag threshold:
+    /// (kind, slot, down x, down y).
+    panel_pending: Option<(PanelKind, SlotLoc, i32, i32)>,
+    /// Drop target highlighted while dragging a panel.
+    panel_drop: Option<PanelDrop>,
     show_tool_presets: bool,
     tool_preset_popup: bool,
     workspaces: Vec<(String, Workspace)>,
@@ -5187,7 +5392,22 @@ struct App {
     /// Guide being dragged out of a ruler, or an existing guide
     /// being moved: (vertical?, doc position, existing index).
     guide_drag: Option<(bool, i32, Option<usize>)>,
+    /// Open documents other than the active one, in tab-bar
+    /// order (the active tab's state lives in App's live fields).
+    tabs: Vec<DocTab>,
+    /// Position of the active tab in the bar (0..=tabs.len()).
+    active_tab: usize,
+    /// Name shown for the active tab (its DocTab holds the
+    /// inactive tabs' names).
+    doc_name: String,
+    /// Close-confirm dialog waiting on this tab-bar index.
+    pending_close: Option<usize>,
     file_panel: Option<Vec<PathBuf>>,
+    /// Subdirectories of the file panel's current folder.
+    file_panel_dirs: Vec<PathBuf>,
+    /// Folder the file panel is showing (navigable; persisted
+    /// as the last-used open folder).
+    file_panel_dir: PathBuf,
     /// What a file-panel click means: 0 open document,
     /// 1 displacement map, 2 texture fill.
     file_panel_purpose: u8,
@@ -5242,6 +5462,11 @@ impl App {
         let saved_workspaces = load_workspaces();
         let mut hist = History::new();
         hist.set_limit(Some(20)); // Phase 5: the History panel's default depth
+        let doc_name = file_path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Untitled".into());
         let mut app = App {
             doc,
             hist,
@@ -5361,6 +5586,11 @@ impl App {
             show_tool_presets: false,
             tool_preset_popup: false,
             workspaces: saved_workspaces,
+            dock_slots: Vec::new(),
+            float_slots: Vec::new(),
+            panel_drag: None,
+            panel_pending: None,
+            panel_drop: None,
             brush_presets: [1.0f32, 3.0, 5.0, 9.0, 13.0, 21.0, 35.0, 50.0]
                 .iter()
                 .map(|sz| BrushPreset {
@@ -5385,7 +5615,13 @@ impl App {
             action_set: "Default Set".to_string(),
             context_menu: None,
             guide_drag: None,
+            tabs: Vec::new(),
+            active_tab: 0,
+            doc_name,
+            pending_close: None,
             file_panel: None,
+            file_panel_dirs: Vec::new(),
+            file_panel_dir: last_open_dir(),
             file_panel_purpose: 0,
             pending_displace: None,
             cursor: (0.0, 0.0),
@@ -5421,6 +5657,9 @@ impl App {
             quit: false,
         };
         app.reset_hist_for_new_doc();
+        app.sync_panel_slots();
+        app.load_panel_layout();
+        app.sync_panel_slots();
         app
     }
 
@@ -5530,7 +5769,8 @@ impl App {
         } else {
             0
         };
-        menu + options
+        let tabs = if self.display_mode == 0 { TAB_H } else { 0 };
+        menu + options + tabs
     }
 
     fn canvas_rect(&self, win_w: u32, win_h: u32) -> Rect {
@@ -5588,63 +5828,640 @@ impl App {
         (if self.doc.work_path.is_some() { 1 } else { 0 }) + self.doc.paths.len()
     }
 
-    /// The dock's panel groups, stacked top-down on the right edge.
-    fn panel_groups(&self) -> Vec<(PanelKind, Rect)> {
-        let mut out = Vec::new();
-        if !self.dock_open() || self.display_mode > 0 {
-            return out;
+    /// Whether a panel kind is currently shown (Window menu flags).
+    fn panel_visible(&self, kind: PanelKind) -> bool {
+        match kind {
+            PanelKind::Cp => self.show_cp,
+            PanelKind::Brushes => self.show_brushes,
+            PanelKind::ToolPresets => self.show_tool_presets,
+            PanelKind::Histogram => self.show_histogram,
+            PanelKind::Color => self.show_palette,
+            PanelKind::Navigator => self.show_navigator,
+            PanelKind::Actions => self.show_actions,
+            PanelKind::History => self.show_history,
+            PanelKind::Info => self.show_info,
         }
-        let x = self.win_size.0 as i32 - DOCK_W;
-        let bottom = self.win_size.1 as i32 - ui::STATUS_H;
-        let mut y = self.top_y();
-        let place = |kind: PanelKind, h: i32, out: &mut Vec<(PanelKind, Rect)>, y: &mut i32| {
-            if *y + h <= bottom {
-                out.push((kind, Rect::new(x, *y, DOCK_W, h)));
-                *y += h + 2;
-            }
-        };
-        if self.show_cp {
-            let h = match self.cp_tab {
+    }
+
+    fn set_panel_visible(&mut self, kind: PanelKind, v: bool) {
+        match kind {
+            PanelKind::Cp => self.show_cp = v,
+            PanelKind::Brushes => self.show_brushes = v,
+            PanelKind::ToolPresets => self.show_tool_presets = v,
+            PanelKind::Histogram => self.show_histogram = v,
+            PanelKind::Color => self.show_palette = v,
+            PanelKind::Navigator => self.show_navigator = v,
+            PanelKind::Actions => self.show_actions = v,
+            PanelKind::History => self.show_history = v,
+            PanelKind::Info => self.show_info = v,
+        }
+    }
+
+    /// Height of one panel's content (without its tab strip).
+    fn panel_height(&self, kind: PanelKind) -> i32 {
+        match kind {
+            PanelKind::Cp => match self.cp_tab {
                 0 => 70 + self.doc.layers.len().min(8) as i32 * self.layer_row_h(),
                 1 => 20 + self.channel_row_count() as i32 * 15 + 22,
                 _ => 20 + self.path_row_count().max(1) as i32 * 15 + 42,
-            };
-            place(PanelKind::Cp, h, &mut out, &mut y);
+            },
+            PanelKind::Brushes => self.brushes_panel_h(),
+            PanelKind::ToolPresets => 24 + self.tool_presets.len().min(10) as i32 * 15 + 20,
+            PanelKind::Histogram => 132,
+            PanelKind::Color => 186,
+            PanelKind::Navigator => 128,
+            PanelKind::Actions => {
+                if self.actions_button_mode {
+                    20 + self.actions.len().min(8) as i32 * 19 + 24
+                } else {
+                    let rows = self.action_rows().len().max(1);
+                    20 + rows.min(6) as i32 * 15 + 58 + 20
+                }
+            }
+            PanelKind::History => {
+                let rows = self.snapshots.len() + self.hist.state_count() + 1;
+                20 + rows.min(9) as i32 * 15 + 38
+            }
+            PanelKind::Info => 118,
         }
-        if self.show_brushes {
-            place(PanelKind::Brushes, self.brushes_panel_h(), &mut out, &mut y);
+    }
+
+    /// The dock's panel groups, stacked top-down on the right edge,
+    /// plus floating groups. Each entry is the ACTIVE kind of its
+    /// slot with its content rect (below the tab strip, if any).
+    /// Single-kind docked slots have no strip, so their rect is
+    /// exactly the classic one.
+    fn panel_groups(&self) -> Vec<(PanelKind, Rect)> {
+        let mut out = Vec::new();
+        if self.display_mode > 0 {
+            return out;
         }
-        if self.show_tool_presets {
-            let h = 24 + self.tool_presets.len().min(10) as i32 * 15 + 20;
-            place(PanelKind::ToolPresets, h, &mut out, &mut y);
+        if self.dock_open() {
+            let x = self.win_size.0 as i32 - DOCK_W;
+            let bottom = self.win_size.1 as i32 - ui::STATUS_H;
+            let mut y = self.top_y();
+            for slot in &self.dock_slots {
+                let kind = slot.kinds[slot.active];
+                let strip = if slot.kinds.len() > 1 { PANEL_TAB_H } else { 0 };
+                let h = self.panel_height(kind);
+                if y + strip + h <= bottom {
+                    out.push((kind, Rect::new(x, y + strip, DOCK_W, h)));
+                    y += strip + h + 2;
+                }
+            }
         }
-        if self.show_histogram {
-            place(PanelKind::Histogram, 132, &mut out, &mut y);
-        }
-        if self.show_palette {
-            place(PanelKind::Color, 186, &mut out, &mut y);
-        }
-        if self.show_navigator {
-            place(PanelKind::Navigator, 128, &mut out, &mut y);
-        }
-        if self.show_actions {
-            let h = if self.actions_button_mode {
-                20 + self.actions.len().min(8) as i32 * 19 + 24
-            } else {
-                let rows = self.action_rows().len().max(1);
-                20 + rows.min(6) as i32 * 15 + 58 + 20
-            };
-            place(PanelKind::Actions, h, &mut out, &mut y);
-        }
-        if self.show_history {
-            let rows = self.snapshots.len() + self.hist.state_count() + 1;
-            let h = 20 + rows.min(9) as i32 * 15 + 38;
-            place(PanelKind::History, h, &mut out, &mut y);
-        }
-        if self.show_info {
-            place(PanelKind::Info, 118, &mut out, &mut y);
+        for (slot, fx, fy, fw) in &self.float_slots {
+            let kind = slot.kinds[slot.active];
+            out.push((
+                kind,
+                Rect::new(*fx, *fy + PANEL_TAB_H, *fw, self.panel_height(kind)),
+            ));
         }
         out
+    }
+
+    /// Which slot holds a kind, if any.
+    fn slot_of(&self, kind: PanelKind) -> Option<SlotLoc> {
+        for (i, slot) in self.dock_slots.iter().enumerate() {
+            if slot.kinds.contains(&kind) {
+                return Some(SlotLoc::Dock(i));
+            }
+        }
+        for (i, (slot, _, _, _)) in self.float_slots.iter().enumerate() {
+            if slot.kinds.contains(&kind) {
+                return Some(SlotLoc::Float(i));
+            }
+        }
+        None
+    }
+
+    fn slot_active_kind(&self, loc: SlotLoc) -> PanelKind {
+        match loc {
+            SlotLoc::Dock(i) => self.dock_slots[i].kinds[self.dock_slots[i].active],
+            SlotLoc::Float(i) => self.float_slots[i].0.kinds[self.float_slots[i].0.active],
+        }
+    }
+
+    fn set_slot_active(&mut self, loc: SlotLoc, kind: PanelKind) {
+        match loc {
+            SlotLoc::Dock(i) => {
+                if let Some(slot) = self.dock_slots.get_mut(i) {
+                    if let Some(pos) = slot.kinds.iter().position(|k| *k == kind) {
+                        slot.active = pos;
+                    }
+                }
+            }
+            SlotLoc::Float(i) => {
+                if let Some((slot, _, _, _)) = self.float_slots.get_mut(i) {
+                    if let Some(pos) = slot.kinds.iter().position(|k| *k == kind) {
+                        slot.active = pos;
+                    }
+                }
+            }
+        }
+        self.save_panel_layout();
+    }
+
+    /// Reconcile slots with the Window-menu visibility flags: drop
+    /// hidden kinds (and empty slots), append newly shown kinds as
+    /// their own docked slots. Called every frame from draw(), so
+    /// every toggle path is covered.
+    fn sync_panel_slots(&mut self) {
+        // Snapshot visibility first: the retain closures below
+        // cannot borrow self while the slots are mutably borrowed.
+        let visible: [bool; 9] = [
+            self.show_cp,
+            self.show_brushes,
+            self.show_tool_presets,
+            self.show_histogram,
+            self.show_palette,
+            self.show_navigator,
+            self.show_actions,
+            self.show_history,
+            self.show_info,
+        ];
+        for slot in self
+            .dock_slots
+            .iter_mut()
+            .chain(self.float_slots.iter_mut().map(|(s, _, _, _)| s))
+        {
+            slot.kinds.retain(|k| visible[*k as usize]);
+            if slot.active >= slot.kinds.len() {
+                slot.active = slot.kinds.len().saturating_sub(1);
+            }
+        }
+        self.dock_slots.retain(|s| !s.kinds.is_empty());
+        self.float_slots.retain(|(s, _, _, _)| !s.kinds.is_empty());
+        for kind in PanelKind::all() {
+            if self.panel_visible(kind) && self.slot_of(kind).is_none() {
+                self.dock_slots.push(PanelSlot {
+                    kinds: vec![kind],
+                    active: 0,
+                });
+            }
+        }
+    }
+
+    /// Rects of tab strips (multi-kind dock slots) and float headers.
+    fn panel_strip_rects(&self) -> Vec<(SlotLoc, Rect)> {
+        let mut out = Vec::new();
+        if self.display_mode > 0 {
+            return out;
+        }
+        if self.dock_open() {
+            let x = self.win_size.0 as i32 - DOCK_W;
+            let bottom = self.win_size.1 as i32 - ui::STATUS_H;
+            let mut y = self.top_y();
+            for (i, slot) in self.dock_slots.iter().enumerate() {
+                let kind = slot.kinds[slot.active];
+                let strip = if slot.kinds.len() > 1 { PANEL_TAB_H } else { 0 };
+                let h = self.panel_height(kind);
+                if strip > 0 && y + strip + h <= bottom {
+                    out.push((SlotLoc::Dock(i), Rect::new(x, y, DOCK_W, PANEL_TAB_H)));
+                }
+                y += strip + h + 2;
+            }
+        }
+        for (i, (_, fx, fy, fw)) in self.float_slots.iter().enumerate() {
+            out.push((SlotLoc::Float(i), Rect::new(*fx, *fy, *fw, PANEL_TAB_H)));
+        }
+        out
+    }
+
+    /// Which tab of a strip sits under x (excluding a float
+    /// header's dock/close buttons).
+    fn strip_tab_at(&self, loc: SlotLoc, mx: i32, my: i32) -> Option<PanelKind> {
+        let slot = match loc {
+            SlotLoc::Dock(i) => &self.dock_slots[i],
+            SlotLoc::Float(i) => &self.float_slots[i].0,
+        };
+        let (_, strip) = self
+            .panel_strip_rects()
+            .into_iter()
+            .find(|(l, _)| *l == loc)?;
+        let mut x = strip.x + 2;
+        for kind in &slot.kinds {
+            let tw = Frame::text_width(kind.title(), 1);
+            let tr = Rect::new(x, strip.y + 2, tw + 14, PANEL_TAB_H - 4);
+            if tr.contains(mx, my) {
+                return Some(*kind);
+            }
+            x += tr.w + 2;
+        }
+        None
+    }
+
+    /// Drag handle of a single docked panel: its title-label zone
+    /// (for Cp, the active Layers/Channels/Paths tab). Multi-kind
+    /// slots and floats are handled by their strips instead.
+    fn title_handle_at(&self, mx: i32, my: i32) -> Option<(PanelKind, SlotLoc)> {
+        for (kind, r) in self.panel_groups() {
+            let Some(loc) = self.slot_of(kind) else {
+                continue;
+            };
+            let multi = match loc {
+                SlotLoc::Dock(i) => self.dock_slots[i].kinds.len() > 1,
+                SlotLoc::Float(_) => true,
+            };
+            if multi {
+                continue;
+            }
+            let handle = if kind == PanelKind::Cp {
+                Self::cp_tab_rect(r, self.cp_tab)
+            } else {
+                let tw = Frame::text_width(kind.title(), 1);
+                Rect::new(r.x + 2, r.y, tw + 14, 16)
+            };
+            if handle.contains(mx, my) {
+                return Some((kind, loc));
+            }
+        }
+        None
+    }
+
+    /// Draw tab strips and float headers (after the panels).
+    fn draw_panel_strips(&mut self, f: &mut Frame) {
+        for (loc, r) in self.panel_strip_rects() {
+            let (slot, is_float) = match loc {
+                SlotLoc::Dock(i) => (&self.dock_slots[i], false),
+                SlotLoc::Float(i) => (&self.float_slots[i].0, true),
+            };
+            f.fill_rect(r, ui::DARK);
+            let mut x = r.x + 2;
+            for (i, kind) in slot.kinds.iter().enumerate() {
+                let tw = Frame::text_width(kind.title(), 1);
+                let tr = Rect::new(x, r.y + 2, tw + 14, PANEL_TAB_H - 4);
+                if i == slot.active {
+                    f.fill_rect(tr, ui::PLATINUM);
+                    f.text(tr.x + 7, tr.y + 2, kind.title(), 1, ui::TEXT);
+                } else {
+                    f.text(tr.x + 7, tr.y + 2, kind.title(), 1, ui::TEXT_DIM);
+                }
+                x += tr.w + 2;
+            }
+            if is_float {
+                // Dock button (square outline) and close button (x).
+                let dock = Rect::new(r.right() - 32, r.y + 4, 10, 10);
+                let close = Rect::new(r.right() - 16, r.y + 2, 14, PANEL_TAB_H - 4);
+                f.outline_rect(dock, ui::TEXT_DIM);
+                f.text(close.x + 4, close.y + 2, "x", 1, ui::TEXT_DIM);
+            }
+            f.fill_rect(Rect::new(r.x, r.bottom() - 1, r.w, 1), ui::EDGE);
+        }
+        // Drop highlight while dragging a panel.
+        if let Some(drop) = self.panel_drop {
+            match drop {
+                PanelDrop::Merge(loc) => {
+                    if let Some((_, r)) = self
+                        .panel_strip_rects()
+                        .into_iter()
+                        .find(|(l, _)| *l == loc)
+                    {
+                        f.outline_rect(r, ui::ACCENT);
+                    }
+                }
+                PanelDrop::DockAt(y) => {
+                    f.fill_rect(
+                        Rect::new(self.win_size.0 as i32 - DOCK_W, y - 1, DOCK_W, 2),
+                        ui::ACCENT,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Press on a strip/header: tab switch, float dock/close, or
+    /// start a pending drag.
+    fn panel_strip_mouse(&mut self, mx: i32, my: i32) -> bool {
+        if self.display_mode > 0 {
+            return false;
+        }
+        let Some((loc, strip)) = self
+            .panel_strip_rects()
+            .into_iter()
+            .find(|(_, r)| r.contains(mx, my))
+        else {
+            return false;
+        };
+        if let SlotLoc::Float(_) = loc {
+            let close = Rect::new(strip.right() - 16, strip.y + 2, 14, PANEL_TAB_H - 4);
+            let dock = Rect::new(strip.right() - 32, strip.y + 2, 14, PANEL_TAB_H - 4);
+            if close.contains(mx, my) {
+                self.hide_panel_slot(loc);
+                return true;
+            }
+            if dock.contains(mx, my) {
+                self.redock_slot(loc);
+                return true;
+            }
+        }
+        if let Some(kind) = self.strip_tab_at(loc, mx, my) {
+            if kind != self.slot_active_kind(loc) {
+                self.set_slot_active(loc, kind);
+                return true;
+            }
+            self.panel_pending = Some((kind, loc, mx, my));
+            return true;
+        }
+        false
+    }
+
+    /// Press on a single docked panel's title label: pending drag.
+    fn panel_title_mouse(&mut self, mx: i32, my: i32) -> bool {
+        if self.display_mode > 0 {
+            return false;
+        }
+        let Some((kind, loc)) = self.title_handle_at(mx, my) else {
+            return false;
+        };
+        self.panel_pending = Some((kind, loc, mx, my));
+        true
+    }
+
+    /// Move a kind into its own float at (x, y).
+    fn float_panel(&mut self, kind: PanelKind, x: i32, y: i32) {
+        let Some(loc) = self.slot_of(kind) else {
+            return;
+        };
+        self.remove_from_slot(kind, loc);
+        self.float_slots.push((
+            PanelSlot {
+                kinds: vec![kind],
+                active: 0,
+            },
+            x,
+            y,
+            DOCK_W,
+        ));
+    }
+
+    fn remove_from_slot(&mut self, kind: PanelKind, loc: SlotLoc) {
+        match loc {
+            SlotLoc::Dock(i) => {
+                if let Some(slot) = self.dock_slots.get_mut(i) {
+                    slot.kinds.retain(|k| *k != kind);
+                    if slot.active >= slot.kinds.len() {
+                        slot.active = slot.kinds.len().saturating_sub(1);
+                    }
+                }
+            }
+            SlotLoc::Float(i) => {
+                if let Some((slot, _, _, _)) = self.float_slots.get_mut(i) {
+                    slot.kinds.retain(|k| *k != kind);
+                    if slot.active >= slot.kinds.len() {
+                        slot.active = slot.kinds.len().saturating_sub(1);
+                    }
+                }
+            }
+        }
+        self.dock_slots.retain(|s| !s.kinds.is_empty());
+        self.float_slots.retain(|(s, _, _, _)| !s.kinds.is_empty());
+    }
+
+    /// Group kind b into kind a's slot (b becomes active).
+    fn group_panels(&mut self, a: PanelKind, b: PanelKind) {
+        let (Some(lb), Some(la)) = (self.slot_of(b), self.slot_of(a)) else {
+            return;
+        };
+        if la == lb {
+            return;
+        }
+        self.remove_from_slot(b, lb);
+        let Some(la2) = self.slot_of(a) else {
+            return;
+        };
+        match la2 {
+            SlotLoc::Dock(i) => {
+                let slot = &mut self.dock_slots[i];
+                slot.kinds.push(b);
+                slot.active = slot.kinds.len() - 1;
+            }
+            SlotLoc::Float(i) => {
+                let (slot, _, _, _) = &mut self.float_slots[i];
+                slot.kinds.push(b);
+                slot.active = slot.kinds.len() - 1;
+            }
+        }
+        self.save_panel_layout();
+    }
+
+    /// Detach a kind into a float under the cursor; returns the
+    /// float index and the grab offset within its header.
+    fn detach_panel(
+        &mut self,
+        kind: PanelKind,
+        loc: SlotLoc,
+        press_x: i32,
+        press_y: i32,
+        cur_x: i32,
+        cur_y: i32,
+    ) -> (usize, i32, i32) {
+        // Grab offset from the strip/title the press landed on.
+        let (gx, gy) = match loc {
+            SlotLoc::Dock(i) if self.dock_slots[i].kinds.len() > 1 => {
+                let (_, strip) = self
+                    .panel_strip_rects()
+                    .into_iter()
+                    .find(|(l, _)| *l == loc)
+                    .unwrap();
+                (press_x - strip.x, press_y - strip.y)
+            }
+            SlotLoc::Float(_) => {
+                let (_, strip) = self
+                    .panel_strip_rects()
+                    .into_iter()
+                    .find(|(l, _)| *l == loc)
+                    .unwrap();
+                (press_x - strip.x, press_y - strip.y)
+            }
+            _ => {
+                // Single docked panel: grab offset from its title handle.
+                let (_, r) = self
+                    .panel_groups()
+                    .into_iter()
+                    .find(|(k, _)| *k == kind)
+                    .unwrap();
+                let handle = if kind == PanelKind::Cp {
+                    Self::cp_tab_rect(r, self.cp_tab)
+                } else {
+                    let tw = Frame::text_width(kind.title(), 1);
+                    Rect::new(r.x + 2, r.y, tw + 14, 16)
+                };
+                (press_x - handle.x, press_y - handle.y)
+            }
+        };
+        let fx = (cur_x - gx).clamp(0, self.win_size.0 as i32 - 60);
+        let fy = (cur_y - gy).clamp(0, self.win_size.1 as i32 - 40);
+        self.float_panel(kind, fx, fy);
+        (self.float_slots.len() - 1, gx, gy)
+    }
+
+    /// Drop target for the dragged float (excluding its own strip).
+    fn compute_drop(&self, mx: i32, my: i32, drag_idx: usize) -> Option<PanelDrop> {
+        let dock_x = self.win_size.0 as i32 - DOCK_W;
+        if mx < dock_x || !self.dock_open() {
+            return None;
+        }
+        for (loc, r) in self.panel_strip_rects() {
+            if loc == SlotLoc::Float(drag_idx) {
+                continue;
+            }
+            if r.contains(mx, my) {
+                return Some(PanelDrop::Merge(loc));
+            }
+        }
+        if my >= self.top_y() && my <= self.win_size.1 as i32 - ui::STATUS_H {
+            return Some(PanelDrop::DockAt(my));
+        }
+        None
+    }
+
+    /// Drop the dragged float's kind into another slot.
+    fn merge_float_into(&mut self, idx: usize, loc: SlotLoc) {
+        let kinds = self
+            .float_slots
+            .get(idx)
+            .map(|(s, _, _, _)| s.kinds.clone())
+            .unwrap_or_default();
+        if kinds.is_empty() {
+            return;
+        }
+        match loc {
+            SlotLoc::Dock(i) => {
+                if let Some(slot) = self.dock_slots.get_mut(i) {
+                    for k in kinds {
+                        if !slot.kinds.contains(&k) {
+                            slot.kinds.push(k);
+                        }
+                    }
+                    slot.active = slot.kinds.len() - 1;
+                }
+            }
+            SlotLoc::Float(j) => {
+                if let Some((slot, _, _, _)) = self.float_slots.get_mut(j) {
+                    for k in kinds {
+                        if !slot.kinds.contains(&k) {
+                            slot.kinds.push(k);
+                        }
+                    }
+                    slot.active = slot.kinds.len() - 1;
+                }
+            }
+        }
+        self.float_slots.remove(idx);
+    }
+
+    /// Drop the dragged float back into the dock at height y.
+    fn redock_float_at(&mut self, idx: usize, y: i32) {
+        let Some((slot, _, _, _)) = self.float_slots.get(idx) else {
+            return;
+        };
+        let kinds = slot.kinds.clone();
+        self.float_slots.remove(idx);
+        let mut pos = self.dock_slots.len();
+        let mut cy = self.top_y();
+        for (i, s) in self.dock_slots.iter().enumerate() {
+            let kind = s.kinds[s.active];
+            let strip = if s.kinds.len() > 1 { PANEL_TAB_H } else { 0 };
+            let h = self.panel_height(kind) + strip;
+            if y < cy + h / 2 {
+                pos = i;
+                break;
+            }
+            cy += h + 2;
+        }
+        self.dock_slots.insert(pos, PanelSlot { kinds, active: 0 });
+    }
+
+    /// Float header's dock button: whole group back to the dock.
+    fn redock_slot(&mut self, loc: SlotLoc) {
+        if let SlotLoc::Float(i) = loc {
+            if let Some((slot, _, _, _)) = self.float_slots.get(i) {
+                let kinds = slot.kinds.clone();
+                self.float_slots.remove(i);
+                self.dock_slots.push(PanelSlot { kinds, active: 0 });
+                self.save_panel_layout();
+            }
+        }
+    }
+
+    /// Float header's close button: hide the whole group.
+    fn hide_panel_slot(&mut self, loc: SlotLoc) {
+        let kinds = match loc {
+            SlotLoc::Dock(i) => self.dock_slots.get(i).map(|s| s.kinds.clone()),
+            SlotLoc::Float(i) => self.float_slots.get(i).map(|(s, _, _, _)| s.kinds.clone()),
+        };
+        if let Some(kinds) = kinds {
+            for k in kinds {
+                self.set_panel_visible(k, false);
+            }
+            self.sync_panel_slots();
+            self.save_panel_layout();
+        }
+    }
+
+    /// Persist the panel layout (dock order + floats).
+    fn save_panel_layout(&self) {
+        let dir = pictodesk_dir();
+        let mut text = String::new();
+        for slot in &self.dock_slots {
+            let names: Vec<&str> = slot.kinds.iter().map(|k| k.title()).collect();
+            text.push_str(&format!("D\t{}\t{}\n", names.join(","), slot.active));
+        }
+        for (slot, x, y, w) in &self.float_slots {
+            let names: Vec<&str> = slot.kinds.iter().map(|k| k.title()).collect();
+            text.push_str(&format!(
+                "F\t{x},{y},{w}\t{}\t{}\n",
+                names.join(","),
+                slot.active
+            ));
+        }
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::write(dir.join("layout.txt"), text);
+    }
+
+    fn load_panel_layout(&mut self) {
+        let Ok(text) = std::fs::read_to_string(pictodesk_dir().join("layout.txt")) else {
+            return;
+        };
+        let mut dock = Vec::new();
+        let mut floats = Vec::new();
+        for line in text.lines() {
+            let parts: Vec<&str> = line.split('\t').collect();
+            match parts.as_slice() {
+                ["D", names, active] => {
+                    let kinds: Vec<PanelKind> =
+                        names.split(',').filter_map(PanelKind::from_title).collect();
+                    if !kinds.is_empty() {
+                        dock.push(PanelSlot {
+                            kinds,
+                            active: active.parse().unwrap_or(0),
+                        });
+                    }
+                }
+                ["F", geo, names, active] => {
+                    let g: Vec<i32> = geo.split(',').filter_map(|s| s.parse().ok()).collect();
+                    let kinds: Vec<PanelKind> =
+                        names.split(',').filter_map(PanelKind::from_title).collect();
+                    if g.len() == 3 && !kinds.is_empty() {
+                        floats.push((
+                            PanelSlot {
+                                kinds,
+                                active: active.parse().unwrap_or(0),
+                            },
+                            g[0],
+                            g[1],
+                            g[2],
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if !dock.is_empty() || !floats.is_empty() {
+            self.dock_slots = dock;
+            self.float_slots = floats;
+        }
     }
 
     fn group_rect(&self, kind: PanelKind) -> Option<Rect> {
@@ -5730,6 +6547,7 @@ impl App {
                 items: vec![
                     MenuItem::new("New...", Action::New).key("N"),
                     MenuItem::new("Open...", Action::OpenPanel).key("O"),
+                    MenuItem::new("Close", Action::CloseTab).key("W"),
                     MenuItem::new("Save", Action::Save).key("S"),
                     MenuItem::new("Save As...", Action::SaveAsPanel),
                     MenuItem::new("Save a Copy...", Action::SaveCopyPanel),
@@ -7899,32 +8717,68 @@ impl App {
     /// Fill the file panel with the openable files in the
     /// working directory (shared by Open and the map/texture
     /// pickers; `file_panel_purpose` says what a click means).
+    /// Open panel starts in the last-used folder (or Pictures),
+    /// and can move between folders — files no longer have to
+    /// sit in the folder the app was launched from.
     fn open_file_panel(&mut self) {
-        let mut files: Vec<PathBuf> = std::fs::read_dir(".")
-            .map(|rd| {
-                rd.filter_map(|e| e.ok().map(|e| e.path()))
-                    .filter(|p| {
-                        p.extension()
-                            .map(|e| {
-                                let e = e.to_ascii_lowercase();
-                                let exts: &[&str] = match self.file_panel_purpose {
-                                    6 => &["pdmesh"],
-                                    3 => &["aco"],
-                                    4 => &["abr"],
-                                    5 => &["txt"],
-                                    _ => {
-                                        &["png", "jpg", "jpeg", "tif", "tiff", "bmp", "pdk", "psd"]
-                                    }
-                                };
-                                exts.contains(&e.to_str().unwrap_or(""))
-                            })
-                            .unwrap_or(false)
+        self.file_panel_dir = last_open_dir();
+        self.refresh_file_panel();
+    }
+
+    fn refresh_file_panel(&mut self) {
+        let dir = self.file_panel_dir.clone();
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        let mut files: Vec<PathBuf> = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    dirs.push(p);
+                } else if p
+                    .extension()
+                    .map(|e| {
+                        let e = e.to_ascii_lowercase();
+                        let exts: &[&str] = match self.file_panel_purpose {
+                            6 => &["pdmesh"],
+                            3 => &["aco"],
+                            4 => &["abr"],
+                            5 => &["txt"],
+                            _ => &["png", "jpg", "jpeg", "tif", "tiff", "bmp", "pdk", "psd"],
+                        };
+                        exts.contains(&e.to_str().unwrap_or(""))
                     })
-                    .collect()
-            })
-            .unwrap_or_default();
+                    .unwrap_or(false)
+                {
+                    files.push(p);
+                }
+            }
+        }
+        dirs.sort();
         files.sort();
+        self.file_panel_dirs = dirs;
         self.file_panel = Some(files);
+    }
+
+    /// Rows shown in the Open panel, in display order: ".."
+    /// (parent) first when one exists, then subdirectories,
+    /// then files matching the panel's purpose.
+    /// (path, is_dir); None path = the ".." row.
+    fn file_panel_rows(&self) -> Vec<(Option<PathBuf>, bool)> {
+        let mut rows = Vec::new();
+        if let Some(parent) = self.file_panel_dir.parent() {
+            if parent != self.file_panel_dir {
+                rows.push((None, true));
+            }
+        }
+        for d in &self.file_panel_dirs {
+            rows.push((Some(d.clone()), true));
+        }
+        if let Some(files) = &self.file_panel {
+            for f in files {
+                rows.push((Some(f.clone()), false));
+            }
+        }
+        rows
     }
 
     /// Load any supported document file without touching the
@@ -8144,7 +8998,219 @@ impl App {
         }
     }
 
-    fn open_path(&mut self, path: &Path) {
+    // ---- document tabs ----
+    fn tab_count(&self) -> usize {
+        self.tabs.len() + 1
+    }
+
+    fn tab_name(&self, bar: usize) -> &str {
+        if bar == self.active_tab {
+            &self.doc_name
+        } else if bar < self.active_tab {
+            &self.tabs[bar].name
+        } else {
+            &self.tabs[bar - 1].name
+        }
+    }
+
+    fn tab_dirty(&self, bar: usize) -> bool {
+        if bar == self.active_tab {
+            self.dirty
+        } else if bar < self.active_tab {
+            self.tabs[bar].dirty
+        } else {
+            self.tabs[bar - 1].dirty
+        }
+    }
+
+    /// Swap every per-document live field with a DocTab.
+    /// After the swap the tab holds the real state and the App
+    /// holds the tab's (placeholder) values, or the reverse.
+    fn swap_with_tab(&mut self, tab: &mut DocTab) {
+        std::mem::swap(&mut self.doc, &mut tab.doc);
+        std::mem::swap(&mut self.hist, &mut tab.hist);
+        std::mem::swap(&mut self.sel, &mut tab.sel);
+        std::mem::swap(&mut self.clone_src, &mut tab.clone_src);
+        std::mem::swap(&mut self.heal_src, &mut tab.heal_src);
+        std::mem::swap(&mut self.viewport, &mut tab.viewport);
+        std::mem::swap(&mut self.file_path, &mut tab.file_path);
+        std::mem::swap(&mut self.doc_name, &mut tab.name);
+        std::mem::swap(&mut self.dirty, &mut tab.dirty);
+        std::mem::swap(&mut self.status, &mut tab.status);
+        std::mem::swap(&mut self.last_label, &mut tab.last_label);
+        std::mem::swap(&mut self.active_path, &mut tab.active_path);
+        std::mem::swap(&mut self.pen_anchor, &mut tab.pen_anchor);
+        std::mem::swap(&mut self.snapshots, &mut tab.snapshots);
+        std::mem::swap(&mut self.hist_scroll, &mut tab.hist_scroll);
+        std::mem::swap(&mut self.hist_selected, &mut tab.hist_selected);
+        std::mem::swap(&mut self.hist_source, &mut tab.hist_source);
+        std::mem::swap(&mut self.hist_src_cache, &mut tab.hist_src_cache);
+        std::mem::swap(&mut self.measure, &mut tab.measure);
+        std::mem::swap(&mut self.fade_source, &mut tab.fade_source);
+        std::mem::swap(&mut self.split_docs, &mut tab.split_docs);
+        std::mem::swap(&mut self.quick_mask, &mut tab.quick_mask);
+        std::mem::swap(&mut self.autosave_at, &mut tab.autosave_at);
+        std::mem::swap(&mut self.autosaved_version, &mut tab.autosaved_version);
+        std::mem::swap(&mut self.recovery_file, &mut tab.recovery_file);
+        std::mem::swap(&mut self.doc_version, &mut tab.doc_version);
+        std::mem::swap(&mut self.cached_render, &mut tab.cached_render);
+        std::mem::swap(&mut self.cached_size, &mut tab.cached_size);
+        std::mem::swap(&mut self.rendered_version, &mut tab.rendered_version);
+        std::mem::swap(&mut self.last_ft, &mut tab.last_ft);
+        std::mem::swap(&mut self.layers_scroll, &mut tab.layers_scroll);
+        std::mem::swap(&mut self.channel_view, &mut tab.channel_view);
+        std::mem::swap(&mut self.paint_target, &mut tab.paint_target);
+        std::mem::swap(&mut self.slice_selected, &mut tab.slice_selected);
+    }
+
+    /// Take the active tab's state out of the live fields,
+    /// leaving placeholders behind.
+    fn take_active_tab(&mut self) -> DocTab {
+        let mut tab = DocTab::placeholder();
+        self.swap_with_tab(&mut tab);
+        tab
+    }
+
+    /// Install a stored tab into the live fields.
+    fn install_tab(&mut self, tab: DocTab) {
+        let mut tab = tab;
+        self.swap_with_tab(&mut tab);
+        self.reset_transient_for_switch();
+    }
+
+    /// A tab switch cancels any in-progress gesture on the old
+    /// document: no stroke, drag, transform, or path edit
+    /// survives the switch.
+    fn reset_transient_for_switch(&mut self) {
+        self.mouse_down = false;
+        self.drag = DragMode::None;
+        self.ft = None;
+        self.persp_crop = None;
+        self.persp_drag = None;
+        self.guide_drag = None;
+        self.shape_drag_layer = None;
+        self.stroke = None;
+        self.lasso_points.clear();
+        self.poly_points.clear();
+        self.mag_cache = None;
+        self.pen_free.clear();
+        self.move_orig_offset = (0, 0);
+        self.move_linked.clear();
+        self.pen_hit = None;
+        self.path_before = None;
+        self.alpha_cmd = None;
+        self.panel_drag = None;
+        self.panel_pending = None;
+        self.panel_drop = None;
+        self.context_menu = None;
+        self.open_menu = None;
+        self.open_submenu = None;
+        self.hover_file = None;
+    }
+
+    fn switch_tab(&mut self, bar: usize) {
+        if bar == self.active_tab || bar >= self.tab_count() {
+            return;
+        }
+        if self.dialog.is_some() || self.file_panel.is_some() {
+            return;
+        }
+        let cur = self.take_active_tab();
+        self.tabs.insert(self.active_tab, cur);
+        let tab = self.tabs.remove(bar);
+        self.active_tab = bar;
+        self.install_tab(tab);
+    }
+
+    fn next_tab(&mut self) {
+        let n = self.tab_count();
+        if n > 1 {
+            self.switch_tab((self.active_tab + 1) % n);
+        }
+    }
+
+    fn prev_tab(&mut self) {
+        let n = self.tab_count();
+        if n > 1 {
+            self.switch_tab((self.active_tab + n - 1) % n);
+        }
+    }
+
+    /// Open a stored tab at the end of the bar and make it active.
+    fn open_tab(&mut self, tab: DocTab) {
+        let cur = self.take_active_tab();
+        self.tabs.insert(self.active_tab, cur);
+        self.active_tab = self.tabs.len();
+        self.install_tab(tab);
+        self.reset_hist_for_new_doc();
+        self.fit_view(self.win_size.0, self.win_size.1);
+    }
+
+    /// Build a fresh tab around a document and open it.
+    fn new_tab_with_doc(&mut self, doc: Document, path: Option<PathBuf>, name: String) {
+        let mut tab = DocTab::placeholder();
+        tab.doc = doc;
+        tab.file_path = path;
+        tab.name = name;
+        tab.hist.set_limit(Some(20));
+        tab.active_path = if tab.doc.work_path.is_some() {
+            Some(PathRef::Work)
+        } else {
+            None
+        };
+        tab.doc_version = 1;
+        self.open_tab(tab);
+    }
+
+    /// Close the tab at a bar position, asking first when it
+    /// has unsaved changes.
+    fn close_tab(&mut self, bar: usize) {
+        if bar >= self.tab_count() || self.dialog.is_some() || self.file_panel.is_some() {
+            return;
+        }
+        if self.tab_dirty(bar) {
+            let name = self.tab_name(bar).to_string();
+            self.pending_close = Some(bar);
+            let mut d = Dialog::new(DialogKind::ConfirmClose, &self.doc);
+            d.text = format!("'{name}' has unsaved changes.");
+            self.dialog = Some(d);
+            return;
+        }
+        self.close_tab_force(bar);
+    }
+
+    fn close_tab_force(&mut self, bar: usize) {
+        if bar >= self.tab_count() {
+            return;
+        }
+        if bar == self.active_tab {
+            let _ = self.take_active_tab();
+            if self.tabs.is_empty() {
+                let tab = DocTab::placeholder();
+                self.active_tab = 0;
+                let mut tab = tab;
+                tab.name = "Untitled".into();
+                self.install_tab(tab);
+                self.doc.log_event("Created");
+                self.fit_view(self.win_size.0, self.win_size.1);
+            } else {
+                let at = if bar < self.tabs.len() { bar } else { bar - 1 };
+                let tab = self.tabs.remove(at);
+                self.active_tab = at;
+                self.install_tab(tab);
+            }
+        } else {
+            let idx = if bar < self.active_tab { bar } else { bar - 1 };
+            self.tabs.remove(idx);
+            if bar < self.active_tab {
+                self.active_tab -= 1;
+            }
+        }
+    }
+
+    /// Load a document file without touching any tab (the
+    /// format routing mirrors the old open_path).
+    fn load_doc_from_path(&self, path: &Path) -> Result<(Document, Option<String>), String> {
         let mut psd_note: Option<String> = None;
         let result = if path
             .extension()
@@ -8173,8 +9239,15 @@ impl App {
         } else {
             io::load_file(path).map_err(|e| e.to_string())
         };
-        match result {
-            Ok(doc) => {
+        result.map(|doc| (doc, psd_note))
+    }
+
+    /// Replace the ACTIVE tab's document with a file's contents
+    /// (File > Revert, and the launch path that opens the file
+    /// the app was started with).
+    fn replace_doc_from_path(&mut self, path: &Path) {
+        match self.load_doc_from_path(path) {
+            Ok((doc, psd_note)) => {
                 self.doc = doc;
                 self.doc.log_event("Opened");
                 self.hist = History::new();
@@ -8190,6 +9263,10 @@ impl App {
                     None
                 };
                 self.file_path = Some(path.to_path_buf());
+                self.doc_name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "Untitled".into());
                 self.dirty = false;
                 self.doc_version += 1;
                 if let Some(old) = self.recovery_file.take() {
@@ -8198,6 +9275,127 @@ impl App {
                 self.autosaved_version = self.doc_version;
                 self.autosave_at = std::time::Instant::now();
                 self.fit_view(self.win_size.0, self.win_size.1);
+                self.status = psd_note.unwrap_or_else(|| format!("Opened {}", path.display()));
+            }
+            Err(e) => {
+                self.status = format!("Open failed: {e}");
+            }
+        }
+    }
+
+    // ---- tab bar ----
+    fn tab_bar_rect(&self) -> Rect {
+        let dock = if self.dock_open() && self.display_mode == 0 {
+            DOCK_W
+        } else {
+            0
+        };
+        Rect::new(
+            ui::TOOLBAR_W,
+            ui::MENU_H + ui::OPTIONS_H,
+            self.win_size.0 as i32 - ui::TOOLBAR_W - dock,
+            TAB_H,
+        )
+    }
+
+    /// (tab rect, close-button rect) per bar position.
+    fn tab_rects(&self) -> Vec<(Rect, Rect)> {
+        let bar = self.tab_bar_rect();
+        let mut out = Vec::new();
+        let mut x = bar.x;
+        for i in 0..self.tab_count() {
+            let label = if self.tab_dirty(i) {
+                format!("{} \u{2022}", self.tab_name(i))
+            } else {
+                self.tab_name(i).to_string()
+            };
+            let w = (Frame::text_width(&label, 1) + 36).max(56);
+            let r = Rect::new(x, bar.y, w, bar.h);
+            let close = Rect::new(r.right() - 18, r.y + 6, 12, 12);
+            out.push((r, close));
+            x = r.right() + 2;
+        }
+        out
+    }
+
+    fn draw_tab_bar(&mut self, f: &mut Frame) {
+        let bar = self.tab_bar_rect();
+        f.fill_rect(bar, ui::CANVAS_SURROUND);
+        let rects = self.tab_rects();
+        for (i, (r, close)) in rects.iter().enumerate() {
+            let active = i == self.active_tab;
+            f.fill_rect(
+                *r,
+                if active {
+                    ui::PLATINUM_LIGHT
+                } else {
+                    ui::PLATINUM
+                },
+            );
+            f.fill_rect(Rect::new(r.x, r.bottom() - 1, r.w, 1), ui::EDGE);
+            let label = if self.tab_dirty(i) {
+                format!("{} \u{2022}", self.tab_name(i))
+            } else {
+                self.tab_name(i).to_string()
+            };
+            f.text(
+                r.x + 8,
+                r.y + 6,
+                &label,
+                1,
+                if active { ui::TEXT } else { ui::TEXT_DIM },
+            );
+            f.text(close.x + 3, close.y, "x", 1, ui::TEXT_DIM);
+        }
+        // "+" opens a blank document in a new tab.
+        let last = rects.last().map(|(r, _)| r.right() + 2).unwrap_or(bar.x);
+        f.fill_rect(Rect::new(last, bar.y + 2, 20, 20), ui::PLATINUM);
+        f.text(last + 6, bar.y + 6, "+", 1, ui::TEXT_DIM);
+    }
+
+    /// Click on the tab bar: switch tabs, close one, or open a
+    /// blank document. Returns true when the click was handled.
+    fn tab_bar_mouse(&mut self, mx: i32, my: i32) -> bool {
+        if self.display_mode != 0 {
+            return false;
+        }
+        let bar = self.tab_bar_rect();
+        if !bar.contains(mx, my) {
+            return false;
+        }
+        let rects = self.tab_rects();
+        for (i, (r, close)) in rects.iter().enumerate() {
+            if close.contains(mx, my) {
+                self.close_tab(i);
+                return true;
+            }
+            if r.contains(mx, my) {
+                self.switch_tab(i);
+                return true;
+            }
+        }
+        let last = rects.last().map(|(r, _)| r.right() + 2).unwrap_or(bar.x);
+        if Rect::new(last, bar.y + 2, 20, 20).contains(mx, my) {
+            let mut doc = Document::new(640, 400);
+            doc.working_space = self.default_space;
+            doc.layers[0].fill_rect(0, 0, 640, 400, self.bg);
+            doc.log_event("Created");
+            self.new_tab_with_doc(doc, None, "Untitled".into());
+            return true;
+        }
+        true
+    }
+
+    /// Open a file in a NEW tab (File > Open, File Browser,
+    /// drag-and-drop). The current document stays open.
+    fn open_path(&mut self, path: &Path) {
+        match self.load_doc_from_path(path) {
+            Ok((doc, psd_note)) => {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "Untitled".into());
+                self.new_tab_with_doc(doc, Some(path.to_path_buf()), name);
                 self.status = psd_note.unwrap_or_else(|| format!("Opened {}", path.display()));
             }
             Err(e) => {
@@ -8320,6 +9518,9 @@ impl App {
                 self.file_panel_purpose = 0;
                 self.open_file_panel();
             }
+            Action::CloseTab => {
+                self.close_tab(self.active_tab);
+            }
             Action::TextureFillPick => {
                 self.file_panel_purpose = 2;
                 self.status = "Choose the texture image".into();
@@ -8362,7 +9563,7 @@ impl App {
             }
             Action::Revert => {
                 if let Some(p) = self.file_path.clone() {
-                    self.open_path(&p);
+                    self.replace_doc_from_path(&p);
                     self.status = "Reverted to saved".into();
                 }
             }
@@ -9240,11 +10441,9 @@ impl App {
             }
             Action::DuplicateImage => {
                 let dup = self.doc.clone();
-                self.structural("Duplicate Image", |doc| *doc = dup);
-                self.file_path = None;
-                self.dirty = true;
-                self.status =
-                    "Duplicated: the copy is open now (Undo returns to the original)".into();
+                let name = format!("{} copy", self.doc_name);
+                self.new_tab_with_doc(dup, None, name);
+                self.status = "Duplicated into a new tab".into();
             }
             Action::RemoveBlackMatte => {
                 self.filter_now("Remove Black Matte", None, |d, l, _| {
@@ -11409,6 +12608,11 @@ impl App {
                     }
                 }
             }
+            DialogKind::ConfirmClose => {
+                if let Some(i) = self.pending_close.take() {
+                    self.close_tab_force(i);
+                }
+            }
             DialogKind::ActionSetName => {
                 let name = d.text.trim().to_string();
                 if !name.is_empty() && !self.action_sets.contains(&name) {
@@ -11859,19 +13063,13 @@ impl App {
                 doc.working_space = self.default_space;
                 doc.layers[0].fill_rect(0, 0, w, h, self.bg);
                 doc.log_event("Created");
-                self.doc = doc;
-                self.channel_view = ChannelView::Composite;
-                self.paint_target = PaintTarget::Image;
-                self.active_path = None;
-                self.hist = History::new();
-                self.hist.set_limit(Some(20));
-                self.reset_hist_for_new_doc();
-                self.last_label = None;
-                self.sel = None;
-                self.file_path = None;
-                self.dirty = false;
-                self.doc_version += 1;
-                self.fit_view(self.win_size.0, self.win_size.1);
+                let name = d.text.trim().to_string();
+                let name = if name.is_empty() {
+                    "Untitled".into()
+                } else {
+                    name
+                };
+                self.new_tab_with_doc(doc, None, name);
                 self.status = "New image".into();
             }
             DialogKind::SaveAs => {
@@ -12055,6 +13253,12 @@ impl App {
     fn dialog_cancel(&mut self) {
         // A capture in flight is abandoned, not attached.
         self.stop_recording(false);
+        if matches!(
+            self.dialog.as_ref().map(|d| &d.kind),
+            Some(DialogKind::ConfirmClose)
+        ) {
+            self.pending_close = None;
+        }
         if matches!(
             self.dialog.as_ref().map(|d| &d.kind),
             Some(DialogKind::ActionStop)
@@ -12857,6 +14061,7 @@ impl App {
     }
 
     fn draw(&mut self, f: &mut Frame) {
+        self.sync_panel_slots();
         self.draw_canvas(f);
         if self.show_rulers && self.display_mode == 0 {
             self.draw_rulers(f);
@@ -12902,6 +14107,9 @@ impl App {
         if self.show_info {
             self.draw_info_panel(f);
         }
+        if self.display_mode == 0 {
+            self.draw_panel_strips(f);
+        }
         if self.display_mode < 2 {
             self.draw_menu_bar(f);
         }
@@ -12912,6 +14120,7 @@ impl App {
                     self.draw_tool_preset_popup(f);
                 }
             }
+            self.draw_tab_bar(f);
             self.draw_status(f);
         }
         if self.file_panel.is_some() {
@@ -13022,7 +14231,7 @@ impl App {
             }
             if sx >= c.x {
                 f.fill_rect(Rect::new(sx, ty + ui::RULER_H - 6, 1, 6), ui::DARK);
-                f.text(sx + 3, ty + 3, &p.to_string(), 1, ui::BLACK);
+                f.text(sx + 3, ty + 3, &p.to_string(), 1, ui::TEXT);
             }
             p += step;
         }
@@ -13043,14 +14252,14 @@ impl App {
                 // the classic rulers, centered on their tick.
                 let label = q.to_string();
                 let lw = Frame::text_width(&label, 1);
-                f.text_vertical(ui::TOOLBAR_W + 5, sy + lw / 2, &label, 1, ui::BLACK);
+                f.text_vertical(ui::TOOLBAR_W + 5, sy + lw / 2, &label, 1, ui::TEXT);
             }
             q += step;
         }
         // Cursor markers.
         let (mx, my) = (self.cursor.0 as i32, self.cursor.1 as i32);
         if c.contains(mx, my) {
-            f.fill_rect(Rect::new(mx, ty + ui::RULER_H - 9, 1, 9), ui::BLACK);
+            f.fill_rect(Rect::new(mx, ty + ui::RULER_H - 9, 1, 9), ui::TEXT_DIM);
             f.fill_rect(
                 Rect::new(ui::TOOLBAR_W + ui::RULER_W - 9, my, 9, 1),
                 ui::BLACK,
@@ -13279,7 +14488,7 @@ impl App {
             let r = Rect::new(c.x + sp.0 as i32 - 5, c.y + sp.1 as i32 - 5, 10, 10);
             f.fill_rect(r, (255, 214, 64));
             f.outline_rect(r, ui::BLACK);
-            f.text(r.x + 2, r.y + 1, "N", 1, ui::BLACK);
+            f.text(r.x + 2, r.y + 1, "N", 1, ui::TEXT);
             if n.audio.is_some() {
                 // Audio note: a play triangle in the corner.
                 for t in 0..4 {
@@ -13492,28 +14701,71 @@ impl App {
                 }
             }
         }
-        // brush cursor ring
-        if matches!(
-            self.tool,
-            Tool::Brush
-                | Tool::Pencil
-                | Tool::Eraser
-                | Tool::Stamp
-                | Tool::Blur
-                | Tool::Sharpen
-                | Tool::Smudge
-        ) && self.dialog.is_none()
-        {
+        // Brush cursor ring + clone/heal source crosshair (modern
+        // feedback: the ring shows the tip size, the crosshair shows
+        // exactly where the source is sampled from).
+        if self.dialog.is_none() && self.open_menu.is_none() {
             let (mx, my) = (self.cursor.0 as i32, self.cursor.1 as i32);
             if c.contains(mx, my) {
-                let r = (self.tip.size * scale / 2.0) as i32;
-                for a in 0..64 {
-                    let t = a as f32 / 64.0 * std::f32::consts::TAU;
-                    f.set(
-                        mx + (t.cos() * r as f32) as i32,
-                        my + (t.sin() * r as f32) as i32,
-                        ui::WHITE,
-                    );
+                let paint_tool = matches!(
+                    self.tool,
+                    Tool::Brush
+                        | Tool::Airbrush
+                        | Tool::Pencil
+                        | Tool::Eraser
+                        | Tool::Stamp
+                        | Tool::PatternStamp
+                        | Tool::Heal
+                        | Tool::HistoryBrush
+                        | Tool::ArtHistoryBrush
+                        | Tool::BackgroundEraser
+                        | Tool::Blur
+                        | Tool::Sharpen
+                        | Tool::Smudge
+                        | Tool::Dodge
+                        | Tool::Burn
+                        | Tool::Sponge
+                );
+                if paint_tool {
+                    // White ring with a black outer ring so it reads
+                    // on light and dark image areas alike.
+                    let r = ((self.tip.size * scale / 2.0) as i32).max(2);
+                    let steps = (r * 4).clamp(24, 128);
+                    for a in 0..steps {
+                        let t = a as f32 / steps as f32 * std::f32::consts::TAU;
+                        let (dx, dy) = (t.cos() * r as f32, t.sin() * r as f32);
+                        f.set(mx + dx as i32, my + dy as i32, ui::WHITE);
+                        let (dx2, dy2) = (t.cos() * (r + 1) as f32, t.sin() * (r + 1) as f32);
+                        f.set(mx + dx2 as i32, my + dy2 as i32, ui::BLACK);
+                    }
+                }
+                // Clone / heal source crosshair: during a stroke the
+                // source tracks the cursor by the stroke offset;
+                // while hovering it sits at the set source point.
+                let src = match self.tool {
+                    Tool::Stamp => self.clone_src,
+                    Tool::Heal if !self.heal_use_pattern => self.heal_src,
+                    _ => None,
+                };
+                if let Some(src) = src {
+                    let dp = self.to_doc(self.cursor.0, self.cursor.1);
+                    let aligned = match &self.stroke {
+                        Some(st) if self.drag == DragMode::Paint => (
+                            src.0 + (dp.0 - st.start_point.0),
+                            src.1 + (dp.1 - st.start_point.1),
+                        ),
+                        _ => src,
+                    };
+                    let sp = self.viewport.doc_to_screen(aligned);
+                    let (sx, sy) = (c.x + sp.0 as i32, c.y + sp.1 as i32);
+                    if (0..c.w).contains(&(sx - c.x)) && (0..c.h).contains(&(sy - c.y)) {
+                        let r = 6;
+                        f.circle_outline(sx, sy, r, ui::ACCENT);
+                        f.line(sx - r - 3, sy, sx - r + 1, sy, ui::ACCENT);
+                        f.line(sx + r - 1, sy, sx + r + 3, sy, ui::ACCENT);
+                        f.line(sx, sy - r - 3, sx, sy - r + 1, ui::ACCENT);
+                        f.line(sx, sy + r - 1, sx, sy + r + 3, ui::ACCENT);
+                    }
                 }
             }
         }
@@ -13816,7 +15068,7 @@ impl App {
         let caps = self.options_captions();
         let mut cx = bar.x + 118;
         for cap in &caps {
-            f.text(cx, bar.y + 9, cap, 1, ui::BLACK);
+            f.text(cx, bar.y + 9, cap, 1, ui::TEXT);
             cx += 56 + 54 + 18 + 26;
         }
         for (r, label, selected, _act) in self.options_items() {
@@ -13826,11 +15078,17 @@ impl App {
         let hint = match self.tool {
             Tool::Move => format!("Layer: {}", self.doc.layers[self.doc.active_layer].name),
             Tool::Zoom | Tool::Hand => format!("Zoom: {:.0}%", self.viewport.scale * 100.0),
+            Tool::Stamp if self.clone_src.is_none() => "Alt+click to set the clone source".into(),
+            Tool::Stamp => "Clone source set - Alt+click to move it".into(),
+            Tool::Heal if !self.heal_use_pattern && self.heal_src.is_none() => {
+                "Alt+click to set the heal source".into()
+            }
+            Tool::Heal if !self.heal_use_pattern => "Heal source set - Alt+click to move it".into(),
             _ => String::new(),
         };
         if !hint.is_empty() {
             let w = hint.len() as i32 * 9;
-            f.text(bar.right() - w - 8, bar.y + 9, &hint, 1, ui::DARK);
+            f.text(bar.right() - w - 8, bar.y + 9, &hint, 1, ui::TEXT_DIM);
         }
     }
 
@@ -13928,7 +15186,7 @@ impl App {
         let Some(r) = self.group_rect(PanelKind::ToolPresets) else {
             return;
         };
-        f.text(r.x + 5, r.y + 5, "Tool Presets", 1, ui::BLACK);
+        f.text(r.x + 5, r.y + 5, "Tool Presets", 1, ui::TEXT);
         let cur = self.current_tool_preset();
         for (i, p) in self.tool_presets.iter().take(10).enumerate() {
             let rr = Rect::new(r.x + 4, r.y + 20 + i as i32 * 15, r.w - 8, 14);
@@ -13936,7 +15194,7 @@ impl App {
                 f.fill_rect(rr, (36, 84, 160));
                 f.text(rr.x + 3, rr.y + 3, &p.name, 1, ui::WHITE);
             } else {
-                f.text(rr.x + 3, rr.y + 3, &p.name, 1, ui::BLACK);
+                f.text(rr.x + 3, rr.y + 3, &p.name, 1, ui::TEXT);
             }
         }
         Self::draw_small_button(
@@ -13964,7 +15222,7 @@ impl App {
                 f.fill_rect(rr, (36, 84, 160));
                 f.text(rr.x + 3, rr.y + 3, &p.name, 1, ui::WHITE);
             } else {
-                f.text(rr.x + 3, rr.y + 3, &p.name, 1, ui::BLACK);
+                f.text(rr.x + 3, rr.y + 3, &p.name, 1, ui::TEXT);
             }
         }
     }
@@ -13995,6 +15253,8 @@ impl App {
             if selected {
                 f.fill_rect(r, ui::PLATINUM_LIGHT);
                 f.bevel_sunken(r);
+            } else if r.contains(self.cursor.0 as i32, self.cursor.1 as i32) {
+                f.fill_rect(r, ui::HOVER);
             }
             draw_tool_icon(f, *t, r);
         }
@@ -14002,7 +15262,7 @@ impl App {
         let sy = area.bottom() - 52;
         f.fill_rect(Rect::new(4, sy - 18, area.w - 8, 1), ui::SHADOW);
         f.fill_rect(Rect::new(4, sy - 17, area.w - 8, 1), ui::WHITE);
-        f.text(6, sy - 12, "Color", 1, ui::BLACK);
+        f.text(6, sy - 12, "Color", 1, ui::TEXT);
         let bg_r = Rect::new(24, sy + 12, 20, 20);
         let fg_r = Rect::new(10, sy, 20, 20);
         let (br, bgc, bb, _) = self.bg.to_rgba8();
@@ -14049,7 +15309,7 @@ impl App {
             return;
         };
         f.panel(r);
-        f.text(r.x + 6, r.y + 5, "Color", 1, ui::BLACK);
+        f.text(r.x + 6, r.y + 5, "Color", 1, ui::TEXT);
         for (i, c) in self.palette.iter().enumerate() {
             let cell = Rect::new(
                 r.x + 5 + (i % 8) as i32 * 17,
@@ -14137,11 +15397,7 @@ impl App {
 
     fn brushes_panel_h(&self) -> i32 {
         let rows = self.dyn_row_defs().len() as i32;
-        let tool_row = if self.tool_row_rects().is_some() {
-            24
-        } else {
-            0
-        };
+        let tool_row = if self.has_tool_row() { 24 } else { 0 };
         86 + 8 * 13 + 6 + rows * 17 + 22 + tool_row
     }
 
@@ -14326,13 +15582,13 @@ impl App {
             return;
         };
         f.panel(r);
-        f.text(r.x + 6, r.y + 5, "Brushes", 1, ui::BLACK);
+        f.text(r.x + 6, r.y + 5, "Brushes", 1, ui::TEXT);
         f.text(
             r.x + 150,
             r.y + 5,
             &format!("{} px", self.tip.size.round() as i32),
             1,
-            ui::BLACK,
+            ui::TEXT,
         );
         for (idx, p) in self.brush_presets.iter().enumerate() {
             let (sz, hardness) = (p.size, p.hardness);
@@ -14341,9 +15597,9 @@ impl App {
             let cy = r.y + 30 + row * 26;
             let rad = (sz / 2.0).min(8.0) as i32;
             let col = if hardness > 0.5 {
-                ui::BLACK
+                ui::TEXT
             } else {
-                ui::SHADOW
+                ui::TEXT_DIM
             };
             for yy in -rad..=rad {
                 for xx in -rad..=rad {
@@ -14356,7 +15612,7 @@ impl App {
                 && (self.tip.hardness - hardness).abs() < 0.1
                 && self.brush_dyn == p.dyn_
             {
-                f.outline_rect(Rect::new(cx - 10, cy - 10, 20, 20), ui::BLACK);
+                f.outline_rect(Rect::new(cx - 10, cy - 10, 20, 20), ui::ACCENT);
             }
         }
         // Phase 7: dynamics section list + the section's rows.
@@ -14371,7 +15627,7 @@ impl App {
         }
         for (j, (id, label, value, kind)) in self.dyn_row_defs().iter().enumerate() {
             let (vb, minus, plus) = self.dyn_row_rects(r, j);
-            f.text(r.x + 6, vb.y + 4, label, 1, ui::BLACK);
+            f.text(r.x + 6, vb.y + 4, label, 1, ui::TEXT);
             f.button(vb, value, false, true);
             if *kind == 0 {
                 f.button(minus, "-", false, true);
@@ -14398,8 +15654,11 @@ impl App {
     /// Option row rects for the Phase 5 tools that carry options
     /// in the Brushes panel: (value button, minus, plus). The
     /// Eraser and Art History rows use only the value button.
-    fn tool_row_rects(&self) -> Option<(Rect, Rect, Rect)> {
-        if !matches!(
+    /// Whether the current tool shows the Brushes panel's option
+    /// row (tool-match only — no rect lookup, so panel_height()
+    /// can call it without recursing through group_rect).
+    fn has_tool_row(&self) -> bool {
+        matches!(
             self.tool,
             Tool::Eraser
                 | Tool::MagicEraser
@@ -14412,7 +15671,11 @@ impl App {
                 | Tool::ShapePolygon
                 | Tool::ShapeLine
                 | Tool::ShapeCustom
-        ) {
+        )
+    }
+
+    fn tool_row_rects(&self) -> Option<(Rect, Rect, Rect)> {
+        if !self.has_tool_row() {
             return None;
         }
         let r = self.group_rect(PanelKind::Brushes)?;
@@ -14432,7 +15695,7 @@ impl App {
         f.fill_rect(Rect::new(r.x + 4, r.bottom() - 24, r.w - 8, 1), ui::SHADOW);
         match self.tool {
             Tool::Eraser => {
-                f.text(r.x + 6, value_btn.y + 4, "Mode:", 1, ui::BLACK);
+                f.text(r.x + 6, value_btn.y + 4, "Mode:", 1, ui::TEXT);
                 f.button(
                     value_btn,
                     if self.eraser_to_history {
@@ -14445,7 +15708,7 @@ impl App {
                 );
             }
             Tool::Gradient => {
-                f.text(r.x + 6, value_btn.y + 4, "Shape:", 1, ui::BLACK);
+                f.text(r.x + 6, value_btn.y + 4, "Shape:", 1, ui::TEXT);
                 f.button(
                     value_btn,
                     match self.gradient_shape {
@@ -14460,7 +15723,7 @@ impl App {
                 );
             }
             Tool::Stamp => {
-                f.text(r.x + 6, value_btn.y + 4, "Sample:", 1, ui::BLACK);
+                f.text(r.x + 6, value_btn.y + 4, "Sample:", 1, ui::TEXT);
                 f.button(
                     value_btn,
                     if self.stamp_sample_merged {
@@ -14473,7 +15736,7 @@ impl App {
                 );
             }
             Tool::Eyedropper => {
-                f.text(r.x + 6, value_btn.y + 4, "Sample:", 1, ui::BLACK);
+                f.text(r.x + 6, value_btn.y + 4, "Sample:", 1, ui::TEXT);
                 f.button(
                     value_btn,
                     if self.dropper_sample_merged {
@@ -14486,7 +15749,7 @@ impl App {
                 );
             }
             Tool::ArtHistoryBrush => {
-                f.text(r.x + 6, value_btn.y + 4, "Style:", 1, ui::BLACK);
+                f.text(r.x + 6, value_btn.y + 4, "Style:", 1, ui::TEXT);
                 f.button(
                     value_btn,
                     match self.art_hist_style {
@@ -14499,25 +15762,25 @@ impl App {
                 );
             }
             Tool::ShapePolygon => {
-                f.text(r.x + 6, value_btn.y + 4, "Sides:", 1, ui::BLACK);
+                f.text(r.x + 6, value_btn.y + 4, "Sides:", 1, ui::TEXT);
                 f.button(value_btn, &format!("{}", self.shape_sides), false, true);
                 f.button(minus, "-", false, true);
                 f.button(plus, "+", false, true);
             }
             Tool::ShapeCustom => {
-                f.text(r.x + 6, value_btn.y + 4, "Shape:", 1, ui::BLACK);
+                f.text(r.x + 6, value_btn.y + 4, "Shape:", 1, ui::TEXT);
                 let (name, _) = self.custom_shape_choice(self.custom_idx);
                 f.button(value_btn, &name, false, true);
             }
             Tool::ShapeRect | Tool::ShapeRounded | Tool::ShapeEllipse | Tool::ShapeLine => {
-                f.text(r.x + 6, value_btn.y + 4, "Stroke:", 1, ui::BLACK);
+                f.text(r.x + 6, value_btn.y + 4, "Stroke:", 1, ui::TEXT);
                 f.button(value_btn, &format!("{} px", self.shape_stroke), false, true);
                 f.button(minus, "-", false, true);
                 f.button(plus, "+", false, true);
             }
             _ => {
                 // Magic / Background Eraser: tolerance stepper.
-                f.text(r.x + 6, value_btn.y + 4, "Tol:", 1, ui::BLACK);
+                f.text(r.x + 6, value_btn.y + 4, "Tol:", 1, ui::TEXT);
                 f.button(
                     value_btn,
                     &format!("{}", self.eraser_tolerance),
@@ -14553,7 +15816,7 @@ impl App {
         let r = self.group_rect(PanelKind::Brushes).unwrap();
         f.fill_rect(Rect::new(r.x + 4, r.bottom() - 24, r.w - 8, 1), ui::SHADOW);
         if self.tool == Tool::Sponge {
-            f.text(r.x + 6, value_btn.y + 4, "Mode:", 1, ui::BLACK);
+            f.text(r.x + 6, value_btn.y + 4, "Mode:", 1, ui::TEXT);
             f.button(
                 value_btn,
                 if self.sponge_saturate {
@@ -14565,7 +15828,7 @@ impl App {
                 true,
             );
         } else {
-            f.text(r.x + 6, value_btn.y + 4, "Range:", 1, ui::BLACK);
+            f.text(r.x + 6, value_btn.y + 4, "Range:", 1, ui::TEXT);
             f.button(
                 value_btn,
                 match self.tone_range {
@@ -14583,7 +15846,7 @@ impl App {
             minus.y + 4,
             &format!("{:.0}%", self.tone_exposure * 100.0),
             1,
-            ui::BLACK,
+            ui::TEXT,
         );
         f.button(plus, "+", false, true);
     }
@@ -14601,7 +15864,7 @@ impl App {
             return;
         };
         f.panel(r);
-        f.text(r.x + 6, r.y + 5, "Histogram", 1, ui::BLACK);
+        f.text(r.x + 6, r.y + 5, "Histogram", 1, ui::TEXT);
         let mut lum = [0u32; 256];
         for px in self.cached_render.as_chunks::<4>().0 {
             let l = (0.299 * px[0] as f32 + 0.587 * px[1] as f32 + 0.114 * px[2] as f32) as usize;
@@ -14629,7 +15892,7 @@ impl App {
                 hist.median_luminance()
             ),
             1,
-            ui::BLACK,
+            ui::TEXT,
         );
     }
 
@@ -14701,7 +15964,7 @@ impl App {
     fn draw_small_button(f: &mut Frame, r: Rect, label: &str, enabled: bool) {
         f.fill_rect(r, ui::PLATINUM);
         f.bevel_raised(r);
-        let c = if enabled { ui::BLACK } else { ui::DISABLED };
+        let c = if enabled { ui::TEXT } else { ui::DISABLED };
         let tw = Frame::text_width(label, 1);
         f.text(r.x + (r.w - tw) / 2, r.y + 4, label, 1, c);
     }
@@ -14716,10 +15979,10 @@ impl App {
             if self.cp_tab == i {
                 f.fill_rect(tr, ui::PLATINUM_LIGHT);
                 f.bevel_raised(tr);
-                f.text(tr.x + 5, tr.y + 3, label, 1, ui::BLACK);
+                f.text(tr.x + 5, tr.y + 3, label, 1, ui::TEXT);
             } else {
                 f.outline_rect(tr, ui::SHADOW);
-                f.text(tr.x + 5, tr.y + 3, label, 1, ui::DARK);
+                f.text(tr.x + 5, tr.y + 3, label, 1, ui::TEXT_DIM);
             }
         }
         if self.cp_tab == 0 {
@@ -14730,9 +15993,9 @@ impl App {
                 let rr = Rect::new(r.x + 2, r.y + 20 + i as i32 * 15, r.w - 4, 15);
                 let selected = self.channel_view == *view;
                 if selected {
-                    f.fill_rect(rr, ui::BLACK);
+                    f.fill_rect(rr, ui::SELROW);
                 }
-                let c = if selected { ui::WHITE } else { ui::BLACK };
+                let c = if selected { ui::WHITE } else { ui::TEXT };
                 if let ChannelView::Alpha(a) = view {
                     if self.paint_target == PaintTarget::Alpha(*a) {
                         f.fill_rect(Rect::new(rr.x + 3, rr.y + 5, 5, 5), c);
@@ -14757,9 +16020,9 @@ impl App {
                 let rr = Rect::new(r.x + 2, r.y + 20 + i as i32 * 15, r.w - 4, 15);
                 let selected = self.active_path == Some(*pref);
                 if selected {
-                    f.fill_rect(rr, ui::BLACK);
+                    f.fill_rect(rr, ui::SELROW);
                 }
-                let c = if selected { ui::WHITE } else { ui::BLACK };
+                let c = if selected { ui::WHITE } else { ui::TEXT };
                 f.text(rr.x + 6, rr.y + 3, label, 1, c);
             }
             let row1 = ["Fill", "Stroke", "Select", "Make"];
@@ -14785,7 +16048,7 @@ impl App {
             return;
         };
         f.panel(r);
-        f.text(r.x + 6, r.y + 5, "Navigator", 1, ui::BLACK);
+        f.text(r.x + 6, r.y + 5, "Navigator", 1, ui::TEXT);
         let pct = (self.viewport.scale * 100.0).round() as i32;
         f.text(r.x + 130, r.y + 5, &format!("{pct}%"), 1, ui::DARK);
         let th = Self::nav_thumb_rect(r);
@@ -14916,7 +16179,7 @@ impl App {
             return;
         };
         f.panel(r);
-        f.text(r.x + 6, r.y + 5, "Actions", 1, ui::BLACK);
+        f.text(r.x + 6, r.y + 5, "Actions", 1, ui::TEXT);
         if self.recording {
             f.fill_rect(Rect::new(r.x + 70, r.y + 5, 7, 7), (255, 0, 0));
             f.text(r.x + 81, r.y + 5, "REC", 1, (200, 0, 0));
@@ -14946,9 +16209,9 @@ impl App {
                 ActRow::Action(ai) => {
                     let selected = *ai == self.active_action;
                     if selected {
-                        f.fill_rect(rr, ui::BLACK);
+                        f.fill_rect(rr, ui::SELROW);
                     }
-                    let c = if selected { ui::WHITE } else { ui::BLACK };
+                    let c = if selected { ui::WHITE } else { ui::TEXT };
                     let a = &self.actions[*ai];
                     f.text(
                         rr.x + 14,
@@ -15152,7 +16415,7 @@ impl App {
             return;
         };
         f.panel(r);
-        f.text(r.x + 6, r.y + 5, "History", 1, ui::BLACK);
+        f.text(r.x + 6, r.y + 5, "History", 1, ui::TEXT);
         // Scroll buttons (rows hidden above/below).
         let rows = self.hist_rows();
         let visible = ((r.h - 58) / 15).max(1) as usize;
@@ -15166,11 +16429,11 @@ impl App {
             let is_current = matches!(row, HistRow::State(idx) if *idx == pos);
             let is_selected = self.hist_selected == Some(*row);
             if is_current {
-                f.fill_rect(rr, ui::BLACK);
+                f.fill_rect(rr, ui::SELROW);
             } else if is_selected {
                 f.fill_rect(rr, ui::PLATINUM_LIGHT);
             }
-            let c = if is_current { ui::WHITE } else { ui::BLACK };
+            let c = if is_current { ui::WHITE } else { ui::TEXT };
             // Source box: the state the History Brush paints from.
             let sb = Rect::new(rr.x + 2, rr.y + 2, 11, 11);
             let is_source = match (row, self.hist_source) {
@@ -15292,7 +16555,7 @@ impl App {
             return;
         };
         f.panel(r);
-        f.text(r.x + 6, r.y + 5, "Info", 1, ui::BLACK);
+        f.text(r.x + 6, r.y + 5, "Info", 1, ui::TEXT);
         let mut y = r.y + 22;
         let line = |f: &mut Frame, y: i32, s: &str| {
             f.text(r.x + 8, y, s, 1, ui::DARK);
@@ -15511,10 +16774,10 @@ impl App {
                 continue;
             }
             if ir.contains(mx, my) && *enabled {
-                f.fill_rect(ir, ui::BLACK);
+                f.fill_rect(ir, ui::ACCENT);
                 f.text(ir.x + 8, ir.y + 4, label, 1, ui::WHITE);
             } else {
-                let c = if *enabled { ui::BLACK } else { ui::SHADOW };
+                let c = if *enabled { ui::TEXT } else { ui::TEXT_DIM };
                 f.text(ir.x + 8, ir.y + 4, label, 1, c);
             }
         }
@@ -15577,14 +16840,14 @@ impl App {
             r.y + 23,
             &format!("Mode: {mode_name}"),
             1,
-            ui::BLACK,
+            ui::TEXT,
         );
         f.text(
             r.x + 6,
             r.y + 36,
             &format!("Opacity: {opacity}%"),
             1,
-            ui::BLACK,
+            ui::TEXT,
         );
         // (The active layer's set is named by the folder
         // header row above it in the panel — v0.6.1 removed a
@@ -15693,9 +16956,9 @@ impl App {
             }
             let active = li == a;
             if active {
-                f.fill_rect(rr, ui::BLACK);
+                f.fill_rect(rr, ui::SELROW);
             }
-            let c = if active { ui::WHITE } else { ui::BLACK };
+            let c = if active { ui::WHITE } else { ui::TEXT };
             let eye = Rect::new(rr.x + 3, rr.y + 7, 14, 14);
             f.outline_rect(eye, c);
             if visible {
@@ -16651,10 +17914,10 @@ impl App {
         let titles = self.menu_title_rects();
         for (r, i) in &titles {
             if self.open_menu == Some(*i) {
-                f.fill_rect(*r, ui::BLACK);
+                f.fill_rect(*r, ui::ACCENT);
                 f.text(r.x + 7, r.y + 7, menus[*i].title, 1, ui::WHITE);
             } else {
-                f.text(r.x + 7, r.y + 7, menus[*i].title, 1, ui::BLACK);
+                f.text(r.x + 7, r.y + 7, menus[*i].title, 1, ui::TEXT);
             }
         }
         // document name at right, Mac-style
@@ -16675,7 +17938,7 @@ impl App {
             self.doc.height
         );
         let tw = Frame::text_width(&label, 1);
-        f.text(f.w as i32 - tw - 10, 7, &label, 1, ui::DARK);
+        f.text(f.w as i32 - tw - 10, 7, &label, 1, ui::TEXT_DIM);
         // dropdown
         if let Some(mi) = self.open_menu {
             let dr = self.dropdown_rect(mi);
@@ -16685,14 +17948,14 @@ impl App {
                 let ir = Rect::new(dr.x + 2, dr.y + 3 + ii as i32 * 17, dr.w - 4, 17);
                 let hovered = self.hover_item == Some((mi, ii));
                 if hovered && item.enabled {
-                    f.fill_rect(ir, ui::BLACK);
+                    f.fill_rect(ir, ui::ACCENT);
                 }
                 let c = if !item.enabled {
                     ui::DISABLED
                 } else if hovered {
                     ui::WHITE
                 } else {
-                    ui::BLACK
+                    ui::TEXT
                 };
                 if item.checked {
                     // tiny checkmark
@@ -16731,14 +17994,14 @@ impl App {
                         let ir = Rect::new(sr.x + 2, sr.y + 3 + ii as i32 * 17, sr.w - 4, 17);
                         let hovered = self.hover_sub_item == Some(ii);
                         if hovered && item.enabled {
-                            f.fill_rect(ir, ui::BLACK);
+                            f.fill_rect(ir, ui::ACCENT);
                         }
                         let c = if !item.enabled {
                             ui::DISABLED
                         } else if hovered {
                             ui::WHITE
                         } else {
-                            ui::BLACK
+                            ui::TEXT
                         };
                         f.text(ir.x + 8, ir.y + 4, &item.label, 1, c);
                         if let Some(sc) = &item.shortcut {
@@ -16771,27 +18034,53 @@ impl App {
             self.fg.to_rgba8().1,
             self.fg.to_rgba8().2
         );
-        f.text(8, r.y + 5, &text, 1, ui::BLACK);
+        f.text(8, r.y + 5, &text, 1, ui::TEXT);
     }
 
     fn draw_file_panel(&mut self, f: &mut Frame) {
-        let files = self.file_panel.clone().unwrap_or_default();
+        let rows = self.file_panel_rows();
         let (ww, wh) = (f.w as i32, f.h as i32);
         let r = Rect::new((ww - 430) / 2, (wh - 320) / 2, 430, 320);
-        f.panel(r);
-        f.fill_rect(Rect::new(r.x + 2, r.y + 2, r.w - 4, 18), ui::ACCENT);
+        f.panel_rounded(r, 6);
+        f.fill_rounded(
+            Rect::new(r.x + 2, r.y + 2, r.w - 4, 18),
+            4,
+            ui::PLATINUM_LIGHT,
+        );
         f.text(r.x + 8, r.y + 7, "Open", 1, ui::WHITE);
-        f.text(r.x + 8, r.y + 26, "Files in current folder:", 1, ui::BLACK);
-        if files.is_empty() {
-            f.text(r.x + 8, r.y + 48, "(no image files here)", 1, ui::DARK);
+        let dir_label = format!("Folder: {}", self.file_panel_dir.display());
+        let dir_label = if dir_label.chars().count() > 58 {
+            format!(
+                "...{}",
+                dir_label
+                    .chars()
+                    .skip(dir_label.chars().count() - 55)
+                    .collect::<String>()
+            )
+        } else {
+            dir_label
+        };
+        f.text(r.x + 8, r.y + 26, &dir_label, 1, ui::TEXT);
+        if rows.is_empty() {
+            f.text(r.x + 8, r.y + 48, "(nothing here)", 1, ui::TEXT_DIM);
         }
-        for (i, p) in files.iter().take(14).enumerate() {
+        for (i, (p, is_dir)) in rows.iter().take(14).enumerate() {
             let ir = Rect::new(r.x + 6, r.y + 44 + i as i32 * 17, r.w - 12, 17);
+            let label = match p {
+                None => "..".to_string(),
+                Some(p) if *is_dir => format!(
+                    "{}/",
+                    p.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| p.display().to_string())
+                ),
+                Some(p) => p.display().to_string(),
+            };
             if self.hover_file == Some(i) {
-                f.fill_rect(ir, ui::BLACK);
-                f.text(ir.x + 6, ir.y + 4, &p.display().to_string(), 1, ui::WHITE);
+                f.fill_rect(ir, ui::ACCENT);
+                f.text(ir.x + 6, ir.y + 4, &label, 1, ui::WHITE);
             } else {
-                f.text(ir.x + 6, ir.y + 4, &p.display().to_string(), 1, ui::BLACK);
+                f.text(ir.x + 6, ir.y + 4, &label, 1, ui::TEXT);
             }
         }
         f.button(
@@ -16816,8 +18105,12 @@ impl App {
         let layout = self.dialog_layout().unwrap();
         let d = self.dialog.as_ref().unwrap();
         let r = layout.rect;
-        f.panel(r);
-        f.fill_rect(Rect::new(r.x + 2, r.y + 2, r.w - 4, 18), ui::ACCENT);
+        f.panel_rounded(r, 6);
+        f.fill_rounded(
+            Rect::new(r.x + 2, r.y + 2, r.w - 4, 18),
+            4,
+            ui::PLATINUM_LIGHT,
+        );
         f.text(
             r.x + 8,
             r.y + 7,
@@ -17107,7 +18400,7 @@ impl App {
                         }
                     }
                     f.outline_rect(cell, if kind == 0 { ui::ACCENT } else { ui::SHADOW });
-                    f.text(cell.x, cell.y + 54, label, 1, ui::BLACK);
+                    f.text(cell.x, cell.y + 54, label, 1, ui::TEXT);
                 }
             }
         }
@@ -17140,10 +18433,10 @@ impl App {
                     by + 4,
                     &format!("Tile: {}x{}", t.width, t.height),
                     1,
-                    ui::BLACK,
+                    ui::TEXT,
                 );
-                f.text(bx + 248, by + 20, "Seamless", 1, ui::BLACK);
-                f.text(bx + 248, by + 36, "cross-blend", 1, ui::BLACK);
+                f.text(bx + 248, by + 20, "Seamless", 1, ui::TEXT);
+                f.text(bx + 248, by + 36, "cross-blend", 1, ui::TEXT);
                 let fb = Rect::new(bx, by + 158, 150, 18);
                 f.button(fb, "Fill layer on OK", d.opt_a, true);
             }
@@ -17184,7 +18477,7 @@ impl App {
                 sw.y + 5,
                 &format!("R {} G {} B {}", t.0, t.1, t.2),
                 1,
-                ui::BLACK,
+                ui::TEXT,
             );
         }
         if d.kind == DialogKind::ActionStop {
@@ -17202,6 +18495,21 @@ impl App {
                 ui::DARK,
             );
         }
+        if d.kind == DialogKind::ConfirmClose {
+            let msg = if d.text.chars().count() > 44 {
+                format!("{}...", d.text.chars().take(44).collect::<String>())
+            } else {
+                d.text.clone()
+            };
+            f.text(layout.rect.x + 12, layout.rect.y + 36, &msg, 1, ui::TEXT);
+            f.text(
+                layout.rect.x + 12,
+                layout.rect.y + 52,
+                "Close discards the changes.",
+                1,
+                ui::TEXT,
+            );
+        }
         if d.kind == DialogKind::InsertMenuItem {
             let r = layout.rect;
             for j in 0..14usize {
@@ -17216,10 +18524,10 @@ impl App {
                     path.clone()
                 };
                 if idx == d.fx_page {
-                    f.fill_rect(row, ui::BLACK);
+                    f.fill_rect(row, ui::SELROW);
                     f.text(row.x + 4, row.y + 3, &label, 1, ui::WHITE);
                 } else {
-                    f.text(row.x + 4, row.y + 3, &label, 1, ui::DARK);
+                    f.text(row.x + 4, row.y + 3, &label, 1, ui::TEXT_DIM);
                 }
             }
             let prev = Rect::new(r.x + 12, r.bottom() - 58, 80, 16);
@@ -17464,7 +18772,7 @@ impl App {
                         f.set(er.x + px, er.y + py, (r, g, b));
                     }
                 }
-                f.outline_rect(er, ui::BLACK);
+                f.outline_rect(er, ui::PLATINUM_LIGHT);
                 let names = [
                     "Highlight",
                     "Fill",
@@ -17503,7 +18811,7 @@ impl App {
             // stay in sync because both edit vals[0] / vals[1].
             if let Some(wr) = self.wireframe_rect() {
                 f.fill_rect(wr, (34, 34, 42));
-                f.outline_rect(wr, ui::BLACK);
+                f.outline_rect(wr, ui::PLATINUM_LIGHT);
                 let (rx, ry) = (d.vals[0].to_radians(), d.vals[1].to_radians());
                 let (sx, cx) = (rx.sin(), rx.cos());
                 let (sy, cy) = (ry.sin(), ry.cos());
@@ -18163,18 +19471,18 @@ impl App {
                 r.y + 272,
                 "Feather sliders split the Blend If points.",
                 1,
-                ui::BLACK,
+                ui::TEXT,
             );
         }
         if d.kind == DialogKind::GradientMap {
             let swf = Rect::new(r.x + 12, r.y + 58, 22, 22);
             f.fill_rect(swf, d.photo_color);
             f.outline_rect(swf, ui::BLACK);
-            f.text(r.x + 40, r.y + 64, "From (dark)", 1, ui::BLACK);
+            f.text(r.x + 40, r.y + 64, "From (dark)", 1, ui::TEXT);
             let swt = Rect::new(r.x + 150, r.y + 58, 22, 22);
             f.fill_rect(swt, d.gm_to);
             f.outline_rect(swt, ui::BLACK);
-            f.text(r.x + 178, r.y + 64, "To (light)", 1, ui::BLACK);
+            f.text(r.x + 178, r.y + 64, "To (light)", 1, ui::TEXT);
             for (i, br) in layout.range_buttons.iter().enumerate() {
                 let (label, on) = match i {
                     0 => ("From: FG", false),
@@ -18277,7 +19585,7 @@ impl App {
                     f.set(er.x + px, er.y + py, (cr, cg, cb));
                 }
             }
-            f.outline_rect(er, ui::BLACK);
+            f.outline_rect(er, ui::PLATINUM_LIGHT);
             let tools = [
                 "Warp", "Twirl+", "Twirl-", "Pucker", "Bloat", "Shift", "Reflect", "Recon",
                 "Freeze", "Thaw", "Turbul", "Hand", "Mesh", "Stiff", "Clear", "Undo", "Bckdrop",
@@ -18300,7 +19608,7 @@ impl App {
                 r.y + 402,
                 "Live warp preview. Freeze = red mask.",
                 1,
-                ui::BLACK,
+                ui::TEXT,
             );
             let zr = self.liquify_zoom_rects(r);
             f.button(zr[0], "-", false, true);
@@ -18309,12 +19617,12 @@ impl App {
         }
         if d.kind == DialogKind::SpellCheck {
             if let Some(tf) = layout.text_field {
-                f.text(tf.x, tf.y - 10, "Change to:", 1, ui::BLACK);
+                f.text(tf.x, tf.y - 10, "Change to:", 1, ui::TEXT);
             }
             match d.spell_items.get(d.spell_pos) {
                 Some((li, _, _, word)) => {
-                    f.text(r.x + 12, r.y + 58, "Not in dictionary:", 1, ui::BLACK);
-                    f.text(r.x + 12, r.y + 74, word, 2, ui::BLACK);
+                    f.text(r.x + 12, r.y + 58, "Not in dictionary:", 1, ui::TEXT);
+                    f.text(r.x + 12, r.y + 74, word, 2, ui::TEXT);
                     f.text(
                         r.x + 12,
                         r.y + 104,
@@ -18334,7 +19642,7 @@ impl App {
                         r.y + 74,
                         "Check complete: no unknown words.",
                         1,
-                        ui::BLACK,
+                        ui::TEXT,
                     );
                 }
             }
@@ -18350,7 +19658,7 @@ impl App {
                     f.text(tf.x + 4, tf.y + 4, "Find text", 1, ui::SHADOW);
                 }
                 let f2 = Rect::new(tf.x, tf.y + 34, tf.w, tf.h);
-                f.text(f2.x, f2.y - 10, "Replace:", 1, ui::BLACK);
+                f.text(f2.x, f2.y - 10, "Replace:", 1, ui::TEXT);
                 if d.text2.is_empty() {
                     f.text(f2.x + 4, f2.y + 4, "Replacement text", 1, ui::SHADOW);
                 }
@@ -18385,7 +19693,7 @@ impl App {
                 r.y + 52,
                 &format!("Folder: {}", d.browser_dir),
                 1,
-                ui::BLACK,
+                ui::TEXT,
             );
             for (i, e) in d.browser_entries.iter().take(12).enumerate() {
                 let cell = self.browser_cell(r, i);
@@ -18396,7 +19704,7 @@ impl App {
                 }
                 f.outline_rect(cell, ui::BLACK);
                 if e.is_dir {
-                    f.text(cell.x + 8, cell.y + 22, "[Folder]", 1, ui::BLACK);
+                    f.text(cell.x + 8, cell.y + 22, "[Folder]", 1, ui::TEXT);
                 } else if e.tw > 0 {
                     let (ox, oy) = (
                         cell.x + (92 - e.tw as i32) / 2,
@@ -18433,7 +19741,7 @@ impl App {
                 .get(d.browser_sel)
                 .map(|e| e.info.clone())
                 .unwrap_or_default();
-            f.text(r.x + 12, r.y + 276, &info, 1, ui::BLACK);
+            f.text(r.x + 12, r.y + 276, &info, 1, ui::TEXT);
             let labels = [
                 "Open", "Up", "Rotate L", "Rotate R", "Rank", "Sort", "Rename", "Refresh",
             ];
@@ -18460,7 +19768,7 @@ impl App {
                     f.fill_rect(rr, (36, 84, 160));
                     f.text(rr.x + 3, rr.y + 3, name, 1, ui::WHITE);
                 } else {
-                    f.text(rr.x + 3, rr.y + 3, name, 1, ui::BLACK);
+                    f.text(rr.x + 3, rr.y + 3, name, 1, ui::TEXT);
                 }
             }
             let by = r.bottom() - 58;
@@ -18493,11 +19801,11 @@ impl App {
         }
         if d.kind == DialogKind::SliceProps {
             if let Some(tf) = layout.text_field {
-                f.text(tf.x, tf.y - 10, "Name:", 1, ui::BLACK);
+                f.text(tf.x, tf.y - 10, "Name:", 1, ui::TEXT);
                 let f2 = Rect::new(tf.x, tf.y + 24, tf.w, tf.h);
                 let f3 = Rect::new(tf.x, tf.y + 48, tf.w, tf.h);
-                f.text(f2.x, f2.y - 10, "URL:", 1, ui::BLACK);
-                f.text(f3.x, f3.y - 10, "Alt text:", 1, ui::BLACK);
+                f.text(f2.x, f2.y - 10, "URL:", 1, ui::TEXT);
+                f.text(f3.x, f3.y - 10, "Alt text:", 1, ui::TEXT);
                 for (i, fr) in [f2, f3].iter().enumerate() {
                     f.fill_rect(*fr, ui::WHITE);
                     f.outline_rect(*fr, ui::SHADOW);
@@ -18514,7 +19822,7 @@ impl App {
         }
         if d.kind == DialogKind::NoteEdit {
             if let Some(tf) = layout.text_field {
-                f.text(tf.x, tf.y - 10, "Note text:", 1, ui::BLACK);
+                f.text(tf.x, tf.y - 10, "Note text:", 1, ui::TEXT);
             }
             let rec_on = self.audio_rec.is_some();
             for (i, br) in layout.range_buttons.iter().enumerate() {
@@ -18556,14 +19864,14 @@ impl App {
                 }
                 let label = d.kernel[i].to_string();
                 let tx = cell.x + (cell.w - label.len() as i32 * 6) / 2;
-                f.text(tx, cell.y + 6, &label, 1, ui::BLACK);
+                f.text(tx, cell.y + 6, &label, 1, ui::TEXT);
             }
             let by = r.y + 156;
-            f.text(r.x + 48, by + 5, "Scale:", 1, ui::BLACK);
-            f.text(r.x + 96, by + 5, &d.kernel_scale.to_string(), 1, ui::BLACK);
+            f.text(r.x + 48, by + 5, "Scale:", 1, ui::TEXT);
+            f.text(r.x + 96, by + 5, &d.kernel_scale.to_string(), 1, ui::TEXT);
             f.button(layout.kernel_buttons[0], "-", false, true);
             f.button(layout.kernel_buttons[1], "+", false, true);
-            f.text(r.x + 216, by + 5, "Offset:", 1, ui::BLACK);
+            f.text(r.x + 216, by + 5, "Offset:", 1, ui::TEXT);
             f.text(
                 r.x + 268,
                 by + 5,
@@ -18587,7 +19895,7 @@ impl App {
                 .get(self.active_action)
                 .map(|a| a.name.clone())
                 .unwrap_or_else(|| "(none)".into());
-            f.text(r.x + 12, r.y + 56, &format!("Action: {name}"), 1, ui::BLACK);
+            f.text(r.x + 12, r.y + 56, &format!("Action: {name}"), 1, ui::TEXT);
             f.text(
                 r.x + 12,
                 r.y + 70,
@@ -18628,7 +19936,10 @@ impl App {
                 for (vi, fam) in fams.iter().skip(d.font_scroll).take(6).enumerate() {
                     let ry = fams_r.y + 2 + vi as i32 * 15;
                     if *fam == cur_fam {
-                        f.fill_rect(Rect::new(fams_r.x + 1, ry - 1, fams_r.w - 2, 14), ui::BLACK);
+                        f.fill_rect(
+                            Rect::new(fams_r.x + 1, ry - 1, fams_r.w - 2, 14),
+                            ui::SELROW,
+                        );
                         f.text(fams_r.x + 5, ry + 2, fam, 1, ui::WHITE);
                     } else {
                         f.text(fams_r.x + 5, ry + 2, fam, 1, ui::BLACK);
@@ -18787,7 +20098,7 @@ impl App {
             );
             for (i, cell) in layout.anchor_cells.iter().enumerate() {
                 let is = (i as i32 % 3 - 1, i as i32 / 3 - 1) == d.anchor;
-                f.fill_rect(*cell, if is { ui::BLACK } else { ui::WHITE });
+                f.fill_rect(*cell, if is { ui::ACCENT } else { ui::PLATINUM_LIGHT });
                 f.outline_rect(*cell, ui::DARK);
             }
         }
@@ -18925,7 +20236,7 @@ fn space_name(s: pictodesk_core::color::WorkingSpace) -> &'static str {
 
 fn draw_tool_icon(f: &mut Frame, tool: Tool, r: Rect) {
     let (cx, cy) = (r.x + r.w / 2, r.y + r.h / 2);
-    let b = ui::BLACK;
+    let b = ui::ICON;
     match tool {
         Tool::Move => {
             f.line(cx - 8, cy, cx + 8, cy, b);
@@ -20628,7 +21939,7 @@ impl App {
         // ---- file panel
         if self.file_panel.is_some() {
             let pr = self.file_panel_rect();
-            let files = self.file_panel.clone().unwrap();
+            let rows = self.file_panel_rows();
             let cancel = Rect::new(pr.right() - 92, pr.bottom() - 32, 80, 24);
             if cancel.contains(mx, my) || !pr.contains(mx, my) {
                 self.file_panel = None;
@@ -20636,9 +21947,28 @@ impl App {
                 self.pending_displace = None;
                 return;
             }
-            for (i, p) in files.iter().take(14).enumerate() {
+            for (i, (p, is_dir)) in rows.iter().take(14).enumerate() {
                 let ir = Rect::new(pr.x + 6, pr.y + 44 + i as i32 * 17, pr.w - 12, 17);
                 if ir.contains(mx, my) {
+                    // ".." goes up one folder; a directory goes in.
+                    if p.is_none() {
+                        if let Some(parent) = self.file_panel_dir.parent().map(|p| p.to_path_buf())
+                        {
+                            if parent != self.file_panel_dir {
+                                self.file_panel_dir = parent;
+                                save_last_open_dir(&self.file_panel_dir.clone());
+                                self.refresh_file_panel();
+                            }
+                        }
+                        return;
+                    }
+                    let p = p.as_ref().unwrap();
+                    if *is_dir {
+                        self.file_panel_dir = p.clone();
+                        save_last_open_dir(&self.file_panel_dir.clone());
+                        self.refresh_file_panel();
+                        return;
+                    }
                     let path = p.clone();
                     self.file_panel = None;
                     let purpose = self.file_panel_purpose;
@@ -20667,6 +21997,10 @@ impl App {
                     return;
                 }
             }
+            return;
+        }
+        // ---- document tab bar
+        if self.display_mode == 0 && self.tab_bar_mouse(mx, my) {
             return;
         }
         // ---- context menu (open): click an item or dismiss
@@ -20755,7 +22089,13 @@ impl App {
         if self.options_press(mx, my) {
             return;
         }
-        // ---- dock panels
+        // ---- dock panels: tab strips, float headers, title handles
+        if self.panel_strip_mouse(mx, my) {
+            return;
+        }
+        if self.panel_title_mouse(mx, my) {
+            return;
+        }
         if self.panel_mouse(mx, my) {
             return;
         }
@@ -23961,6 +25301,44 @@ impl App {
         let (mx, my) = (x as i32, y as i32);
         let prev = self.cursor;
         self.cursor = (x, y);
+        // Toolbox hover: name the tool under the cursor in the
+        // status bar (with its key and, for source tools, what to
+        // do next) so tools are discoverable without guessing.
+        if self.drag == DragMode::None && self.dialog.is_none() && mx < ui::TOOLBAR_W {
+            for (i, t) in TOOLS.iter().enumerate() {
+                if Self::tool_rect(i, self.top_y()).contains(mx, my) {
+                    let extra = match *t {
+                        Tool::Stamp if self.clone_src.is_none() => " - Alt+click to set the source",
+                        Tool::Stamp => " - source set",
+                        Tool::Heal if !self.heal_use_pattern && self.heal_src.is_none() => {
+                            " - Alt+click to set the source"
+                        }
+                        Tool::Heal if !self.heal_use_pattern => " - source set",
+                        _ => "",
+                    };
+                    self.status = format!("{} ({}){}", t.name(), t.key(), extra);
+                    break;
+                }
+            }
+        }
+        // Panel drag: a press on a tab/title starts a drag past a
+        // 4px threshold; the dragged float follows the cursor and
+        // shows its drop target (merge / dock / stay floating).
+        if let Some((kind, loc, dx, dy)) = self.panel_pending {
+            if (mx - dx).abs() + (my - dy).abs() > 4 && self.dialog.is_none() {
+                let (idx, gx, gy) = self.detach_panel(kind, loc, dx, dy, mx, my);
+                self.panel_drag = Some((idx, gx, gy));
+                self.panel_pending = None;
+            }
+        }
+        if let Some((idx, gdx, gdy)) = self.panel_drag {
+            if let Some((_, fx, fy, _)) = self.float_slots.get_mut(idx) {
+                *fx = (mx - gdx).clamp(0, self.win_size.0 as i32 - 60);
+                *fy = (my - gdy).clamp(0, self.win_size.1 as i32 - 40);
+            }
+            self.panel_drop = self.compute_drop(mx, my, idx);
+            return;
+        }
         if self.drag == DragMode::NavDrag {
             self.navigator_to(mx, my);
             return;
@@ -24167,10 +25545,11 @@ impl App {
             return;
         }
         // file panel hover
-        if let Some(files) = &self.file_panel {
+        if self.file_panel.is_some() {
             let pr = self.file_panel_rect();
             self.hover_file = None;
-            for i in 0..files.len().min(14) {
+            let rows = self.file_panel_rows();
+            for i in 0..rows.len().min(14) {
                 let ir = Rect::new(pr.x + 6, pr.y + 44 + i as i32 * 17, pr.w - 12, 17);
                 if ir.contains(mx, my) {
                     self.hover_file = Some(i);
@@ -24374,6 +25753,15 @@ impl App {
 
     pub fn mouse_up(&mut self, _x: f32, _y: f32) {
         self.mouse_down = false;
+        if let Some((idx, _, _)) = self.panel_drag.take() {
+            match self.panel_drop.take() {
+                Some(PanelDrop::Merge(loc)) => self.merge_float_into(idx, loc),
+                Some(PanelDrop::DockAt(y)) => self.redock_float_at(idx, y),
+                None => {}
+            }
+            self.save_panel_layout();
+        }
+        self.panel_pending = None;
         if self.drag == DragMode::PatchDrag {
             self.drag = DragMode::None;
             let (dx, dy) = (
@@ -24747,6 +26135,7 @@ impl App {
                 's' => self.do_action(Action::Save),
                 'o' => self.do_action(Action::OpenPanel),
                 'n' => self.do_action(Action::New),
+                'w' => self.do_action(Action::CloseTab),
                 'd' => self.do_action(Action::SelectNone),
                 'a' => self.do_action(Action::SelectAll),
                 'i' => self.do_action(Action::AdjustDialog("invert")),
@@ -25244,6 +26633,9 @@ fn run_shot(args: &[String]) -> i32 {
     let mut ft = false;
     let mut many_layers = false;
     let mut view: Option<String> = None;
+    let mut uitool: Option<String> = None;
+    let mut uipanels = false;
+    let mut twotabs = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -25281,6 +26673,12 @@ fn run_shot(args: &[String]) -> i32 {
                 view = args.get(i + 1).cloned();
                 i += 1;
             }
+            "--uitool" => {
+                uitool = args.get(i + 1).cloned();
+                i += 1;
+            }
+            "--uipanels" => uipanels = true,
+            "--twotabs" => twotabs = true,
             "--size" => {
                 if let Some(s) = args.get(i + 1) {
                     if let Some((w, h)) = s.split_once('x') {
@@ -26618,6 +28016,409 @@ fn run_shot(args: &[String]) -> i32 {
                 app.doc.width == 612 && app.doc.layers.len() == 5,
             );
         }
+        // --- Tool sweep: every paint/selection tool through the
+        // real mouse path (screen coords -> to_doc -> press/move/up).
+        // Banning found tools dead on his Mac (2026-11-25); this
+        // suite proves the engine path works so a future failure
+        // can only be the event path or the tool's own UI.
+        {
+            let scr = |app: &App, dx: f32, dy: f32| {
+                let c = app.canvas_rect(app.win_size.0, app.win_size.1);
+                (
+                    c.x as f32 + app.viewport.offset.0 + dx * app.viewport.scale,
+                    c.y as f32 + app.viewport.offset.1 + dy * app.viewport.scale,
+                )
+            };
+            let two_tone = || {
+                let mut doc = Document::new(30, 20);
+                doc.layers[0].fill_rect(0, 0, 15, 20, Pixel16::from_rgba8(255, 0, 0, 255));
+                doc.layers[0].fill_rect(15, 0, 15, 20, Pixel16::from_rgba8(0, 0, 255, 255));
+                doc
+            };
+            // Clone Stamp: Alt+click arms it, paint copies red.
+            {
+                let mut app = App::new(two_tone(), None);
+                app.tool = Tool::Stamp;
+                app.tip = BrushTip::new(5.0, 1.0);
+                let (sx, sy) = scr(&app, 5.0, 10.0);
+                app.alt_down = true;
+                app.mouse_down(sx, sy);
+                check("stamp alt-click sets source", app.clone_src.is_some());
+                app.alt_down = false;
+                app.mouse_up(sx, sy);
+                let (tx, ty) = scr(&app, 22.0, 10.0);
+                app.mouse_down(tx, ty);
+                app.mouse_move(tx + 4.0, ty);
+                app.mouse_up(tx + 4.0, ty);
+                let px = app.doc.layers[0].get_pixel(22, 10).to_rgba8();
+                check("stamp paints the source color", px.0 > 200 && px.2 < 50);
+            }
+            // Brush + Eraser round trip.
+            {
+                let mut doc = Document::new(30, 20);
+                doc.layers[0].fill_rect(0, 0, 30, 20, Pixel16::from_rgba8(255, 255, 255, 255));
+                let mut app = App::new(doc, None);
+                app.tool = Tool::Brush;
+                app.tip = BrushTip::new(5.0, 1.0);
+                app.fg = Pixel16::from_rgba8(0, 0, 0, 255);
+                let (bx, by) = scr(&app, 10.0, 10.0);
+                app.mouse_down(bx, by);
+                app.mouse_up(bx, by);
+                check(
+                    "brush paints",
+                    app.doc.layers[0].get_pixel(10, 10).to_rgba8().0 < 50,
+                );
+                app.tool = Tool::Eraser;
+                app.mouse_down(bx, by);
+                app.mouse_up(bx, by);
+                check(
+                    "eraser clears to transparent",
+                    app.doc.layers[0].get_pixel(10, 10).to_rgba8().3 == 0,
+                );
+            }
+            // Bucket fills, Gradient runs dark to light.
+            {
+                let mut doc = Document::new(30, 20);
+                doc.layers[0].fill_rect(0, 0, 30, 20, Pixel16::from_rgba8(255, 255, 255, 255));
+                let mut app = App::new(doc, None);
+                app.tool = Tool::Bucket;
+                app.fg = Pixel16::from_rgba8(0, 0, 0, 255);
+                let (kx, ky) = scr(&app, 10.0, 10.0);
+                app.mouse_down(kx, ky);
+                app.mouse_up(kx, ky);
+                check(
+                    "bucket fills",
+                    app.doc.layers[0].get_pixel(10, 10).to_rgba8().0 == 0,
+                );
+                let mut doc2 = Document::new(30, 20);
+                doc2.layers[0].fill_rect(0, 0, 30, 20, Pixel16::from_rgba8(255, 255, 255, 255));
+                let mut app2 = App::new(doc2, None);
+                app2.tool = Tool::Gradient;
+                app2.fg = Pixel16::from_rgba8(0, 0, 0, 255);
+                app2.bg = Pixel16::from_rgba8(255, 255, 255, 255);
+                let (gx, gy) = scr(&app2, 4.0, 10.0);
+                app2.mouse_down(gx, gy);
+                let (gx2, _) = scr(&app2, 26.0, 10.0);
+                app2.mouse_move(gx2, gy);
+                app2.mouse_up(gx2, gy);
+                let lo = app2.doc.layers[0].get_pixel(5, 10).to_rgba8().0;
+                let hi = app2.doc.layers[0].get_pixel(25, 10).to_rgba8().0;
+                check("gradient runs dark to light", lo < 100 && hi > 200);
+            }
+            // Eyedropper, Wand, Marquee, Move.
+            {
+                let mut app = App::new(two_tone(), None);
+                app.tool = Tool::Eyedropper;
+                let (ex, ey) = scr(&app, 5.0, 10.0);
+                app.mouse_down(ex, ey);
+                app.mouse_up(ex, ey);
+                check("eyedropper picks the color", app.fg.to_rgba8().0 == 255);
+                app.tool = Tool::Wand;
+                app.mouse_down(ex, ey);
+                app.mouse_up(ex, ey);
+                check(
+                    "wand selects the region",
+                    app.sel
+                        .as_ref()
+                        .and_then(|s| s.bounds())
+                        .map(|(x, _, w, _)| x == 0 && w == 15)
+                        .unwrap_or(false),
+                );
+                app.tool = Tool::MarqueeRect;
+                let (mx, my) = scr(&app, 4.0, 4.0);
+                app.mouse_down(mx, my);
+                let (mx2, my2) = scr(&app, 20.0, 15.0);
+                app.mouse_move(mx2, my2);
+                app.mouse_up(mx2, my2);
+                check(
+                    "marquee makes a selection",
+                    app.sel
+                        .as_ref()
+                        .and_then(|s| s.bounds())
+                        .map(|(_, _, w, h)| w == 16 && h == 11)
+                        .unwrap_or(false),
+                );
+                app.tool = Tool::Move;
+                let (vx, vy) = scr(&app, 10.0, 10.0);
+                app.mouse_down(vx, vy);
+                let (vx2, vy2) = scr(&app, 15.0, 12.0);
+                app.mouse_move(vx2, vy2);
+                app.mouse_up(vx2, vy2);
+                check("move shifts the layer", app.doc.layers[0].offset == (5, 2));
+            }
+            // Dodge lightens, Burn darkens.
+            {
+                let gray = || {
+                    let mut doc = Document::new(30, 20);
+                    doc.layers[0].fill_rect(0, 0, 30, 20, Pixel16::from_rgba8(100, 100, 100, 255));
+                    doc
+                };
+                let mut app = App::new(gray(), None);
+                app.tool = Tool::Dodge;
+                app.tip = BrushTip::new(9.0, 1.0);
+                let (dx, dy) = scr(&app, 15.0, 10.0);
+                app.mouse_down(dx, dy);
+                app.mouse_up(dx, dy);
+                check(
+                    "dodge lightens",
+                    app.doc.layers[0].get_pixel(15, 10).to_rgba8().0 > 120,
+                );
+                let mut app2 = App::new(gray(), None);
+                app2.tool = Tool::Burn;
+                app2.tip = BrushTip::new(9.0, 1.0);
+                let (bx, by) = scr(&app2, 15.0, 10.0);
+                app2.mouse_down(bx, by);
+                app2.mouse_up(bx, by);
+                check(
+                    "burn darkens",
+                    app2.doc.layers[0].get_pixel(15, 10).to_rgba8().0 < 80,
+                );
+            }
+            // Smudge drags color across the edge; Blur softens it.
+            {
+                let mut app = App::new(two_tone(), None);
+                app.tool = Tool::Smudge;
+                app.tip = BrushTip::new(9.0, 1.0);
+                let (sx, sy) = scr(&app, 14.0, 10.0);
+                app.mouse_down(sx, sy);
+                let (sx2, _) = scr(&app, 18.0, 10.0);
+                app.mouse_move(sx2, sy);
+                app.mouse_up(sx2, sy);
+                let px = app.doc.layers[0].get_pixel(17, 10).to_rgba8();
+                check("smudge mixes the edge", px.0 > 40 && px.2 > 40);
+                let mut app2 = App::new(two_tone(), None);
+                app2.tool = Tool::Blur;
+                app2.tip = BrushTip::new(9.0, 1.0);
+                let (bx, by) = scr(&app2, 15.0, 10.0);
+                app2.mouse_down(bx, by);
+                app2.mouse_up(bx, by);
+                let px2 = app2.doc.layers[0].get_pixel(15, 10).to_rgba8();
+                check("blur softens the edge", px2.0 > 40 && px2.0 < 220);
+            }
+            // Healing Brush: Alt+click a clean source, paint over a
+            // black spot, and the spot is gone.
+            {
+                let mut doc = Document::new(30, 20);
+                doc.layers[0].fill_rect(0, 0, 30, 20, Pixel16::from_rgba8(255, 0, 0, 255));
+                doc.layers[0].fill_rect(15, 8, 3, 3, Pixel16::from_rgba8(0, 0, 0, 255));
+                let mut app = App::new(doc, None);
+                app.tool = Tool::Heal;
+                app.tip = BrushTip::new(9.0, 1.0);
+                let (hx, hy) = scr(&app, 5.0, 10.0);
+                app.alt_down = true;
+                app.mouse_down(hx, hy);
+                app.alt_down = false;
+                app.mouse_up(hx, hy);
+                let (tx, ty) = scr(&app, 16.0, 9.0);
+                app.mouse_down(tx, ty);
+                app.mouse_up(tx, ty);
+                let px = app.doc.layers[0].get_pixel(16, 9).to_rgba8();
+                check("healing removes the spot", px.0 > 100);
+            }
+        }
+        {
+            // Modern UI: draggable panel slots — group, float, redock.
+            // (HOME is the real one here, so the layout file the
+            // checks write is removed again afterwards.)
+            let mut app = App::new(flat(), None);
+            app.sync_panel_slots();
+            check(
+                "slots default one kind each",
+                app.dock_slots.iter().all(|s| s.kinds.len() == 1) && app.float_slots.is_empty(),
+            );
+            app.group_panels(PanelKind::Brushes, PanelKind::Histogram);
+            let grouped = app.slot_of(PanelKind::Brushes) == app.slot_of(PanelKind::Histogram)
+                && app.dock_slots.iter().any(|s| s.kinds.len() == 2);
+            check("brushes+histogram grouped in one slot", grouped);
+            check(
+                "grouped slot shows only the active kind",
+                app.group_rect(PanelKind::Histogram).is_some()
+                    != app.group_rect(PanelKind::Brushes).is_some(),
+            );
+            app.float_panel(PanelKind::Navigator, 700, 150);
+            check(
+                "navigator floated",
+                app.float_slots.len() == 1
+                    && matches!(app.slot_of(PanelKind::Navigator), Some(SlotLoc::Float(_))),
+            );
+            let idx = app.float_slots.len() - 1;
+            app.redock_float_at(idx, app.top_y() + 10);
+            check(
+                "navigator redocked",
+                app.float_slots.is_empty()
+                    && app
+                        .dock_slots
+                        .iter()
+                        .any(|s| s.kinds.contains(&PanelKind::Navigator)),
+            );
+            let _ = std::fs::remove_file(pictodesk_dir().join("layout.txt"));
+            // Tab click switches the grouped slot's active panel.
+            {
+                let mut app = App::new(flat(), None);
+                app.sync_panel_slots();
+                app.group_panels(PanelKind::Brushes, PanelKind::Histogram);
+                let loc = app.slot_of(PanelKind::Brushes).unwrap();
+                let (_, strip) = app
+                    .panel_strip_rects()
+                    .into_iter()
+                    .find(|(l, _)| *l == loc)
+                    .unwrap();
+                // Click the Brushes tab (first tab, left end).
+                let (tx, ty) = (strip.x + 10, strip.y + 8);
+                app.mouse_down(tx as f32, ty as f32);
+                app.mouse_up(tx as f32, ty as f32);
+                check(
+                    "tab click switches active panel",
+                    app.slot_active_kind(loc) == PanelKind::Brushes
+                        && app.group_rect(PanelKind::Brushes).is_some(),
+                );
+                let _ = std::fs::remove_file(pictodesk_dir().join("layout.txt"));
+            }
+            // Real drag: press a title handle, move past the
+            // threshold onto the canvas, release -> floating.
+            // (The dock only fits the first few panels at 800px, so
+            // drag the first group entry, whatever kind it is.)
+            {
+                let mut app = App::new(flat(), None);
+                app.sync_panel_slots();
+                let (_drag_kind, r) = app.panel_groups().into_iter().next().unwrap();
+                let (hx, hy) = (r.x + 6, r.y + 6);
+                app.mouse_down(hx as f32, hy as f32);
+                check(
+                    "title press starts pending drag",
+                    app.panel_pending.is_some(),
+                );
+                app.mouse_move(400.0, 300.0);
+                check(
+                    "drag past threshold floats the panel",
+                    app.panel_drag.is_some() && app.float_slots.len() == 1,
+                );
+                app.mouse_up(400.0, 300.0);
+                check(
+                    "drop over canvas leaves it floating",
+                    app.float_slots.len() == 1 && app.panel_drop.is_none(),
+                );
+                let _ = std::fs::remove_file(pictodesk_dir().join("layout.txt"));
+            }
+        }
+        // Document tabs: two docs keep separate pixels, history,
+        // and zoom; a dirty tab asks before closing.
+        {
+            let mut doc1 = Document::new(30, 20);
+            doc1.layers[0].fill_rect(0, 0, 30, 20, Pixel16::from_rgba8(255, 0, 0, 255));
+            let mut app = App::new(doc1, None);
+            app.doc_name = "red.png".into();
+            check("one tab at start", app.tab_count() == 1);
+            let mut doc2 = Document::new(30, 20);
+            doc2.layers[0].fill_rect(0, 0, 30, 20, Pixel16::from_rgba8(0, 0, 255, 255));
+            app.new_tab_with_doc(doc2, None, "blue.png".into());
+            check(
+                "second tab opens",
+                app.tab_count() == 2 && app.active_tab == 1,
+            );
+            app.tool = Tool::Brush;
+            app.tip = BrushTip::new(5.0, 1.0);
+            app.fg = Pixel16::from_rgba8(0, 0, 0, 255);
+            let c = app.canvas_rect(app.win_size.0, app.win_size.1);
+            let sp = app.viewport.doc_to_screen((10.0, 10.0));
+            app.mouse_down(c.x as f32 + sp.0, c.y as f32 + sp.1);
+            app.mouse_up(c.x as f32 + sp.0, c.y as f32 + sp.1);
+            check(
+                "paint lands on tab 2",
+                app.doc.layers[0].get_pixel(10, 10).to_rgba8().0 < 50,
+            );
+            app.switch_tab(0);
+            check(
+                "tab 1 pixels untouched",
+                app.doc.layers[0].get_pixel(10, 10).to_rgba8() == (255, 0, 0, 255),
+            );
+            check(
+                "tab 1 has no undo from tab 2",
+                !app.hist.can_undo() && app.doc_name == "red.png",
+            );
+            app.switch_tab(1);
+            check(
+                "back on tab 2, paint and undo survive",
+                app.doc.layers[0].get_pixel(10, 10).to_rgba8().0 < 50 && app.hist.can_undo(),
+            );
+            app.close_tab(1);
+            check(
+                "closing a dirty tab asks first",
+                app.dialog.as_ref().map(|d| &d.kind) == Some(&DialogKind::ConfirmClose)
+                    && app.tab_count() == 2,
+            );
+            app.dialog_cancel();
+            check("cancel keeps the tab", app.tab_count() == 2);
+            app.close_tab(1);
+            app.dialog_ok();
+            check(
+                "confirm closes the tab",
+                app.tab_count() == 1 && app.active_tab == 0,
+            );
+            app.viewport = Viewport {
+                scale: 2.0,
+                offset: (0.0, 0.0),
+            };
+            let mut doc3 = Document::new(30, 20);
+            doc3.layers[0].fill_rect(0, 0, 30, 20, Pixel16::from_rgba8(0, 255, 0, 255));
+            app.new_tab_with_doc(doc3, None, "green.png".into());
+            let z2 = app.viewport.scale;
+            app.switch_tab(0);
+            check(
+                "zoom stays with its tab",
+                app.viewport.scale == 2.0 && z2 != 2.0,
+            );
+        }
+        // Open panel: folders are navigable, the last folder is
+        // remembered on disk.
+        {
+            let base = std::path::PathBuf::from("/tmp/pd-tabs-test");
+            let sub = base.join("sub");
+            let _ = std::fs::remove_dir_all(&base);
+            std::fs::create_dir_all(&sub).unwrap();
+            let mut doc = Document::new(8, 8);
+            doc.layers[0].fill_rect(0, 0, 8, 8, Pixel16::from_rgba8(10, 20, 30, 255));
+            let bytes = io::export_image(&doc, ExportFormat::Png, 92).unwrap();
+            std::fs::write(sub.join("a.png"), bytes).unwrap();
+            std::env::set_var("HOME", "/tmp/pdhome-test");
+            let _ = std::fs::remove_dir_all("/tmp/pdhome-test");
+            let mut app = App::new(flat(), None);
+            app.file_panel_dir = base.clone();
+            app.file_panel_purpose = 0;
+            app.refresh_file_panel();
+            let rows = app.file_panel_rows();
+            let sub_row = rows.iter().position(|(p, d)| {
+                *d && p
+                    .as_ref()
+                    .map(|p| p.file_name().map(|n| n == "sub").unwrap_or(false))
+                    .unwrap_or(false)
+            });
+            check("panel lists the subfolder", sub_row.is_some());
+            let pr = app.file_panel_rect();
+            let ry = pr.y + 44 + sub_row.unwrap() as i32 * 17 + 8;
+            app.mouse_down(pr.x as f32 + 20.0, ry as f32);
+            check(
+                "clicking a folder enters it",
+                app.file_panel_dir == sub && app.file_panel.is_some(),
+            );
+            let rows2 = app.file_panel_rows();
+            check(
+                "entered folder lists its image",
+                rows2.iter().any(|(p, d)| {
+                    !*d && p
+                        .as_ref()
+                        .map(|p| p.file_name().map(|n| n == "a.png").unwrap_or(false))
+                        .unwrap_or(false)
+                }),
+            );
+            let ry0 = pr.y + 44 + 8;
+            app.mouse_down(pr.x as f32 + 20.0, ry0 as f32);
+            check(".. goes back up", app.file_panel_dir == base);
+            check("last folder is remembered on disk", last_open_dir() == base);
+            let _ = std::fs::remove_dir_all(&base);
+            let _ = std::fs::remove_dir_all("/tmp/pdhome-test");
+            std::env::set_var("HOME", "/home/hatch");
+        }
         eprintln!("PHASE7TEST {}", if ok { "PASS" } else { "FAIL" });
         if !ok {
             std::process::exit(1);
@@ -27372,6 +29173,51 @@ fn run_shot(args: &[String]) -> i32 {
             return 1;
         }
     }
+    // UI verification: pose a tool + cursor so the shot shows the
+    // brush ring / clone crosshair the user actually sees.
+    if let Some(tool_name) = &uitool {
+        let scr = |app: &App, dx: f32, dy: f32| {
+            let c = app.canvas_rect(app.win_size.0, app.win_size.1);
+            (
+                c.x as f32 + app.viewport.offset.0 + dx * app.viewport.scale,
+                c.y as f32 + app.viewport.offset.1 + dy * app.viewport.scale,
+            )
+        };
+        match tool_name.as_str() {
+            "stamp" => {
+                app.tool = Tool::Stamp;
+                app.tip = BrushTip::new(27.0, 1.0);
+                app.clone_src = Some((100.0, 100.0));
+                app.cursor = scr(&app, 400.0, 200.0);
+            }
+            "brush" => {
+                app.tool = Tool::Brush;
+                app.tip = BrushTip::new(40.0, 1.0);
+                app.cursor = scr(&app, 400.0, 200.0);
+            }
+            _ => {}
+        }
+    }
+    // UI verification: a grouped dock slot (Brushes + Histogram)
+    // and a floating Navigator, so the shot shows tabs + a float.
+    // The demo layout is never left on disk: stash layout.txt
+    // first, restore it after the frame is drawn.
+    let layout_before = std::fs::read(pictodesk_dir().join("layout.txt")).ok();
+    if uipanels {
+        app.sync_panel_slots();
+        app.group_panels(PanelKind::Brushes, PanelKind::Histogram);
+        if let Some(loc) = app.slot_of(PanelKind::Brushes) {
+            app.set_slot_active(loc, PanelKind::Brushes);
+        }
+        app.float_panel(PanelKind::Navigator, 700, 150);
+    }
+    if twotabs {
+        app.new_tab_with_doc(
+            demo_document(),
+            Some(PathBuf::from("photo.png")),
+            "photo.png".into(),
+        );
+    }
     if let Some(m) = menu {
         app.open_menu = Some(m);
         app.hover_item = Some((m, 0));
@@ -27584,6 +29430,16 @@ fn run_shot(args: &[String]) -> i32 {
         app.doc_version += 1;
     }
     app.draw(&mut frame);
+    // Restore the stashed panel layout (the --uipanels demo must
+    // not leak into later runs' ~/.pictodesk).
+    match layout_before {
+        Some(bytes) => {
+            let _ = std::fs::write(pictodesk_dir().join("layout.txt"), bytes);
+        }
+        None => {
+            let _ = std::fs::remove_file(pictodesk_dir().join("layout.txt"));
+        }
+    }
 
     // CPU-only shot (no GPU adapter in this environment): save
     // the CPU frame directly; the GPU cross-check is skipped.
@@ -28020,6 +29876,15 @@ impl ApplicationHandler for Runner {
                         Key::Named(NamedKey::Backspace) if pressed => {
                             self.app.key_special(SpecialKey::Backspace)
                         }
+                        Key::Named(NamedKey::Tab) if pressed => {
+                            if self.app.primary_down() {
+                                if self.app.shift_down {
+                                    self.app.prev_tab();
+                                } else {
+                                    self.app.next_tab();
+                                }
+                            }
+                        }
                         Key::Character(s) if pressed => {
                             for c in s.chars() {
                                 self.app.key_char(c);
@@ -28085,10 +29950,10 @@ fn run_window(path: Option<PathBuf>) {
                     app.recovery_file = Some(rec);
                     app.status = "Recovered autosaved work — Save to keep it".into();
                 }
-                Err(_) => app.open_path(&p),
+                Err(_) => app.replace_doc_from_path(&p),
             }
         } else {
-            app.open_path(&p);
+            app.replace_doc_from_path(&p);
         }
     } else {
         let rec = std::env::temp_dir().join("pictodesk-untitled.pdk.recovery");

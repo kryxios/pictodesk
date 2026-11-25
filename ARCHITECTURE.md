@@ -416,6 +416,73 @@ The full-behavior pass over the Phase 6 surface:
   Illustrator-style EPS text file, the Options Bar, and
   full-screen display modes.
 
+## Modern UI pass (v0.7.1)
+
+The shell is a dark professional theme and no longer changes per
+version: dark panels (`PLATINUM` 56, `PLATINUM_LIGHT` 74, `DARK` 40),
+near-black fields, light text (`TEXT` 232, `TEXT_DIM` 164), one blue
+accent (`ACCENT` 49,168,255) for selections, hovers and slider fills,
+and a muted blue (`SELROW` 62,92,128) for selected list rows. The old
+constant names are kept as aliases so chrome call sites restyle
+without edits. `Frame::panel` / `button` / `slider` are flat (1px
+borders); the bevel helpers now draw edges only, because every call
+site fills its own background first (graphs, text fields and lists
+keep theirs). Text drawn on white surfaces (dialog text fields,
+font lists, history log, histogram strips) stays black. Tool
+feedback: a brush-size ring (white with a black outer ring) at the
+cursor for all paint tools, a blue source crosshair for the Clone
+Stamp and Healing Brush (tracks the stroke offset while painting),
+toolbox hover highlights, status-bar hover hints naming each tool
+and its shortcut, and Options Bar readouts naming the clone/heal
+source state. Headless check: `--uitool stamp|brush` poses a tool
+and cursor for screenshots.
+
+Type is real antialiased Liberation Sans (SIL OFL), embedded
+as base64 text and rasterized with fontdue (glyphs cached);
+scale 1 = 12px regular, scale 2 = 18px bold. Frame::text keeps
+its old signature; text_width is now real advances. Borders are
+soft hairlines (`EDGE` 44 on panels, `EDGE_MID` 88 on sunken
+controls); buttons and sliders have no outline — fill contrast
+is the edge. Dialogs and the file panel use rounded corners
+(`panel_rounded`, radius 6) with a soft `EDGE_SOFT` border.
+
+Panels are tab groups (`PanelSlot`: kinds + active index) in
+dock_slots (stacked) or float_slots (own rect). Drag a panel by
+its title label (or a tab strip / float header) past 4px to
+float it; drop it on another strip to group, on the dock column
+to re-dock at that height, or anywhere else to leave it
+floating. Float headers carry dock and close buttons. Layout
+persists in ~/.pictodesk/layout.txt. panel_height() is kept
+free of group_rect() calls (the tone-row check is the
+rect-free has_tool_row()) so the layout math cannot recurse.
+Headless check: `--uipanels` poses a grouped slot + a float.
+
+Document tabs (v0.7.1): one tab per open document, in a bar
+under the Options Bar (always shown in standard mode). The
+App's live fields are the active tab's working copy; a DocTab
+holds the stored per-document state (document, History,
+selection, clone/heal sources, viewport, file path, dirty
+flag, snapshots, render cache, autosave bookkeeping) and
+switching swaps them with mem::swap, so each tab keeps its
+own layers, undo, selection, and zoom. Tool, palette, and
+panel state stay global. Open, New, Duplicate, and
+drag-and-drop open a new tab; Revert and the launch path
+replace the active tab's document instead. Closing a dirty
+tab asks first (ConfirmClose dialog); closing the last tab
+leaves a fresh blank document. Ctrl+Tab / Ctrl+Shift+Tab
+cycle tabs, Ctrl+W closes. Headless check: `--twotabs`
+opens a second tab for screenshots.
+
+Open panel (v0.7.1): the panel shows the current folder path
+and lists subdirectories first, with ".." to go up; the last
+folder used is remembered in ~/.pictodesk/last-dir.txt, and
+the panel starts in Pictures when there is no remembered
+folder. Previously it listed only the folder the app was
+launched from.
+
+
+and cursor for screenshots.
+
 ## Phase 7 additions (v0.7.0)
 
 - Healing is texture transfer, not blurring: a heal stamp or
